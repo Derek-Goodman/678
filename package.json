@@ -1,0 +1,13 @@
+{
+  "name": "d678-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "678 联机（单人对决）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

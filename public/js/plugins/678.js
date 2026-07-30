@@ -1,0 +1,2054 @@
+//=============================================================================
+// 678.js
+//=============================================================================
+/*:
+ * @plugindesc 21点卡牌淘汰赛（678） 调用命令: start678
+ * @author DerekGoodman
+ *
+ * @help
+ * ============================================================================
+ * 使用方法
+ * ============================================================================
+ * 事件中使用插件命令:
+ *
+ *   start678
+ *
+ * 进入后先询问玩家是否知道规则：
+ *   知道     -> 直接开始第 1 轮
+ *   不知道   -> 先跑一场固定开局的教学对局（5+6 对 1+11，最终 21:21 平局），
+ *               教程不掉血、不计胜负、不占轮次，结束后接着打第 1 轮，
+ *               对手名单沿用教程里排名画面展示过的那 8 位。
+ *
+ * 游戏结束（玩家被淘汰 或 玩家成为最后幸存者）后自动返回地图。
+ *
+ * ============================================================================
+ * 回合规则
+ * ============================================================================
+ *  只有抽牌类动作会结束回合：要牌、过牌、指定抽牌成功、抽底牌、重抽、抽小。
+ *  其余功能牌（互换/强夺/退回/规则牌/查看牌库/干扰）不消耗回合，可以连续使用。
+ *  指定抽牌失败（该号牌已在场上）只消耗该功能牌，回合仍在自己手上。
+ *
+ *  使用功能牌成功后，对方之前的过牌一律作废（“连续过牌”计数清零）：
+ *  回合仍在自己手上，但对方必定能再行动一次，
+ *  因此不存在“对方过牌 -> 我方用规则牌 -> 我方过牌 -> 直接结算”这种情况。
+ *  双方连续过牌两次才进入结算。
+ *
+ * ============================================================================
+ * 结算规则
+ * ============================================================================
+ *  单方爆牌：爆牌方直接判负（伤害多算一份）。
+ *  双方爆牌：平局，立即重新发牌（不比谁更接近目标点数）。
+ *  双方未爆且同点：平局，立即重新发牌。
+ *
+ * ============================================================================
+ * 功能牌的发放与弃牌
+ * ============================================================================
+ *  结算后胜者摸 1 张、败者摸 2 张。
+ *  本局这场对战里被用掉的功能牌，交手的两个人这次发牌都摸不到（取双方并集）。
+ *  牌本身照旧回公共池给别人摸，只是这两位隔一次发牌才可能再拿到。
+ *
+ *  手上超过 D678.MAX_FUNC 张时必须弃牌，且只能弃到刚好剩 MAX_FUNC 张 ——
+ *  不能多弃。选满之后其余牌点不动，想换要先取消一张。
+ *
+ * ============================================================================
+ * AI
+ * ============================================================================
+ *  AI 出规则牌有时机限制：改完规则后自己必须已经满点，
+ *  或者离新目标点数不超过 D678.AI.RULE_NEAR 点且不爆，才会出手。
+ *  否则把牌留着 —— 避免 1+2 就甩规则18 这种离目标还差十几点的出牌。
+ *  唯一例外是对手已经停牌/抽不动、而新规则能直接把他打爆且自己没爆。
+ *
+ *  超哥必定登场，他知道牌库的完整顺序（每次抽到什么牌都算得到），
+ *  也看得见对方的底牌，因此他的要牌/过牌是确定性最优的。
+ *  因为他本来就知道牌库，「查看牌库」对他毫无价值，所以他不会摸到这张牌，
+ *  这张牌会留在公共牌池里给其他更需要情报的玩家。
+ *  其余 AI 从 D678.AI_NAMES 里随机抽 D678.AI_COUNT 位。
+ *  要增加 AI，只需往 D678.AI_NAMES 数组里加名字。
+ *
+ * ============================================================================
+ * 排名规则
+ * ============================================================================
+ *  存活者按 HP 从高到低排列；被淘汰者按淘汰时间倒序排在存活者之后，
+ *  即最早被淘汰的人固定占据最后一名。
+ *
+ * ============================================================================
+ * 素材要求 (img/pictures/, 每张 720x1020)
+ * ============================================================================
+ *  1 ~ 11        数字牌
+ *  cardback      背面牌
+ *  pick1~pick11  抽X号
+ *  swap return rob pickback
+ *  rule18 rule24 rule+1 rule-1 rule21 check
+ *  repick reback picksmall
+ * ============================================================================
+ */
+
+var D678 = D678 || {};
+
+(function () {
+'use strict';
+
+// 规则层在 678core.js 里。加载顺序错了就立刻报明确的错，
+// 不要等到玩家点开对局才莫名崩在某个 undefined 上。
+if (!D678.Battle || !D678.GameClass) {
+    throw new Error('678.js 需要先加载 678core.js —— 插件管理器里把 678core 排到 678 之前');
+}
+
+// 拆分前这两个类是同一个 IIFE 内的函数声明，拆开后从 D678 上取回来。
+var D678_Battle = D678.Battle;
+var D678_Game   = D678.GameClass;
+
+//=============================================================================
+// 场景 - 布局常量
+//=============================================================================
+
+var LY = {
+    SW: 720, SH: 1280,
+    CARD_W: 100, CARD_H: 142,
+    FCARD_W: 88, FCARD_H: 125,
+    OPP_CARD_Y: 190,
+    MY_CARD_Y: 660,
+    FUNC_Y: 880,
+    BTN_Y: 1180,
+    // 场上生效的规则牌：画在“规则：…”那行文字下方的空位
+    RULE_W: 62, RULE_X: 24, RULE_Y: 416
+};
+D678.LY = LY;
+
+var COL = {
+    bg1: '#0b2b1c', bg2: '#04140d',
+    line: 'rgba(255,255,255,0.18)',
+    white: '#ffffff', gray: '#b9c8c0', gold: '#ffd766',
+    red: '#ff5a5a', green: '#5cff9d', blue: '#7fd4ff',
+    aqua: '#48e6d2',      // 我方回合
+    orange: '#ff9a4d',    // 对方回合
+    purple: '#c98bff'     // 规则被变更
+};
+
+//=============================================================================
+// Scene_D678
+//=============================================================================
+
+function Scene_D678() { this.initialize.apply(this, arguments); }
+Scene_D678.prototype = Object.create(Scene_Base.prototype);
+Scene_D678.prototype.constructor = Scene_D678;
+window.Scene_D678 = Scene_D678;
+
+Scene_D678.prototype.initialize = function () {
+    Scene_Base.prototype.initialize.call(this);
+};
+
+Scene_D678.prototype.create = function () {
+    Scene_Base.prototype.create.call(this);
+    this._phase      = 'init';
+    this._wait       = 0;
+    this._hits       = [];
+    this._anims      = [];
+    this._msgs       = [];
+    this._battle     = null;
+    this._roundInfo  = null;
+    this._selFunc    = null;
+    this._showList   = false;
+    this._showRule   = false;   // 场上规则牌的详情浮窗
+    this._discardFor = null;
+    this._discardSel = [];
+    this._resultInfo = null;
+    this._lastLog    = null;   // 上一场对局的日志，供轮结果画面展示
+    this._notice     = '';
+    this._noticeTime = 0;
+    this._cardSprites = {};
+    // 结算演出：满点时先放大字，面板延后淡入（见 onBattleEnd / drawOverlay）
+    this._panelHold  = 0;    // 还需压住结算面板不画的帧数
+    this._panelFade  = 1;    // 面板不透明度 0~1
+    this._shake      = 0;    // 剩余震屏帧数
+    this._shakePow   = 0;    // 震屏幅度（像素）
+    this._fxQueue    = [];   // 延时触发的特效 [{t:剩余帧, fn:回调}]
+    this.createBackground();
+    this.createLayers();
+    this.preloadImages();
+};
+
+Scene_D678.prototype.preloadImages = function () {
+    for (var i = 1; i <= 11; i++) ImageManager.loadPicture(String(i));
+    ImageManager.loadPicture('cardback');
+    D678.FUNCS.forEach(function (f) { ImageManager.loadPicture(f.img); });
+};
+
+// 背景四周多画 PAD 像素并向左上偏移：满点演出会震屏（updateShake 推整个场景的
+// x/y），背景若正好 720x1280 就会在边缘露出黑边。多出来的一圈把它兜住。
+Scene_D678.prototype.createBackground = function () {
+    var PAD = 16;
+    var W = LY.SW + PAD * 2, H = LY.SH + PAD * 2;
+    var b = new Bitmap(W, H);
+    var ctx = b._context;
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, COL.bg1); g.addColorStop(1, COL.bg2);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // 分隔线坐标是屏幕坐标，画到位图上要补 PAD
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(20 + PAD, 640 + PAD); ctx.lineTo(700 + PAD, 640 + PAD);
+    ctx.stroke();
+    b._setDirty();
+    this._bgSprite = new Sprite(b);
+    this._bgSprite.x = -PAD;
+    this._bgSprite.y = -PAD;
+    this.addChild(this._bgSprite);
+};
+
+Scene_D678.prototype.createLayers = function () {
+    this._cardLayer = new Sprite();
+    this.addChild(this._cardLayer);
+
+    this._uiBmp = new Bitmap(LY.SW, LY.SH);
+    this._uiSprite = new Sprite(this._uiBmp);
+    this.addChild(this._uiSprite);
+
+    this._fxLayer = new Sprite();
+    this.addChild(this._fxLayer);
+
+    this._ovBmp = new Bitmap(LY.SW, LY.SH);
+    this._ovSprite = new Sprite(this._ovBmp);
+    this.addChild(this._ovSprite);
+
+    // 高光特效层：在结算面板之上。满点大字必须走这一层，
+    // 否则会被 drawShowdown 的 rgba(0,0,0,0.85) 面板平切掉一半。
+    // 只给满点这类高光用 —— 不能把 _fxLayer 整体上移，
+    // 那会让 funcFx/dealFx 盖住排名列表和弃牌选择界面。
+    this._fxTopLayer = new Sprite();
+    this.addChild(this._fxTopLayer);
+
+    this._topLayer = new Sprite();   // 覆盖层之上（弃牌选择用）
+    this.addChild(this._topLayer);
+};
+
+//--- 绘制工具 --------------------------------------------------------------
+
+Scene_D678.prototype.txt = function (bmp, text, x, y, w, size, color, align) {
+    bmp.fontSize = size || 22;
+    bmp.textColor = color || COL.white;
+    bmp.outlineColor = 'rgba(0,0,0,0.75)';
+    bmp.outlineWidth = 4;
+    bmp.drawText(text, x, y, w || (LY.SW - x), size + 8, align || 'left');
+};
+Scene_D678.prototype.box = function (bmp, x, y, w, h, fill, stroke, r) {
+    var ctx = bmp._context;
+    r = r || 8;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+    ctx.restore();
+    bmp._setDirty();
+};
+
+//--- 点数字符串 ------------------------------------------------------------
+
+Scene_D678.prototype.totalString = function (b, si, revealAll) {
+    var cards = b.sides[si].cards;
+    var parts = [], base = 0, visible = 0;
+    for (var i = 0; i < cards.length; i++) {
+        if (cards[i].hidden && !revealAll) { parts.push('?'); }
+        else { parts.push(String(cards[i].v)); base += cards[i].v; visible++; }
+    }
+    if (visible === 0) return parts.join('+') + '=?';
+    // 规则+1/-1 时显示成 “1+2+3=6+3”：等号后是牌面合计，再挂上修正总量，
+    // 不再画出最终点数（最终点数由下面的大字/结算显示）。
+    var s = parts.join('+') + '=' + base;
+    var m = b.mod();
+    if (m !== 0) {
+        // 修正量按“手上所有牌”算，含看不见的暗牌 —— 只数明牌会少算，
+        // 例如对方 ?(6)+7+11 在 rule-1 下应显示 18-3 而不是 18-2。
+        var d = m * cards.length;
+        s += (d >= 0 ? '+' : '-') + Math.abs(d);
+    }
+    return s;
+};
+
+//--- 卡牌精灵 --------------------------------------------------------------
+
+Scene_D678.prototype.cardKey = function (si, idx, c, revealAll) {
+    var shown = (si === 0 || revealAll || !c.hidden);
+    return si + '_' + idx + '_' + c.v + '_' + (shown ? 'f' : 'b');
+};
+
+Scene_D678.prototype.refreshCards = function () {
+    var b = this._battle;
+    var used = {};
+    if (b) {
+        for (var si = 0; si < 2; si++) {
+            var cards = b.sides[si].cards;
+            var n = cards.length;
+            var span = Math.min(LY.CARD_W + 12, Math.floor(660 / Math.max(n, 1)));
+            var totalW = span * (n - 1) + LY.CARD_W;
+            var sx = Math.floor((LY.SW - totalW) / 2);
+            var y = (si === 0) ? LY.MY_CARD_Y : LY.OPP_CARD_Y;
+            for (var i = 0; i < n; i++) {
+                var c = cards[i];
+                var key = this.cardKey(si, i, c, b.revealed);
+                used[key] = true;
+                var sp = this._cardSprites[key];
+                var shown = (si === 0 || b.revealed || !c.hidden);
+                if (!sp) {
+                    sp = new Sprite(ImageManager.loadPicture(shown ? String(c.v) : 'cardback'));
+                    sp.scale.x = sp.scale.y = LY.CARD_W / D678.CARD_W;
+                    sp.opacity = 0;
+                    sp.x = LY.SW / 2 - LY.CARD_W / 2;
+                    sp.y = 420;
+                    this._cardLayer.addChild(sp);
+                    this._cardSprites[key] = sp;
+                    sp._new = true;
+                }
+                sp._tx = sx + span * i;
+                sp._ty = y;
+                // 我方暗牌：自己看得见牌面，但压一层淡黑蒙版提示“对方看不到这张”。
+                // 结算翻牌后大家都看得见了，蒙版随之撤掉。
+                // setColorTone 内部会比对数值，重复设同一个值不会有额外开销，
+                // 且图片异步加载完成后会自动重新套用，所以每次刷新都直接设。
+                var masked = (si === 0 && c.hidden && !b.revealed);
+                sp.setColorTone(masked ? D678.HOLE_TONE : [0, 0, 0, 0]);
+            }
+        }
+    }
+    for (var k in this._cardSprites) {
+        if (!used[k]) {
+            var s2 = this._cardSprites[k];
+            this._cardLayer.removeChild(s2);
+            delete this._cardSprites[k];
+        }
+    }
+    // 离开对局画面（轮结果 / 赛事结束）时，规则牌精灵一并收起
+    if (!b && this._ruleSprite) this._ruleSprite.visible = false;
+};
+
+Scene_D678.prototype.updateCardSprites = function () {
+    for (var k in this._cardSprites) {
+        var sp = this._cardSprites[k];
+        if (sp._tx === undefined) continue;
+        sp.x += (sp._tx - sp.x) * 0.28;
+        sp.y += (sp._ty - sp.y) * 0.28;
+        if (Math.abs(sp._tx - sp.x) < 1) sp.x = sp._tx;
+        if (Math.abs(sp._ty - sp.y) < 1) sp.y = sp._ty;
+        if (sp.opacity < 255) sp.opacity += 24;
+    }
+};
+
+//--- 主界面刷新 ------------------------------------------------------------
+
+Scene_D678.prototype.refresh = function () {
+    this.refreshCards();
+    var bmp = this._uiBmp;
+    bmp.clear();
+    this._hits = [];
+    this.drawHpBar();
+    var b = this._battle;
+    if (b) {
+        this.drawBattle(b);
+    }
+    // 非对局画面（轮结果 / 结束）的内容由下面的 refresh 覆写统一绘制，
+    // 这里不再画 notice，否则会压在对战记录面板上。
+    this.drawOverlay();
+};
+
+Scene_D678.prototype.drawHpBar = function () {
+    var bmp = this._uiBmp, me = D678.Game.human();
+    this.box(bmp, 12, 10, 696, 56, 'rgba(0,0,0,0.45)', COL.line, 10);
+    this.txt(bmp, me.name, 26, 22, 120, 24, COL.white);
+    var w = 300, x = 110, y = 30;
+    var ratio = Math.max(0, Math.min(1, me.hp / D678.START_HP));
+    this.box(bmp, x, y, w, 18, 'rgba(255,255,255,0.15)', null, 6);
+    if (ratio > 0) this.box(bmp, x, y, Math.floor(w * ratio), 18,
+        ratio > 0.4 ? '#4be08a' : '#ff6b6b', null, 6);
+    this.txt(bmp, 'HP ' + me.showHp(), x + w + 12, 20, 120, 24, COL.gold);
+    this.txt(bmp, this._showList ? '▲ 收起' : '▼ 排名', 590, 22, 110, 22, COL.blue);
+    this._hits.push({ x: 12, y: 10, w: 696, h: 56, cb: this.onToggleList.bind(this) });
+    this.txt(bmp, '第 ' + D678.Game.round + ' 轮   存活 ' + D678.Game.alivePlayers().length + ' 人',
+        26, 72, 400, 20, COL.gray);
+};
+
+Scene_D678.prototype.drawBattle = function (b) {
+    var bmp = this._uiBmp;
+    var opp = b.players[1];
+    this.drawOppName(opp);
+    this.txt(bmp, 'HP ' + opp.showHp(), 0, 130, LY.SW, 20, COL.gray, 'center');
+
+    // 对方点数
+    this.txt(bmp, this.totalString(b, 1, b.revealed), 0, 350, LY.SW, 30,
+        b.revealed ? COL.gold : COL.white, 'center');
+    // 我方点数
+    this.txt(bmp, this.totalString(b, 0, true), 0, 610, LY.SW, 30, COL.white, 'center');
+    // 底牌标记
+    this.txt(bmp, '（左起第一张为底牌）', 0, 812, LY.SW, 16, COL.gray, 'center');
+
+    // 场上生效的规则牌实体（原来的“规则：…”文字已去掉，改为点卡查看）
+    this.drawRuleCard(b);
+
+    // 回合（居中）
+    var turnTxt = b.finished ? '结算' : (b.turn === 0 ? '我方回合' : '对方回合');
+    this.txt(bmp, turnTxt, 0, 420, LY.SW, 26, b.turn === 0 ? COL.aqua : COL.orange, 'center');
+
+    // 对方行为日志（靠右）
+    if (this._msgs.length) {
+        this.txt(bmp, '对方动作', 380, 452, 316, 16, COL.gray, 'right');
+        for (var i = 0; i < this._msgs.length; i++) {
+            this.txt(bmp, this._msgs[i], 380, 474 + i * 24, 316, 20, COL.white, 'right');
+        }
+    }
+
+    // 未见的牌：不会让我方爆牌的牌标金色
+    this.drawUnseen(b, 24, 540);
+
+    // 查看牌库结果
+    if (b.sides[0].checkN > 0) {
+        var top = b.deck.slice(0, b.sides[0].checkN);
+        this.txt(bmp, '牌库顶：' + top.join('  '), 24, 566, 680, 20, COL.gold);
+    }
+
+    this.drawFuncHand(b);
+    this.drawButtons(b);
+
+    // 提示：画在最后，作为底部横幅，避免压住右侧的对方动作日志
+    if (this._noticeTime > 0 && this._notice) {
+        this.box(bmp, 40, 1100, 640, 46, 'rgba(0,0,0,0.82)', COL.red, 8);
+        this.txt(bmp, this._notice, 40, 1111, 640, 24, COL.red, 'center');
+    }
+};
+
+// 对手名字 + 后缀「（胜率x%　功能牌n）」。
+// 名字本身仍然居中（位置和以前一致），后缀紧跟在名字右边，
+// 字号比名字小、用灰色，与「第 X 轮」那行同一个色阶。
+Scene_D678.prototype.drawOppName = function (opp) {
+    var bmp = this._uiBmp;
+    var NAME_SIZE = 30, SUB_SIZE = 20;
+    var suffix = '（胜率' + opp.rateText(opp.winRate()) +
+                 '　功能牌' + opp.funcs.length + '）';
+    bmp.fontSize = NAME_SIZE;
+    var nameW = bmp.measureTextWidth(opp.name);
+    var nx = Math.floor((LY.SW - nameW) / 2);
+    this.txt(bmp, opp.name, nx, 96, nameW + 8, NAME_SIZE, COL.gold, 'left');
+    // 小字基线对齐到名字的视觉中线：(30+8)/2 - (20+8)/2 = 5
+    this.txt(bmp, suffix, nx + nameW + 4, 96 + 5, LY.SW - (nx + nameW), SUB_SIZE,
+        COL.gray, 'left');
+};
+
+// 场上生效的规则牌：在规则文字下方摆一张实体卡，纯展示。
+// 它只读 b.rule，不参与任何流转 —— 规则牌用掉后回公共池、被后一张覆盖，
+// 都由 useFunc 那边照原逻辑处理，这里只是跟着 b.rule 变化重画。
+Scene_D678.prototype.drawRuleCard = function (b) {
+    var bmp = this._uiBmp;
+    var x = LY.RULE_X, y = LY.RULE_Y;
+    var w = LY.RULE_W, h = Math.round(w * D678.CARD_H / D678.CARD_W);
+    this.syncRuleSprite(b.rule, x, y, w);
+    if (!b.rule) return;          // 没有规则牌就空着，不画占位框
+    // 卡图由精灵绘制，这里只描边 + 在下方标名字
+    this.box(bmp, x - 3, y - 3, w + 6, h + 6, null, COL.purple, 7);
+    this.txt(bmp, D678.funcName(b.rule), x - 12, y + h + 4, w + 24, 14, COL.purple, 'center');
+    // 点卡查看当前规则详情
+    this._hits.push({ x: x - 3, y: y - 3, w: w + 6, h: h + 20,
+        cb: this.onToggleRuleInfo.bind(this) });
+};
+
+// 规则详情浮窗：点场上的规则牌打开，点任意处关闭
+Scene_D678.prototype.onToggleRuleInfo = function () {
+    this._showRule = !this._showRule;
+    this.refresh();
+};
+
+Scene_D678.prototype.drawRuleInfo = function () {
+    var b = this._battle;
+    if (!b || !b.rule) { this._showRule = false; return; }
+    var bmp = this._ovBmp;
+    var f = D678.funcData(b.rule);
+    var lines = (f ? f.desc : '').split('\n');
+    var w = 600, x = (LY.SW - w) / 2, y = 300;
+    var h = 150 + lines.length * 26;
+    this.box(bmp, 0, 0, LY.SW, LY.SH, 'rgba(0,0,0,0.6)', null, 0);
+    this.box(bmp, x, y, w, h, 'rgba(0,0,0,0.92)', COL.purple, 12);
+    this.txt(bmp, '当前规则', x, y + 16, w, 20, COL.gray, 'center');
+    this.txt(bmp, f ? f.name : b.rule, x, y + 46, w, 30, COL.purple, 'center');
+    this.txt(bmp, '目标 ' + b.target() + ' 点', x, y + 88, w, 22, COL.gold, 'center');
+    for (var i = 0; i < lines.length; i++) {
+        this.txt(bmp, lines[i], x + 28, y + 126 + i * 26, w - 56, 18, COL.white, 'left');
+    }
+    this.txt(bmp, '点击任意处关闭', 0, y + h + 12, LY.SW, 18, COL.gray, 'center');
+    this._hits.push({ x: 0, y: 0, w: LY.SW, h: LY.SH, cb: this.onToggleRuleInfo.bind(this) });
+};
+
+// 规则牌精灵：常驻一个，随 b.rule 换图 / 隐藏
+Scene_D678.prototype.syncRuleSprite = function (id, x, y, w) {
+    if (!this._ruleSprite) {
+        this._ruleSprite = new Sprite();
+        this._cardLayer.addChild(this._ruleSprite);
+    }
+    var sp = this._ruleSprite;
+    if (!id) { sp.visible = false; return; }
+    var f = D678.funcData(id);
+    if (!f) { sp.visible = false; return; }
+    sp.bitmap = ImageManager.loadPicture(f.img);
+    sp.scale.x = sp.scale.y = w / D678.CARD_W;
+    sp.x = x; sp.y = y;
+    sp.visible = true;
+};
+
+// 未见的牌逐张绘制：
+//   能凑成满点的那张 -> 红色
+//   抽到后不会爆牌   -> 金色
+//   抽到后会爆牌     -> 灰色
+Scene_D678.prototype.drawUnseen = function (b, x, y) {
+    var bmp = this._uiBmp;
+    var uns = this.unseenForPlayer(b);
+    var label = '未见的牌：';
+    this.txt(bmp, label, x, y, 200, 20, COL.gray, 'left');
+    bmp.fontSize = 20;
+    var cx = x + bmp.measureTextWidth(label) + 6;
+    if (!uns.length) { this.txt(bmp, '无', cx, y, 100, 20, COL.gray, 'left'); return; }
+    var myTotal = b.total(0);
+    for (var i = 0; i < uns.length; i++) {
+        var v = uns[i];
+        var t = myTotal + b.adj(v);
+        var hit = b.isMaxVal(t);                 // 抽到它正好满点
+        var safe = !b.isBustVal(t);
+        var s = String(v);
+        bmp.fontSize = 20;
+        var tw = bmp.measureTextWidth(s);
+        // 满点牌用红色，安全牌金色，会爆的灰色
+        this.txt(bmp, s, cx, y, 60, 20, hit ? COL.red : (safe ? COL.gold : COL.gray), 'left');
+        bmp.fontSize = 20;
+        cx += tw + 14;
+    }
+};
+
+Scene_D678.prototype.unseenForPlayer = function (b) {
+    var known = {}, i;
+    var mine = b.sides[0].cards, opp = b.sides[1].cards;
+    for (i = 0; i < mine.length; i++) known[mine[i].v] = true;
+    for (i = 0; i < opp.length; i++) { if (!opp[i].hidden || b.revealed) known[opp[i].v] = true; }
+    var out = [];
+    for (var v = 1; v <= 11; v++) { if (!known[v]) out.push(v); }
+    return out;
+};
+
+Scene_D678.prototype.drawFuncHand = function (b) {
+    var bmp = this._uiBmp;
+    var me = D678.Game.human();
+    this.txt(bmp, '功能牌 ' + me.funcs.length + '/' + D678.MAX_FUNC, 20, 846, 300, 20, COL.gray);
+    this.syncFuncSprites(me.funcs, 20, LY.FUNC_Y);
+    var span = Math.min(LY.FCARD_W + 24, Math.floor(680 / Math.max(me.funcs.length, 1)));
+    for (var i = 0; i < me.funcs.length; i++) {
+        var x = 20 + span * i;
+        var sel = (this._selFunc === i);
+        if (sel) this.box(bmp, x - 4, LY.FUNC_Y - 4, LY.FCARD_W + 8, LY.FCARD_H + 8, null, COL.gold, 6);
+        this.txt(bmp, D678.funcName(me.funcs[i]), x - 6, LY.FUNC_Y + LY.FCARD_H + 2,
+            LY.FCARD_W + 12, 16, sel ? COL.gold : COL.white, 'center');
+        this._hits.push({ x: x, y: LY.FUNC_Y, w: LY.FCARD_W, h: LY.FCARD_H + 20,
+            cb: this.onFuncTouch.bind(this, i) });
+    }
+    if (this._selFunc !== null && me.funcs[this._selFunc]) {
+        var f = D678.funcData(me.funcs[this._selFunc]);
+        this.box(bmp, 16, 1026, 688, 140, 'rgba(0,0,0,0.55)', COL.line, 8);
+        this.txt(bmp, f.name, 30, 1030, 300, 22, COL.gold);
+        // 说明文字限宽到 480，右侧留给「使用」大按钮，两者不重叠
+        var lines = f.desc.split('\n');
+        for (var j = 0; j < lines.length; j++) {
+            this.txt(bmp, lines[j], 30, 1058 + j * 24, 480, 18, COL.white);
+        }
+        this.drawUseButton(b);
+    }
+};
+
+// 「使用」按钮：做成醒目的实心大按钮，和说明面板明显区分，避免误触
+Scene_D678.prototype.drawUseButton = function (b) {
+    var bmp = this._uiBmp;
+    var x = 522, y = 1046, w = 168, h = 100;
+    var usable = (b && !b.finished && b.turn === 0 && this._phase === 'battle');
+    var ctx = bmp._context;
+    ctx.save();
+    // 外发光，把按钮从面板里"抬"出来
+    if (usable) {
+        this.box(bmp, x - 5, y - 5, w + 10, h + 10, 'rgba(255,215,102,0.22)', null, 12);
+    }
+    ctx.restore();
+    this.box(bmp, x, y, w, h,
+        usable ? 'rgba(70,175,110,0.95)' : 'rgba(70,70,70,0.7)',
+        usable ? COL.gold : COL.line, 10);
+    // 顶部高光
+    this.box(bmp, x + 6, y + 5, w - 12, 30, 'rgba(255,255,255,0.18)', null, 7);
+    this.txt(bmp, '使 用', x, y + 32, w, 34, usable ? COL.white : '#888', 'center');
+    if (usable) {
+        this._hits.push({ x: x, y: y, w: w, h: h, cb: this.onUseFunc.bind(this) });
+    }
+};
+
+Scene_D678.prototype.syncFuncSprites = function (ids, x0, y0) {
+    if (!this._funcSprites) this._funcSprites = [];
+    var span = Math.min(LY.FCARD_W + 24, Math.floor(680 / Math.max(ids.length, 1)));
+    while (this._funcSprites.length < ids.length) {
+        var sp = new Sprite();
+        sp.scale.x = sp.scale.y = LY.FCARD_W / D678.CARD_W;
+        this._cardLayer.addChild(sp);
+        this._funcSprites.push(sp);
+    }
+    for (var i = 0; i < this._funcSprites.length; i++) {
+        var s = this._funcSprites[i];
+        if (i < ids.length) {
+            var f = D678.funcData(ids[i]);
+            s.bitmap = ImageManager.loadPicture(f.img);
+            s.x = x0 + span * i; s.y = y0; s.visible = true;
+        } else { s.visible = false; }
+    }
+};
+
+Scene_D678.prototype.drawButtons = function (b) {
+    var bmp = this._uiBmp;
+    var active = (b && !b.finished && b.turn === 0 && this._phase === 'battle' &&
+        !this._showList && !this._discardFor && !this._showRule);
+    var bw = 300, bh = 68;
+    var y = LY.BTN_Y;
+    var canHit = active && b.canHit(0);
+    this.box(bmp, 30, y, bw, bh, canHit ? 'rgba(60,140,90,0.85)' : 'rgba(60,60,60,0.6)', COL.line, 10);
+    this.txt(bmp, '要牌', 30, y + 18, bw, 28, canHit ? COL.white : '#888', 'center');
+    this.box(bmp, 390, y, bw, bh, active ? 'rgba(150,110,40,0.85)' : 'rgba(60,60,60,0.6)', COL.line, 10);
+    this.txt(bmp, '过牌', 390, y + 18, bw, 28, active ? COL.white : '#888', 'center');
+    if (active) {
+        this._hits.push({ x: 30, y: y, w: bw, h: bh, cb: this.onHit.bind(this) });
+        this._hits.push({ x: 390, y: y, w: bw, h: bh, cb: this.onStand.bind(this) });
+    }
+};
+
+//=============================================================================
+// 覆盖层：排名列表 / 弃牌选择
+//=============================================================================
+
+Scene_D678.prototype.drawOverlay = function () {
+    var bmp = this._ovBmp;
+    bmp.clear();
+    if (this._discardFor) { this._hits = []; this.drawDiscard(); return; }
+    if (this._showList) { this.drawRankList(); return; }
+    if (this._showRule) { this.drawRuleInfo(); return; }
+    // 满点演出期间压住面板，让大字独占画面（_panelHold 由 update 递减）
+    if (this._panelHold > 0) return;
+    if (this._phase === 'resolve' || this._phase === 'tie') { this.drawShowdown(); return; }
+};
+
+// 拼点结果：双方最终点数用大字并排，中间一行大字写谁获胜，下方列出本局对战日志
+Scene_D678.prototype.drawShowdown = function () {
+    var b = this._battle, r = b && b.result;
+    if (!r || !r.totals) return;
+    var bmp = this._ovBmp, opp = b.players[1];
+    var t0 = r.totals[0], t1 = r.totals[1];
+
+    this.box(bmp, 60, 300, 600, 380, 'rgba(0,0,0,0.85)', COL.gold, 14);
+
+    // 对方
+    this.txt(bmp, opp.name, 60, 318, 600, 24, COL.gray, 'center');
+    this.txt(bmp, String(t1) + (r.busts[1] ? '　爆牌' : (r.maxes[1] ? '　满点' : '')),
+        60, 348, 600, 60, r.busts[1] ? COL.red : (r.maxes[1] ? COL.gold : COL.white), 'center');
+
+    // 中间大字：以我方为准写“胜 / 负”，胜为红色、负为绿色
+    var mid, midCol;
+    if (r.tie)               { mid = '平　局'; midCol = COL.blue; }
+    else if (r.winner === 0) { mid = '胜';     midCol = COL.red; }
+    else                     { mid = '负';     midCol = COL.green; }
+    this.txt(bmp, mid, 60, 434, 600, 54, midCol, 'center');
+
+    // 我方
+    this.txt(bmp, '我', 60, 512, 600, 24, COL.gray, 'center');
+    this.txt(bmp, String(t0) + (r.busts[0] ? '　爆牌' : (r.maxes[0] ? '　满点' : '')),
+        60, 542, 600, 60, r.busts[0] ? COL.red : (r.maxes[0] ? COL.gold : COL.white), 'center');
+
+    // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）
+    if (r.tie) {
+        this.txt(bmp, '重新发牌', 60, 622, 600, 26, COL.gray, 'center');
+    }
+};
+
+// 排名里的胜负一栏。本轮还没打完时退回上一轮的结果（prev=true 时标注“上轮”），
+// 这样对战途中打开排名也能看到所有人最近一次的胜负。
+Scene_D678.prototype.lastText = function (p) {
+    var e = p.last, prev = false;
+    if (!e) { e = p.prevLast; prev = true; }
+    if (!e) return { s: '—', c: COL.gray, d: '', prev: false };
+    if (e.type === 'bye')  return { s: '轮空', c: COL.gold, d: '', prev: prev };
+    if (e.type === 'win')  return { s: '胜', c: COL.red,   d: '', prev: prev };
+    return { s: '负', c: COL.green, d: '-' + e.dmg, prev: prev };
+};
+
+Scene_D678.prototype.drawRankList = function () {
+    var bmp = this._ovBmp;
+    this.box(bmp, 12, 70, 696, 640, 'rgba(0,0,0,0.88)', COL.gold, 12);
+    this.txt(bmp, '排　名', 0, 80, LY.SW, 24, COL.gold, 'center');
+    this.txt(bmp, '（存活者按 HP，淘汰者按淘汰顺序）', 0, 110, LY.SW, 16, COL.gray, 'center');
+    var list = D678.Game.rankedPlayers();
+    for (var i = 0; i < list.length; i++) {
+        var p = list[i], y = 140 + i * 68;
+        this.box(bmp, 26, y, 668, 62, p.isHuman ? 'rgba(80,120,60,0.5)' : 'rgba(255,255,255,0.06)',
+            p.alive ? COL.line : 'rgba(255,80,80,0.4)', 8);
+        this.txt(bmp, String(i + 1), 36, y + 6, 40, 22, COL.gold);
+        this.txt(bmp, p.name, 76, y + 6, 240, 22, p.alive ? COL.white : '#888');
+        // 淘汰者 HP 一律显示 0，不露出负数
+        var hp = p.showHp();
+        this.txt(bmp, 'HP ' + hp, 320, y + 6, 120, 22, hp > 30 ? COL.white : COL.red);
+        if (p.alive) {
+            var lt = this.lastText(p);
+            if (lt.prev && lt.s !== '—') this.txt(bmp, '上轮', 414, y + 9, 40, 16, COL.gray);
+            this.txt(bmp, lt.s, 450, y + 6, 60, 24, lt.c);
+            this.txt(bmp, lt.d, 500, y + 6, 100, 24, lt.c);
+        } else {
+            // 淘汰者不显示胜负，改为写明最终名次（名次即排序位置，无需再标淘汰顺序）
+            this.txt(bmp, '第' + D678.numCN(i + 1) + '名', 450, y + 6, 160, 22, '#888');
+        }
+        // 胜率 / 满点率的分母都是真正打完的场次（平局重发，不计入）。
+        // 「功能牌N」是手上现有张数，「已使用x次」是整场赛事累计打出的次数。
+        this.txt(bmp, '胜' + p.wins + '　负' + p.losses +
+            '　胜率' + p.rateText(p.winRate()) +
+            '　满点' + p.maxPoint + '(' + p.rateText(p.maxRate()) + ')' +
+            '　功能牌' + p.funcs.length +
+            '（已使用功能牌' + (p.funcUses || 0) + '次）', 76, y + 32, 616, 16, COL.gray);
+    }
+    this.txt(bmp, '点击任意处关闭', 0, 676, LY.SW, 18, COL.gray, 'center');
+    this._hits.push({ x: 0, y: 0, w: LY.SW, h: LY.SH, cb: this.onToggleList.bind(this) });
+};
+
+Scene_D678.prototype.drawDiscard = function () {
+    var bmp = this._ovBmp, p = this._discardFor;
+    this.box(bmp, 0, 0, LY.SW, LY.SH, 'rgba(0,0,0,0.8)', null, 0);
+    this.txt(bmp, '功能牌超过 ' + D678.MAX_FUNC + ' 张，请选择要弃掉的牌', 0, 200, LY.SW, 26, COL.gold, 'center');
+    // 只能弃到刚好剩 MAX_FUNC 张：need 是固定张数，不是下限。
+    // 选满之后未选中的牌不再注册点击，想换要先取消一张。
+    var need = Math.max(0, p.funcs.length - D678.MAX_FUNC);
+    var full = (this._discardSel.length >= need);
+    this.txt(bmp, '需要弃掉 ' + need + ' 张（已选 ' + this._discardSel.length + ' 张）',
+        0, 240, LY.SW, 22, COL.white, 'center');
+    // 卡图高度 = 118 * (1020/720) ≈ 167，名字画在卡图下方，避免被卡精灵挡住
+    var perRow = 4, x0 = 60, y0 = 320, spanX = 150, spanY = 230;
+    var imgH = Math.round(118 * D678.CARD_H / D678.CARD_W);
+    for (var i = 0; i < p.funcs.length; i++) {
+        var cx = x0 + (i % perRow) * spanX, cy = y0 + Math.floor(i / perRow) * spanY;
+        var sel = this._discardSel.indexOf(i) >= 0;
+        // 已选够时，其余牌压暗表示点不动了
+        var lock = (full && !sel);
+        this.box(bmp, cx - 6, cy - 6, 130, imgH + 34,
+            sel ? 'rgba(255,80,80,0.35)' : (lock ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.08)'),
+            sel ? COL.red : COL.line, 8);
+        this.txt(bmp, D678.funcName(p.funcs[i]), cx - 6, cy + imgH + 8, 130, 18,
+            sel ? COL.red : (lock ? '#777' : COL.white), 'center');
+        if (!lock) {
+            this._hits.push({ x: cx - 6, y: cy - 6, w: 130, h: imgH + 34,
+                cb: this.onDiscardTouch.bind(this, i) });
+        }
+    }
+    this.syncDiscardSprites(p.funcs, x0, y0, spanX, spanY, perRow, full, this._discardSel);
+    if (full) {
+        this.txt(bmp, '已选够 ' + need + ' 张，想换请先取消一张', 0, 1090, LY.SW, 18, COL.gray, 'center');
+    }
+    // 必须恰好选 need 张才能确定
+    var ok = (this._discardSel.length === need);
+    this.box(bmp, 210, 1130, 300, 70, ok ? 'rgba(60,140,90,0.9)' : 'rgba(70,70,70,0.7)', COL.line, 10);
+    this.txt(bmp, '确定', 210, 1148, 300, 28, ok ? COL.white : '#888', 'center');
+    if (ok) this._hits.push({ x: 210, y: 1130, w: 300, h: 70, cb: this.onDiscardConfirm.bind(this) });
+};
+
+Scene_D678.prototype.syncDiscardSprites = function (ids, x0, y0, spanX, spanY, perRow, full, sel) {
+    if (!this._dcSprites) { this._dcSprites = []; }
+    while (this._dcSprites.length < ids.length) {
+        var sp = new Sprite();
+        sp.scale.x = sp.scale.y = 118 / D678.CARD_W;
+        this._topLayer.addChild(sp);
+        this._dcSprites.push(sp);
+    }
+    for (var i = 0; i < this._dcSprites.length; i++) {
+        var s = this._dcSprites[i];
+        if (i < ids.length && this._discardFor) {
+            s.bitmap = ImageManager.loadPicture(D678.funcData(ids[i]).img);
+            s.x = x0 + (i % perRow) * spanX; s.y = y0 + Math.floor(i / perRow) * spanY;
+            s.visible = true;
+            // 选够之后点不动的牌连卡图一起压暗，跟外框的压暗保持一致
+            var lock = (full && sel && sel.indexOf(i) < 0);
+            s.setColorTone(lock ? [-90, -90, -90, 0] : [0, 0, 0, 0]);
+        } else s.visible = false;
+    }
+};
+
+Scene_D678.prototype.clearDiscardSprites = function () {
+    if (!this._dcSprites) return;
+    for (var i = 0; i < this._dcSprites.length; i++) this._dcSprites[i].visible = false;
+};
+
+//=============================================================================
+// 输入
+//=============================================================================
+
+Scene_D678.prototype.updateInput = function () {
+    if (!TouchInput.isTriggered()) return;
+    var x = TouchInput.x, y = TouchInput.y;
+    for (var i = this._hits.length - 1; i >= 0; i--) {
+        var h = this._hits[i];
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) { h.cb(); return; }
+    }
+    // 满点演出可以点击跳过：赶时间的玩家不必等完整 3.3 秒
+    if (this._phase === 'resolve' && this._panelHold > 0) {
+        this.skipMaxFx();
+        return;
+    }
+    // 点击空白区域取消功能牌选中
+    if (this._selFunc !== null && !this._showList && !this._discardFor) {
+        this._selFunc = null;
+        this.refresh();
+        return;
+    }
+    if (this._phase === 'roundResult' && this._wait <= 0) this.nextRound();
+    // gameover 不再点击即退出：画面保留，只能通过「返回主菜单」按钮离开
+};
+
+Scene_D678.prototype.onToggleList = function () {
+    this._showList = !this._showList;
+    this.refresh();
+};
+Scene_D678.prototype.onFuncTouch = function (i) {
+    this._selFunc = (this._selFunc === i) ? null : i;
+    this.refresh();
+};
+Scene_D678.prototype.onDiscardTouch = function (i) {
+    var k = this._discardSel.indexOf(i);
+    if (k >= 0) { this._discardSel.splice(k, 1); this.refresh(); return; }
+    // 只能弃到刚好剩 MAX_FUNC 张，选满就不再接受新选择
+    var need = Math.max(0, this._discardFor.funcs.length - D678.MAX_FUNC);
+    if (this._discardSel.length >= need) return;
+    this._discardSel.push(i);
+    this.refresh();
+};
+Scene_D678.prototype.onDiscardConfirm = function () {
+    var p = this._discardFor;
+    var sel = this._discardSel.slice(0).sort(function (a, b) { return b - a; });
+    for (var i = 0; i < sel.length; i++) {
+        var id = p.funcs.splice(sel[i], 1)[0];
+        D678.Game.returnFunc(id);
+    }
+    this._discardFor = null; this._discardSel = [];
+    this.clearDiscardSprites();
+    this.afterDiscard();
+};
+
+Scene_D678.prototype.notice = function (s) {
+    this._notice = s; this._noticeTime = 100;
+};
+
+// 跳过满点演出：清掉高光层的特效与排队中的分拍，面板立刻到位。
+// _wait 也一并收回到普通结算的长度，避免跳过了却还在干等。
+Scene_D678.prototype.skipMaxFx = function () {
+    this._fxQueue = [];
+    for (var i = this._anims.length - 1; i >= 0; i--) {
+        if (this._anims[i].layer === this._fxTopLayer) {
+            this._fxTopLayer.removeChild(this._anims[i].s);
+            this._anims.splice(i, 1);
+        }
+    }
+    this._panelHold = 0;
+    this._panelFade = 1;
+    this._shake = 0;
+    this.x = 0; this.y = 0;
+    this._wait = Math.min(this._wait, 60);
+    this.refresh();
+};
+
+Scene_D678.prototype.onHit = function () {
+    var b = this._battle;
+    if (!b || b.turn !== 0 || b.finished) return;
+    if (!b.canHit(0)) {
+        this.notice(b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌');
+        this.refresh(); return;
+    }
+    this._selFunc = null;
+    b.act(0, 'hit');
+    this.afterPlayerAction();
+};
+
+Scene_D678.prototype.onStand = function () {
+    var b = this._battle;
+    if (!b || b.turn !== 0 || b.finished) return;
+    this._selFunc = null;
+    b.act(0, 'stand');
+    this.afterPlayerAction();
+};
+
+Scene_D678.prototype.onUseFunc = function () {
+    var b = this._battle, me = D678.Game.human();
+    if (!b || b.turn !== 0 || b.finished) return;
+    if (this._selFunc === null) return;
+    var id = me.funcs[this._selFunc];
+    if (!id) return;
+    var r = b.useFunc(0, id);
+    if (!r.ok) { this.notice(r.err || '无法使用'); this.refresh(); return; }
+    this.funcFx();
+    if (r.fail) this.notice('此号牌已在场上');
+    this._selFunc = null;
+    this.afterPlayerAction();
+};
+
+Scene_D678.prototype.afterPlayerAction = function () {
+    var b = this._battle;
+    this._wait = 30;
+    this.refresh();
+    if (b.finished || (b.result && b.result.tie)) this.onBattleEnd();
+};
+
+//=============================================================================
+// 特效
+//=============================================================================
+
+// top 为真时挂到 _fxTopLayer（结算面板之上），否则挂常规特效层
+Scene_D678.prototype.addFx = function (sprite, dur, fn, top) {
+    var layer = top ? this._fxTopLayer : this._fxLayer;
+    layer.addChild(sprite);
+    this._anims.push({ s: sprite, t: 0, d: dur, fn: fn, layer: layer });
+};
+
+Scene_D678.prototype.updateFx = function () {
+    for (var i = this._anims.length - 1; i >= 0; i--) {
+        var a = this._anims[i];
+        a.t++;
+        a.fn(a.s, a.t / a.d, a.t);
+        if (a.t >= a.d) {
+            (a.layer || this._fxLayer).removeChild(a.s);
+            this._anims.splice(i, 1);
+        }
+    }
+};
+
+// 延时若干帧后再放特效：满点演出要分拍，靠它排时序
+Scene_D678.prototype.laterFx = function (delay, fn) {
+    if (delay <= 0) { fn.call(this); return; }
+    this._fxQueue.push({ t: delay, fn: fn });
+};
+
+Scene_D678.prototype.updateFxQueue = function () {
+    for (var i = this._fxQueue.length - 1; i >= 0; i--) {
+        if (--this._fxQueue[i].t <= 0) {
+            var fn = this._fxQueue[i].fn;
+            this._fxQueue.splice(i, 1);
+            fn.call(this);
+        }
+    }
+};
+
+// 震屏：整场景一起偏移。RMMV 的 Scene_Base 没有内建震屏，
+// 这里直接推 this.x / this.y，衰减到 0 时归位。
+Scene_D678.prototype.shake = function (frames, power) {
+    this._shake = frames;
+    this._shakePow = power;
+};
+
+Scene_D678.prototype.updateShake = function () {
+    if (this._shake <= 0) {
+        if (this.x !== 0 || this.y !== 0) { this.x = 0; this.y = 0; }
+        return;
+    }
+    this._shake--;
+    var p = this._shakePow * (this._shake / 10);      // 线性衰减
+    this.x = Math.round((Math.random() - 0.5) * 2 * p);
+    this.y = Math.round((Math.random() - 0.5) * 2 * p);
+    if (this._shake <= 0) { this.x = 0; this.y = 0; }
+};
+
+// 结算面板淡入：满点演出结束后，面板在 MAXFX_FADE 帧内浮出来。
+// _ovSprite 是排名列表 / 弃牌界面共用的，所以那些界面打开时一律按全不透明处理，
+// 只有正在淡入的结算面板才吃 _panelFade。
+Scene_D678.prototype.updatePanelFade = function () {
+    if (this._panelHold > 0) {
+        this._panelHold--;
+        if (this._panelHold > 0) return;
+        this.refresh();      // 压制解除，这一帧把面板画进 _ovBmp
+        // 这里故意不 return：必须在同一帧把不透明度按 _panelFade(=0) 设好。
+        // 否则面板会以全不透明弹出一帧、下一帧再跳回淡入起点，出现一下闪烁。
+    }
+    if (this._showList || this._discardFor || this._showRule) {
+        this._ovSprite.opacity = 255;
+        return;
+    }
+    if (this._panelFade < 1) {
+        this._panelFade = Math.min(1, this._panelFade + 1 / D678.MAXFX_FADE);
+    }
+    this._ovSprite.opacity = Math.round(255 * this._panelFade);
+};
+
+Scene_D678.prototype.ringBitmap = function (color) {
+    var b = new Bitmap(256, 256), ctx = b._context;
+    ctx.strokeStyle = color; ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.arc(128, 128, 100, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(128, 128, 76, 0, Math.PI * 2); ctx.stroke();
+    b._setDirty();
+    return b;
+};
+
+// 所有功能牌通用特效
+Scene_D678.prototype.funcFx = function (cx, cy) {
+    cx = cx === undefined ? LY.SW / 2 : cx;
+    cy = cy === undefined ? 500 : cy;
+    var sp = new Sprite(this.ringBitmap('#ffd766'));
+    sp.anchor.x = sp.anchor.y = 0.5;
+    sp.x = cx; sp.y = cy;
+    this.addFx(sp, 34, function (s, r) {
+        s.scale.x = s.scale.y = 0.3 + r * 1.8;
+        s.opacity = 255 * (1 - r);
+        s.rotation = r * 1.2;
+    });
+    var sp2 = new Sprite(this.ringBitmap('#7fd4ff'));
+    sp2.anchor.x = sp2.anchor.y = 0.5;
+    sp2.x = cx; sp2.y = cy;
+    this.addFx(sp2, 26, function (s, r) {
+        s.scale.x = s.scale.y = 1.6 - r * 1.2;
+        s.opacity = 255 * (1 - r * r);
+    });
+};
+
+// 发牌特效
+Scene_D678.prototype.dealFx = function () {
+    var b = new Bitmap(LY.SW, 260), ctx = b._context;
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(0, 120, LY.SW, 20);
+    b._setDirty();
+    var sp = new Sprite(b);
+    sp.y = 380;
+    this.addFx(sp, 30, function (s, r) {
+        s.opacity = 255 * (1 - r);
+        s.scale.y = 1 + r * 2;
+    });
+};
+
+// 揭牌特效
+Scene_D678.prototype.revealFx = function () {
+    var b = new Bitmap(LY.SW, 200), ctx = b._context;
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, LY.SW, 200);
+    b._setDirty();
+    var sp = new Sprite(b);
+    sp.y = LY.OPP_CARD_Y - 20;
+    sp.blendMode = 1;
+    this.addFx(sp, 28, function (s, r) { s.opacity = 200 * (1 - r); });
+};
+
+//--- 满点演出 --------------------------------------------------------------
+//
+// 满点只可能出现在胜者身上（isMaxVal 要求不爆且恰好等于目标点数；双方都满点
+// 则距离相等 -> 平局，doResolve 在 tie 分支就 return 了，maxPoint 不累计），
+// 所以一次结算最多放一次，不必考虑两边同时演出。
+//
+// 演出放在屏幕正中而不是贴胜者牌区：结算面板占 y 300~680 且几乎不透明，
+// 贴牌区必然被平切。居中 + 走 _fxTopLayer + 面板延后淡入，三者一起才不打架。
+// 三拍的帧数。写成绝对帧而不是比例，是因为「大字开始淡出」和「面板开始淡入」
+// 必须精确对齐同一帧，用比例算两边很容易差出十几帧变成互相打架。
+D678.MAXFX_DELAY = 18;   // 第一拍：只翻底牌，等这么久再砸字
+D678.MAXFX_SHOW  = 44;   // 第二拍：大字独占画面
+D678.MAXFX_FADE  = 16;   // 第三拍：大字淡出 / 面板淡入（同时进行）
+// 面板被压住的总帧数 = 前两拍。到这一帧大字开始退、面板开始进。
+D678.MAXFX_HOLD  = D678.MAXFX_DELAY + D678.MAXFX_SHOW;
+// 结算总时长：普通胜负 150 帧（2.5s），满点 200 帧（约 3.3s）
+D678.RESOLVE_WAIT     = 150;
+D678.RESOLVE_WAIT_MAX = 200;
+
+// 渐变填色的「满点!」位图。textColor 只能纯色，所以直接画在 _context 上
+// （项目里 box / ringBitmap / dealFx 已经是这个路子）。
+Scene_D678.prototype.maxTextBitmap = function () {
+    var W = 640, H = 170;
+    var b = new Bitmap(W, H), ctx = b._context;
+    var txt = '满 点 !';
+    ctx.save();
+    // 走 Bitmap 自己的字体名（GameFont），别写死字体族。
+    // _makeFontNameText 是 MV 内部方法，保险起见留一条回退。
+    b.fontSize = 104;
+    ctx.font = 'bold ' + (b._makeFontNameText ? b._makeFontNameText()
+        : b.fontSize + 'px ' + (b.fontFace || 'GameFont'));
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    var cx = W / 2, cy = H / 2;
+    // 描边由粗到细叠三层，做出一道有厚度的暖色边，比单层 outlineWidth 扎实
+    var edges = [
+        { w: 18, c: 'rgba(90,30,0,0.95)' },
+        { w: 11, c: '#ff8a00' },
+        { w: 5,  c: '#ffd766' }
+    ];
+    ctx.lineJoin = 'round';
+    for (var i = 0; i < edges.length; i++) {
+        ctx.lineWidth = edges[i].w;
+        ctx.strokeStyle = edges[i].c;
+        ctx.strokeText(txt, cx, cy);
+    }
+    // 字面渐变：上白下橙，中段压金色，金属感来自这道过渡
+    var g = ctx.createLinearGradient(0, cy - 54, 0, cy + 54);
+    g.addColorStop(0,    '#fffdf0');
+    g.addColorStop(0.42, '#ffe98a');
+    g.addColorStop(0.62, '#ffc23d');
+    g.addColorStop(1,    '#ff9a1f');
+    ctx.fillStyle = g;
+    ctx.fillText(txt, cx, cy);
+    ctx.restore();
+    b._setDirty();
+    return b;
+};
+
+// 过冲弹性缓动：0 -> OVERSHOOT -> 回落 1.0，尾段小幅回弹。
+// 原来的 0.4 + min(1,r*4)*0.9 在 22 帧就涨到 1.35 然后一秒只是轻抖，
+// 所以观感是「软」的；这条曲线是先砸下来再收住。
+//
+// 过冲只取 1.9：字面实宽约 480px，1.9 倍到约 910px 会溢出 720 的屏宽 ——
+// 这是「砸」下来时想要的冲出画面感，但再大（试过 2.4）就整块糊出屏幕，
+// 看着像渲染出错而不像特效。
+D678.MAXFX_OVERSHOOT = 1.9;
+D678.maxEase = function (r) {
+    var o = D678.MAXFX_OVERSHOOT;
+    if (r < 0.16) return o - (o - 1) * Math.pow(r / 0.16, 0.55);   // 冲入并收缩到 1.0
+    var k = (r - 0.16) / 0.84;
+    return 1.0 + Math.sin(k * Math.PI * 2.2) * 0.05 * (1 - k);     // 余韵回弹
+};
+
+Scene_D678.prototype.maxFx = function (si) {
+    var cx = LY.SW / 2, cy = 470;      // 居中：面板 300~680 的视觉中心
+    var self = this;
+
+    // 1) 冲击白闪 —— 3 帧全屏，卖「砸」的那一下
+    var fb = new Bitmap(LY.SW, LY.SH);
+    fb.fillRect(0, 0, LY.SW, LY.SH, '#ffffff');
+    var flash = new Sprite(fb);
+    flash.blendMode = 1;
+    this.addFx(flash, 10, function (s, r) {
+        s.opacity = 210 * Math.max(0, 1 - r * 3.2);
+    }, true);
+
+    // 2) 轻微震屏
+    this.shake(10, 7);
+
+    // 3) 暗角：压暗牌桌，让大字在花哨的牌面上仍然读得清。
+    //    寿命与大字一致，最后 MAXFX_FADE 帧一起退掉，把画面交还给结算面板。
+    var life = D678.MAXFX_SHOW + D678.MAXFX_FADE;
+    var vb = new Bitmap(LY.SW, LY.SH);
+    var vctx = vb._context;
+    var rg = vctx.createRadialGradient(cx, cy, 120, cx, cy, 620);
+    rg.addColorStop(0, 'rgba(0,0,0,0)');
+    rg.addColorStop(1, 'rgba(0,0,0,0.72)');
+    vctx.fillStyle = rg;
+    vctx.fillRect(0, 0, LY.SW, LY.SH);
+    vb._setDirty();
+    var vig = new Sprite(vb);
+    vig.opacity = 0;
+    this.addFx(vig, life, function (s, r, tick) {
+        var fadeOut = Math.max(0, tick - D678.MAXFX_SHOW) / D678.MAXFX_FADE;
+        s.opacity = 255 * Math.min(1, tick / 6) * (1 - Math.min(1, fadeOut));
+    }, true);
+
+    // 4) 扩散光环两道，错开 6 帧
+    [0, 6].forEach(function (delay, k) {
+        self.laterFx(delay, function () {
+            var ring = new Sprite(this.ringBitmap(k === 0 ? '#ffd766' : '#fff3c4'));
+            ring.anchor.x = ring.anchor.y = 0.5;
+            ring.x = cx; ring.y = cy;
+            this.addFx(ring, 44, function (s, r) {
+                s.scale.x = s.scale.y = 0.15 + Math.pow(r, 0.6) * 2.9;
+                s.opacity = 255 * (1 - r) * (1 - r);
+            }, true);
+        });
+    });
+
+    // 5) 主体大字。缩放走 maxEase（过冲后收住），
+    //    到第 MAXFX_SHOW 帧开始缩小淡出，正好是面板淡入那一帧。
+    var sp = new Sprite(this.maxTextBitmap());
+    sp.anchor.x = sp.anchor.y = 0.5;
+    sp.x = cx; sp.y = cy;
+    this.addFx(sp, life, function (s, r, tick) {
+        var base = D678.maxEase(Math.min(1, tick / D678.MAXFX_SHOW));
+        if (tick <= D678.MAXFX_SHOW) {
+            s.opacity = 255;
+            s.scale.x = s.scale.y = base;
+        } else {
+            var k = Math.min(1, (tick - D678.MAXFX_SHOW) / D678.MAXFX_FADE);
+            s.opacity = 255 * (1 - k);
+            s.scale.x = s.scale.y = base * (1 - k * 0.25);
+        }
+    }, true);
+};
+
+//=============================================================================
+// 流程
+//=============================================================================
+
+// 注意：下方「新手教程」一节覆写了 start，改为先进入询问画面，
+// 玩家选「知道规则」后才走 beginRound。
+Scene_D678.prototype.start = function () {
+    Scene_Base.prototype.start.call(this);
+    this.startFadeIn(this.fadeSpeed(), false);
+    this.beginRound();
+};
+
+Scene_D678.prototype.pushMsg = function (s) {
+    if (!s) return;
+    this._msgs.push(s);
+    while (this._msgs.length > 3) this._msgs.shift();
+};
+
+Scene_D678.prototype.beginRound = function () {
+    if (this.checkGameEnd()) return;
+    var g = D678.Game, me = g.human();
+    this._msgs = [];
+    this._report = null;
+    this._selFunc = null;
+    this._notice = '';
+    // 结算演出状态不跨轮残留，免得上一轮跳过时留下半透明的面板
+    this._panelHold = 0;
+    this._panelFade = 1;
+    var r = g.makeRound();
+    this._roundInfo = r;
+    // 清空本轮胜负前先存一份，好让对战途中打开排名仍能看到上一轮的结果
+    g.players.forEach(function (p) {
+        if (p.alive) { p.prevLast = p.last; p.last = null; }
+    });
+    if (r.bye) r.bye.last = { type: 'bye', dmg: 0 };
+
+    var myPair = null;
+    for (var i = 0; i < r.pairs.length; i++) {
+        if (r.pairs[i][0] === me || r.pairs[i][1] === me) myPair = r.pairs[i];
+    }
+    this._myPair = myPair;
+    if (!myPair) {                       // 玩家轮空
+        this._battle = null;
+        this._lastLog = null;            // 轮空没有对战记录
+        this.simulateOthers();
+        this.handleElimination();
+        this._phase = 'roundResult';
+        this._notice = '本轮轮空';
+        this._wait = 20;
+        this.buildRoundReport();
+        this.refresh();
+        return;
+    }
+    var opp = (myPair[0] === me) ? myPair[1] : myPair[0];
+    this._battle = new D678_Battle(me, opp, false);
+    this._tieShown = false;
+    this._phase = 'battle';
+    this._wait = 40;
+    this.dealFx();
+    this.refresh();
+};
+
+Scene_D678.prototype.update = function () {
+    Scene_Base.prototype.update.call(this);
+    this.updateCardSprites();
+    this.updateFxQueue();
+    this.updateFx();
+    this.updateShake();
+    this.updatePanelFade();
+    if (this._noticeTime > 0) {
+        this._noticeTime--;
+        if (this._noticeTime === 0) { this._notice = ''; this.refresh(); }
+    }
+    this.updateInput();
+    if (this._discardFor || this._showList) return;
+    if (this._wait > 0) { this._wait--; return; }
+    switch (this._phase) {
+    case 'battle':  this.updateBattle(); break;
+    case 'tie':     this.doRedeal(); break;
+    case 'resolve': this.finishBattle(); break;
+    }
+};
+
+Scene_D678.prototype.updateBattle = function () {
+    var b = this._battle;
+    if (!b) return;
+    if (b.finished || (b.result && b.result.tie)) { this.onBattleEnd(); return; }
+    if (b.turn === 1) {
+        var ev = D678.AI.step(b, 1);
+        if (ev.action === 'func') this.funcFx();
+        this.pushMsg(ev.msg);
+        this._wait = 45;
+        this.refresh();
+        if (b.finished || (b.result && b.result.tie)) this.onBattleEnd();
+    }
+};
+
+Scene_D678.prototype.onBattleEnd = function () {
+    var b = this._battle;
+    if (b.result && b.result.tie) {
+        if (this._phase === 'tie') return;
+        this._phase = 'tie';
+        b.revealed = true;
+        this.revealFx();
+        // 平局不可能满点（双方同点在 doResolve 里走 tie 分支），面板照旧立刻画
+        this._panelHold = 0;
+        this._panelFade = 1;
+        this.pushMsg('平局，重新发牌');
+        this._wait = 100;
+        this.refresh();
+        return;
+    }
+    if (b.finished && this._phase !== 'resolve') {
+        this._phase = 'resolve';
+        var r = b.result;
+        this.revealFx();
+        var isMax = !!(r.maxes[0] || r.maxes[1]);
+        if (isMax) {
+            // 满点：先翻底牌，第 MAXFX_DELAY 帧砸大字，这段时间不画结算面板。
+            // 只有满点才拉长（约 3.3 秒），普通胜负仍是 150 帧（2.5 秒）。
+            this._panelHold = D678.MAXFX_HOLD;
+            this._panelFade = 0;
+            var side = r.maxes[0] ? 0 : 1;
+            this.laterFx(D678.MAXFX_DELAY, function () { this.maxFx(side); });
+            this._wait = D678.RESOLVE_WAIT_MAX;
+        } else {
+            this._panelHold = 0;
+            this._panelFade = 1;
+            this._wait = D678.RESOLVE_WAIT;
+        }
+        // 拼点阶段不报伤害，只报胜负
+        this.pushMsg(r.winner === 0 ? '胜' : '负');
+        this.refresh();
+    }
+};
+
+Scene_D678.prototype.doRedeal = function () {
+    var b = this._battle;
+    b.pendingRedeal = false;
+    b.result = null;
+    b.redeals++;
+    this._panelHold = 0;
+    this._panelFade = 1;
+    b.newDeal();
+    this._msgs = ['平局，已重新发牌'];
+    this._phase = 'battle';
+    this._wait = 40;
+    this.dealFx();
+    this.refresh();
+};
+
+Scene_D678.prototype.finishBattle = function () {
+    var b = this._battle;
+    var need = b.grantFuncs();
+    var human = D678.Game.human();
+    var humanNeed = false;
+    need.forEach(function (p) {
+        if (p.isHuman) humanNeed = true; else D678.autoDiscard(p);
+    });
+    this.handleElimination();
+    if (humanNeed && human.alive && human.funcs.length > D678.MAX_FUNC) {
+        this._discardFor = human;
+        this._discardSel = [];
+        this._phase = 'discard';
+        this.refresh();
+        return;
+    }
+    this.afterDiscard();
+};
+
+Scene_D678.prototype.afterDiscard = function () {
+    this.simulateOthers();
+    this.handleElimination();
+    // 轮结果画面要展示本局对战记录，_battle 置空前先把日志留下来
+    this._lastLog = (this._battle && this._battle.log) ? this._battle.log.slice(0) : null;
+    this._battle = null;
+    this._phase = 'roundResult';
+    this._notice = '本轮结束　点击继续';
+    this._wait = 20;
+    this.buildRoundReport();
+    this.refresh();
+};
+
+Scene_D678.prototype.simulateOthers = function () {
+    var r = this._roundInfo, mp = this._myPair;
+    if (!r) return;
+    for (var i = 0; i < r.pairs.length; i++) {
+        var pr = r.pairs[i];
+        if (mp && pr === mp) continue;
+        if (!pr[0].alive || !pr[1].alive) continue;
+        D678.simulateMatch(pr[0], pr[1]);
+        this.handleElimination();
+    }
+};
+
+Scene_D678.prototype.handleElimination = function () {
+    var g = D678.Game, changed = false;
+    g.players.forEach(function (p) {
+        if (!p.alive && p.funcs.length > 0) { g.returnAllFuncs(p); changed = true; }
+    });
+    if (changed) g.resetPairLog();
+};
+
+Scene_D678.prototype.buildRoundReport = function () {
+    var r = this._roundInfo, rows = [];
+    if (!r) { this._report = null; return; }
+    for (var i = 0; i < r.pairs.length; i++) {
+        var a = r.pairs[i][0], b = r.pairs[i][1];
+        var mine = (a.isHuman || b.isHuman);
+        var w = (a.last && a.last.type === 'win') ? a : ((b.last && b.last.type === 'win') ? b : null);
+        if (!w) { rows.push({ type: 'none', win: a.name, lose: b.name, me: mine }); continue; }
+        var l = (w === a) ? b : a;
+        rows.push({ type: 'match', win: w.name, lose: l.name, dmg: l.last.dmg,
+                    out: !l.alive, me: mine });
+    }
+    if (r.bye) rows.push({ type: 'bye', win: r.bye.name, me: r.bye.isHuman });
+    this._report = rows;
+};
+
+// 结算报表：各列对齐
+Scene_D678.prototype.drawReport = function (rows, x, y, lineH) {
+    var bmp = this._uiBmp;
+    // 列位置（相对 x）
+    var cWin = 0, cW = 132, cVS = 176, cL = 224, cLose = 268, cDmg = 400;
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i], yy = y + i * lineH;
+        // 玩家自己的那一场用金框标出来
+        if (r.me) {
+            this.box(bmp, x - 14, yy - 7, 588, lineH - 4, 'rgba(255,215,102,0.12)', COL.gold, 6);
+        }
+        if (r.type === 'bye') {
+            this.txt(bmp, r.win, x + cWin, yy, 130, 22, COL.white, 'right');
+            this.txt(bmp, '轮空', x + cW, yy, 120, 22, COL.gold, 'left');
+            continue;
+        }
+        if (r.type === 'none') {
+            this.txt(bmp, r.win, x + cWin, yy, 130, 22, COL.gray, 'right');
+            this.txt(bmp, '未进行', x + cW, yy, 160, 22, COL.gray, 'left');
+            continue;
+        }
+        this.txt(bmp, r.win,  x + cWin,  yy, 130, 22, COL.white, 'right');
+        this.txt(bmp, '胜',   x + cW,    yy, 40,  22, COL.red,   'left');
+        this.txt(bmp, 'VS',   x + cVS,   yy, 40,  22, COL.gray,  'left');
+        this.txt(bmp, '负',   x + cL,    yy, 40,  22, COL.green, 'left');
+        this.txt(bmp, r.lose, x + cLose, yy, 130, 22, COL.white, 'left');
+        this.txt(bmp, '-' + r.dmg + (r.out ? ' 淘汰' : ''), x + cDmg, yy, 160, 22,
+            r.out ? COL.red : COL.green, 'left');
+    }
+};
+
+Scene_D678.prototype.nextRound = function () {
+    if (this.checkGameEnd()) return;
+    this.beginRound();
+};
+
+Scene_D678.prototype.checkGameEnd = function () {
+    var g = D678.Game;
+    if (!g.human().alive) {
+        this._phase = 'gameover';
+        this._battle = null;
+        this._notice = '你被淘汰了……';
+        var me = g.human();
+        this._report = this.buildFinalReport(g.rankedPlayers().indexOf(me) + 1);
+        this.refresh();
+        return true;
+    }
+    if (g.alivePlayers().length <= 1) {
+        this._phase = 'gameover';
+        this._battle = null;
+        this._notice = '最后的幸存者！你赢得了这场赌局！';
+        this._report = this.buildFinalReport(1);
+        this.refresh();
+        return true;
+    }
+    return false;
+};
+
+// 淘汰 / 通关画面的战绩表。胜率与满点率的分母是真正打完的场次（平局重发不计入）
+Scene_D678.prototype.buildFinalReport = function (rank) {
+    var g = D678.Game, me = g.human();
+    return [
+        '最终名次：第 ' + rank + ' 名 / ' + g.players.length + ' 人',
+        '最终 HP：' + me.showHp() + '　对局 ' + me.games() + ' 场',
+        '胜 ' + me.wins + '　负 ' + me.losses + '　胜率 ' + me.rateText(me.winRate()),
+        '满点 ' + me.maxPoint + ' 次　满点率 ' + me.rateText(me.maxRate()),
+        '共使用功能牌 ' + (me.funcUses || 0) + ' 次'
+    ];
+};
+
+Scene_D678.prototype.leaveScene = function () {
+    if (this._leaving) return;
+    this._leaving = true;
+    SceneManager.pop();
+};
+
+//--- 非对局画面的补充绘制 --------------------------------------------------
+
+var _D678_refresh = Scene_D678.prototype.refresh;
+Scene_D678.prototype.refresh = function () {
+    _D678_refresh.call(this);
+    if (!this._battle) {
+        this.syncFuncSprites([], 20, LY.FUNC_Y);
+        var bmp = this._uiBmp;
+        this.box(bmp, 40, 268, 640, 300, 'rgba(0,0,0,0.5)', COL.line, 12);
+        this.txt(bmp, '第 ' + D678.Game.round + ' 轮结果', 0, 286, LY.SW, 28, COL.gold, 'center');
+        var rows = this._report || [];
+        if (rows.length && typeof rows[0] === 'string') {
+            for (var i = 0; i < rows.length; i++) {
+                this.txt(bmp, rows[i], 0, 340 + i * 42, LY.SW, 22, COL.white, 'center');
+            }
+        } else {
+            this.drawReport(rows, 66, 340, 42);
+        }
+        this.drawBattleLog();
+        var over = (this._phase === 'gameover');
+        this.txt(bmp, this._notice || (over ? '' : '点击继续'), 0, 1066, LY.SW, 24, COL.gold, 'center');
+        if (!over) {
+            this.txt(bmp, '点击上方血条查看全体排名与统计', 0, 1100, LY.SW, 20, COL.gray, 'center');
+        } else {
+            // 结束后画面保留，另给一个返回主菜单的按钮
+            this.drawBackButton();
+        }
+    }
+};
+
+// 本局对战记录：画在「第X轮结果」界面，谁做了什么、动作后的牌面
+Scene_D678.prototype.drawBattleLog = function () {
+    var bmp = this._uiBmp;
+    var log = this._lastLog || [];
+    var x = 40, y = 584, w = 640, h = 470, lineH = 24;
+    var maxLines = 16;
+    this.box(bmp, x, y, w, h, 'rgba(0,0,0,0.5)', COL.line, 12);
+    this.txt(bmp, '本局对战记录', x, y + 8, w, 20, COL.gold, 'center');
+
+    if (!log.length) {
+        this.txt(bmp, '（本轮轮空，无对战记录）', x, y + 44, w, 18, COL.gray, 'center');
+        return;
+    }
+    // 超出可显示行数时只留最近的，开头标注省略了多少条
+    var start = 0, shown = log;
+    if (log.length > maxLines) {
+        start = log.length - maxLines;
+        shown = log.slice(start);
+    }
+    var ly = y + 38;
+    if (start > 0) {
+        this.txt(bmp, '…前 ' + start + ' 条已省略', x + 16, ly, w - 32, 16, COL.gray, 'left');
+        ly += 20;
+    }
+    for (var i = 0; i < shown.length; i++) {
+        var e = shown[i];
+        // 我方一行用青色、对方用橙色，一眼分得清是谁的动作
+        var col = (e.side === 0) ? COL.aqua : COL.orange;
+        this.txt(bmp, e.name + e.what, x + 16, ly, 430, 18, col, 'left');
+        this.txt(bmp, e.hand, x + 452, ly, 172, 18, COL.white, 'right');
+        ly += lineH;
+    }
+};
+
+// 「返回主菜单」按钮：只在游戏结束、且没有弹出层挡着时可点
+Scene_D678.prototype.drawBackButton = function () {
+    var bmp = this._uiBmp;
+    var x = 210, y = 1120, w = 300, h = 70;
+    this.box(bmp, x, y, w, h, 'rgba(60,140,90,0.9)', COL.gold, 10);
+    this.txt(bmp, '返回主菜单', x, y + 20, w, 28, COL.white, 'center');
+    if (!this._showList && !this._discardFor) {
+        this._hits.push({ x: x, y: y, w: w, h: h, cb: this.backToTitle.bind(this) });
+    }
+};
+
+Scene_D678.prototype.backToTitle = function () {
+    if (this._leaving) return;
+    this._leaving = true;
+    D678.Game = null;
+    AudioManager.stopBgm();
+    AudioManager.stopBgs();
+    SceneManager.goto(Scene_Title);
+};
+
+
+
+//=============================================================================
+// 新手教程
+//=============================================================================
+
+// 固定牌序：发牌吃掉前 4 张（我方底牌 5 / 对方底牌 1 / 我方明牌 6 / 对方明牌 11），
+// 之后依次是我方要牌 3、我方要牌 7、对方要牌 9，最终双方 21 点平局。
+D678.TUT_DECK = [5, 1, 6, 11, 3, 7, 9, 2, 4, 8, 10];
+
+// 框选目标：坐标全部跟着实际绘制代码算，不写死重复的魔法数字
+Scene_D678.prototype.tutRect = function (key) {
+    switch (key) {
+    case 'hp':       return { x: 12, y: 8, w: 696, h: 60 };
+    case 'rank':     return { x: 574, y: 14, w: 134, h: 44 };
+    case 'unseen':   return { x: 18, y: 534, w: 688, h: 32 };
+    case 'oppLog':   return { x: 374, y: 446, w: 326, h: 104 };
+    case 'hit':      return { x: 26, y: LY.BTN_Y - 4, w: 308, h: 76 };
+    case 'stand':    return { x: 386, y: LY.BTN_Y - 4, w: 308, h: 76 };
+    case 'myCards':  return this.tutCardRect(0, 0, -1);
+    case 'oppCards': return this.tutCardRect(1, 0, -1);
+    case 'oppHole':  return this.tutCardRect(1, 0, 0);
+    case 'allCards':                       // 双方牌区一起框住
+        var a = this.tutCardRect(1, 0, -1), c = this.tutCardRect(0, 0, -1);
+        if (!a || !c) return null;
+        var x = Math.min(a.x, c.x), y = Math.min(a.y, c.y);
+        return { x: x, y: y,
+                 w: Math.max(a.x + a.w, c.x + c.w) - x,
+                 h: Math.max(a.y + a.h, c.y + c.h) - y };
+    }
+    return null;
+};
+
+// 卡牌框：沿用 refreshCards 的排布算法，牌数变了框也跟着变（to = -1 表示到最后一张）
+Scene_D678.prototype.tutCardRect = function (si, from, to) {
+    var b = this._battle;
+    if (!b) return null;
+    var n = b.sides[si].cards.length;
+    if (to < 0) to = n - 1;
+    var span = Math.min(LY.CARD_W + 12, Math.floor(660 / Math.max(n, 1)));
+    var totalW = span * (n - 1) + LY.CARD_W;
+    var sx = Math.floor((LY.SW - totalW) / 2);
+    var y = (si === 0) ? LY.MY_CARD_Y : LY.OPP_CARD_Y;
+    var x0 = sx + span * from, x1 = sx + span * to + LY.CARD_W;
+    return { x: x0 - 6, y: y - 6, w: (x1 - x0) + 12, h: LY.CARD_H + 12 };
+};
+
+// 教程脚本。每步: box 框选目标 / lines 文字(1~3句) / allow 允许的按钮
+//   allow 为 null 时点任意处推进；为 'hit'/'stand' 时只有该按钮可点，
+//   点另一个按钮会弹 hitMsg / standMsg 而不真的执行。
+//   wait 为自动推进的帧数（用于展示对方回合这类不需要玩家点的步骤）。
+//   enter 在进入该步时调用一次。
+D678.TUT_STEPS = [
+    { box: 'hp', lines: [
+        '这是玩家的生命值，如果生命值降为 0 游戏将会失败',
+        '对局失败了会 -1 生命值，如果爆牌会额外 -1 生命值'] },
+    { box: 'hp', lines: [
+        '对方满点胜利，也会额外 -1 生命值',
+        '每次对局失败都会累计 -1 生命值'] },
+    { box: 'rank', lines: ['点击此处打开目前排名情况'] },
+    { box: null, openRank: true, lines: [
+        '这是 ' + '{N}' + ' 位玩家的排名情况，记得点开查看'] },
+    { box: null, closeRank: true, lines: [
+        '游戏为 21 点规则',
+        '低于 21 点哪方接近 21 点则获胜',
+        '如果超过了 21 点就属于爆牌'] },
+    { box: null, lines: [
+        '爆牌后无论是否接近 21 点，都无法获胜',
+        '比如对方 3 点、我方 22 点，也是我方输了本局'] },
+    { box: 'allCards', lines: [
+        '每局每名玩家会发两张牌',
+        '一张底牌，一张明牌'] },
+    { box: 'allCards', lines: [
+        '双方都无法查看对方的底牌，明牌是可见的',
+        '数字牌不会重复，从 1-11 随机抽出发出'] },
+    { box: 'myCards', lines: ['比方已经拿到了底牌 5 跟明牌 6'] },
+    { box: 'oppHole', lines: [
+        '那么对方的底牌里肯定就不会是 5 跟 6',
+        '包括对方已有的明牌 11 也是不会有的'] },
+    { box: 'unseen', lines: [
+        '此处是记牌区，所有未见过的数字牌就会在此显示',
+        '金色的数字就是拿了不会爆牌的数字牌',
+        '红色的数字 10 则是拿到了以后达到 21 点的牌'] },
+    { box: 'allCards', lines: [
+        '每局发牌后由牌面小的一方先手行动',
+        '对方明牌 11，我方明牌 6，那么就由我方开始行动'] },
+    { box: 'hit',   lines: ['点击要牌按钮即可要牌'] },
+    { box: 'stand', lines: ['点击过牌按钮则会轮到对方行动'] },
+    { box: 'hit', allow: 'hit',
+      standMsg: '教程里请先点要牌',
+      lines: [
+        '由于我方目前的总点数是 11 点，肯定无法赢得对方',
+        '那么请点击要牌按钮选择要牌'] },
+    { box: 'myCards', lines: [
+        '我方获得了数字 3',
+        '要牌后就会轮到对方行动'] },
+    // 对方回合：自动播放，不需要玩家点
+    { box: null, oppAct: 'stand', wait: 90, lines: ['对方选择了过牌'] },
+    { box: 'oppLog', lines: [
+        '此处会记录对方的行动，对方选择了过牌就会显示在此'] },
+    { box: 'allCards', lines: [
+        '我方目前总点数是 14 点，对方明牌是 11',
+        '如果对方底牌超过 3 的话，那么我方则无法获胜',
+        '要合理推理出对方的底牌并最终拼点获胜'] },
+    { box: null, lines: [
+        '现在轮到你操作了',
+        '点击过牌后双方就会进入揭底牌阶段',
+        '目前牌面不一定能赢得对方'] },
+    { box: 'hit', allow: 'hit',
+      standMsg: '目前牌面不一定能赢得对方，请选择要牌',
+      lines: ['那么请点击要牌按钮选择要牌'] },
+    { box: 'myCards', lines: [
+        '我方获得了数字 7，目前是 21 点',
+        '要牌后轮到对方行动'] },
+    { box: null, oppAct: 'hit', wait: 90, lines: [
+        '对方选择了要牌，获得了数字 9'] },
+    { box: 'stand', allow: 'stand',
+      hitMsg: '目前已经 21 点了，再要牌就会爆牌了',
+      lines: [
+        '我方已经 21 点，再要牌必定爆牌',
+        '正常对局中即使 21 点的情况下也能继续要牌',
+        '请慎重查看每局的对战情况来做出行动选择'] },
+    { box: null, lines: [
+        '对方刚才要牌了，所以连续过牌次数重新计算',
+        '还需要对方也过牌一次才会揭底牌'] },
+    { box: null, oppAct: 'stand', wait: 100, showdown: true, lines: [
+        '双方连续过牌两次，此时将会揭开双方底牌'] },
+    { box: null, lines: [
+        '对方 21 点，我方也是 21 点',
+        '那么这局就是平局处理，需要重新对局'] },
+    { box: null, lines: [
+        '游戏除了普通数字牌外，还会有不同的功能牌',
+        '通过游戏过程了解具体使用方式和功能'] },
+    { box: null, lines: ['祝你获得好的成绩获得冠军！'] }
+];
+
+//--- 教程流程 --------------------------------------------------------------
+
+Scene_D678.prototype.startTutorial = function () {
+    var g = D678.Game, me = g.human();
+    // 教程对手不能是超哥：他看得见底牌，会和「双方都无法查看对方的底牌」矛盾
+    var cand = g.players.filter(function (p) { return !p.isHuman && !p.isGod; });
+    var opp = cand.length ? D678.rndPick(cand) : g.players[1];
+    me.funcs = []; opp.funcs = [];
+    var b = new D678_Battle(me, opp, false);
+    // 覆写成固定开局：教程每句话都要对得上具体牌面，不能交给随机
+    b.deck = D678.TUT_DECK.slice(4);
+    b.rule = null;
+    b.sides[0].cards = [{ v: 5, hidden: true }, { v: 6, hidden: false }];
+    b.sides[1].cards = [{ v: 1, hidden: true }, { v: 11, hidden: false }];
+    b.sides[0].stood = false;  b.sides[1].stood = false;
+    b.sides[0].checkN = 0;     b.sides[1].checkN = 0;
+    b.standStreak = 0;
+    b.turn = 0;                     // 明牌 6 < 11，我方先手
+    b.revealed = false;
+    b.log = [];
+    this._battle = b;
+    this._tutOpp = opp;
+    this._tutOn  = true;
+    this._tutIdx = 0;
+    this._tutWait = 0;
+    this._tutFrame = 0;
+    this._tutShowdown = false;
+    this._phase = 'tut';
+    this._msgs = [];
+    this.dealFx();
+    this.tutEnter();
+};
+
+Scene_D678.prototype.tutStep = function () {
+    return this._tutOn ? (D678.TUT_STEPS[this._tutIdx] || null) : null;
+};
+
+Scene_D678.prototype.tutEnter = function () {
+    var s = this.tutStep();
+    if (!s) { this.endTutorial(); return; }
+    this._tutWait = s.wait || 0;
+    if (s.openRank)  this._showList = true;
+    if (s.closeRank) this._showList = false;
+    if (s.oppAct) {
+        this._msgs = [];
+        this.pushMsg(this._battle.act(1, s.oppAct).msg);
+    }
+    if (s.showdown) {
+        this._tutShowdown = true;
+        this._battle.revealed = true;
+        this.revealFx();
+    }
+    this.refresh();
+};
+
+Scene_D678.prototype.tutAdvance = function () {
+    this._tutIdx++;
+    this.tutEnter();
+};
+
+Scene_D678.prototype.endTutorial = function () {
+    this._tutOn = false;
+    this._tutShowdown = false;
+    this._showList = false;
+    this._battle = null;
+    this._msgs = [];
+    if (this._tutArrow) this._tutArrow.visible = false;
+    if (this._tutBmp) this._tutBmp.clear();
+    // 教程打平：不掉血、不计胜负、round 仍是 0，接着就是正式第 1 轮
+    this.beginRound();
+};
+
+//--- 教程输入：只有当前步该点的地方生效 ------------------------------------
+
+Scene_D678.prototype.tutUpdateInput = function () {
+    var s = this.tutStep();
+    if (!s) return true;
+    var click = TouchInput.isTriggered();
+    var key   = Input.isTriggered('ok') || Input.isTriggered('c');
+    if (!click && !key) return true;
+
+    // 键盘/手柄：确定键等价于按下当前步允许的按钮，没有则直接推进
+    if (key && !click) {
+        if (s.allow === 'hit' || s.allow === 'stand') this.tutAct(s.allow);
+        else this.tutAdvance();
+        return true;
+    }
+    var x = TouchInput.x, y = TouchInput.y;
+    var rh = this.tutRect('hit'), rs = this.tutRect('stand');
+    var inRect = function (r) {
+        return r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+    };
+    if (inRect(rh)) {
+        if (s.allow === 'hit') this.tutAct('hit');
+        else { this.notice(s.hitMsg || '教程里这一步还不能要牌'); this.refresh(); }
+        return true;
+    }
+    if (inRect(rs)) {
+        if (s.allow === 'stand') this.tutAct('stand');
+        else { this.notice(s.standMsg || '教程里这一步还不能过牌'); this.refresh(); }
+        return true;
+    }
+    // 需要按按钮的步骤：点空白处不推进，避免玩家一路乱点跳过操作练习
+    if (!s.allow) this.tutAdvance();
+    return true;
+};
+
+Scene_D678.prototype.tutAct = function (action) {
+    this._notice = ''; this._noticeTime = 0;
+    this._msgs = [];
+    this._battle.act(0, action);
+    this.tutAdvance();
+};
+
+Scene_D678.prototype.updateTut = function () {
+    this._tutFrame++;
+    if (this._tutWait > 0) {
+        this._tutWait--;
+        if (this._tutWait === 0) this.tutAdvance();
+    }
+    this.updateTutArrow();
+};
+
+//--- 教程绘制：文字带 + 框选框 + 指向箭头 ------------------------------------
+
+Scene_D678.prototype.createTutLayer = function () {
+    if (this._tutSprite) return;
+    this._tutBoxBmp = new Bitmap(LY.SW, LY.SH);
+    this._tutBoxSprite = new Sprite(this._tutBoxBmp);
+    this.addChild(this._tutBoxSprite);
+    this._tutBmp = new Bitmap(LY.SW, LY.SH);
+    this._tutSprite = new Sprite(this._tutBmp);
+    this.addChild(this._tutSprite);
+    this._tutArrow = new Sprite(this.tutArrowBitmap());
+    this._tutArrow.anchor.x = 0.5;
+    this._tutArrow.visible = false;
+    this.addChild(this._tutArrow);
+};
+
+Scene_D678.prototype.tutArrowBitmap = function () {
+    var b = new Bitmap(72, 56), ctx = b._context;
+    ctx.fillStyle = COL.red;
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(36, 52); ctx.lineTo(6, 8); ctx.lineTo(66, 8);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    b._setDirty();
+    return b;
+};
+
+Scene_D678.prototype.drawTut = function () {
+    this.createTutLayer();
+    var s = this.tutStep();
+    this._tutBoxBmp.clear();
+    this._tutBmp.clear();
+    if (!s) { this._tutArrow.visible = false; return; }
+
+    // 框选框：box 的描边固定 2px，单圈在手机上太细，
+    // 所以叠四圈做出一道有厚度的红色光边，由内到外逐层变淡。
+    var r = s.box ? this.tutRect(s.box) : null;
+    if (r) {
+        var rings = [
+            { d: 0,  c: COL.red },
+            { d: 3,  c: COL.red },
+            { d: 7,  c: 'rgba(255,90,90,0.55)' },
+            { d: 11, c: 'rgba(255,90,90,0.24)' }
+        ];
+        for (var k = 0; k < rings.length; k++) {
+            var d = rings[k].d;
+            this.box(this._tutBoxBmp, r.x - d, r.y - d, r.w + d * 2, r.h + d * 2,
+                null, rings[k].c, 10 + d);
+        }
+    }
+    // 指向箭头：只在需要玩家按按钮的步骤出现
+    var arrow = (s.allow && r);
+    this._tutArrow.visible = !!arrow;
+    if (arrow) {
+        this._tutArrow.x = r.x + r.w / 2;
+        this._tutArrowY = r.y - 62;
+    }
+    // 文字带：放在功能牌那条空带，教程期间玩家 0 张功能牌，不会挡东西
+    var bmp = this._tutBmp;
+    var n = D678.Game ? D678.Game.players.length : 8;
+    var lines = s.lines.map(function (t) { return t.replace('{N}', String(n)); });
+    var bx = 30, by = 900, bw = 660, bh = 60 + lines.length * 34;
+    this.box(bmp, bx, by, bw, bh, 'rgba(0,0,0,0.86)', COL.gold, 12);
+    this.txt(bmp, '新手教程', bx, by + 10, bw, 17, COL.gray, 'center');
+    for (var i = 0; i < lines.length; i++) {
+        this.txt(bmp, lines[i], bx + 20, by + 38 + i * 34, bw - 40, 21, COL.white, 'center');
+    }
+    var tip = s.allow
+        ? '请点击上方指示的按钮'
+        : (this._tutWait > 0 ? '（点击可加速）' : '点击任意处继续');
+    this.txt(bmp, tip, bx, by + bh - 26, bw, 16, COL.gold, 'center');
+};
+
+Scene_D678.prototype.updateTutArrow = function () {
+    if (!this._tutArrow || !this._tutArrow.visible) return;
+    var t = this._tutFrame;
+    this._tutArrow.y = this._tutArrowY + Math.sin(t * 0.14) * 9;
+    this._tutArrow.opacity = 205 + Math.sin(t * 0.14) * 50;
+    if (this._tutBoxSprite) {
+        this._tutBoxSprite.opacity = 190 + Math.sin(t * 0.1) * 65;
+    }
+};
+
+//--- 开局询问：是否已经知道规则 ---------------------------------------------
+
+Scene_D678.prototype.askButtons = function () {
+    return [
+        { x: 110, y: 600, w: 500, h: 96, label: '我知道规则，直接开始', tut: false },
+        { x: 110, y: 720, w: 500, h: 96, label: '不知道，教我一遍',     tut: true  }
+    ];
+};
+
+Scene_D678.prototype.drawAsk = function () {
+    var bmp = this._uiBmp;
+    bmp.clear();
+    this._hits = [];
+    this.box(bmp, 60, 392, 600, 136, 'rgba(0,0,0,0.7)', COL.gold, 14);
+    this.txt(bmp, '你知道本游戏的规则吗？', 60, 420, 600, 26, COL.white, 'center');
+    this.txt(bmp, '选择「教我一遍」会先进行一场固定开局的教学对局',
+        60, 470, 600, 17, COL.gray, 'center');
+    var btns = this.askButtons();
+    for (var i = 0; i < btns.length; i++) {
+        var b = btns[i], on = (this._askSel === i);
+        this.box(bmp, b.x, b.y, b.w, b.h,
+            on ? 'rgba(70,175,110,0.95)' : 'rgba(0,0,0,0.6)',
+            on ? COL.gold : COL.line, 12);
+        if (on) this.box(bmp, b.x + 8, b.y + 6, b.w - 16, 28, 'rgba(255,255,255,0.18)', null, 7);
+        this.txt(bmp, b.label, b.x, b.y + 32, b.w, 26, on ? COL.white : COL.gray, 'center');
+        this._hits.push({ x: b.x, y: b.y, w: b.w, h: b.h,
+            cb: this.onAskChoose.bind(this, i) });
+    }
+    this.txt(bmp, '点击选择，或用方向键选择后按确定键', 0, 856, LY.SW, 18, COL.gray, 'center');
+};
+
+Scene_D678.prototype.askUpdateInput = function () {
+    if (Input.isRepeated('down') || Input.isRepeated('right')) {
+        this._askSel = (this._askSel + 1) % 2; this.refresh(); return;
+    }
+    if (Input.isRepeated('up') || Input.isRepeated('left')) {
+        this._askSel = (this._askSel + 1) % 2; this.refresh(); return;
+    }
+    if (Input.isTriggered('ok') || Input.isTriggered('c')) {
+        this.onAskChoose(this._askSel); return;
+    }
+};
+
+Scene_D678.prototype.onAskChoose = function (i) {
+    if (this._phase !== 'ask') return;
+    var b = this.askButtons()[i];
+    if (!b) return;
+    this._askSel = i;
+    if (b.tut) this.startTutorial();
+    else { this._phase = 'init'; this.beginRound(); }
+};
+
+//--- 钩子 ------------------------------------------------------------------
+
+var _D678_tut_create = Scene_D678.prototype.create;
+Scene_D678.prototype.create = function () {
+    _D678_tut_create.call(this);
+    this._tutOn = false;
+    this._askSel = 0;
+};
+
+// start 原本直接 beginRound，改成先弹询问
+Scene_D678.prototype.start = function () {
+    Scene_Base.prototype.start.call(this);
+    this.startFadeIn(this.fadeSpeed(), false);
+    this._phase = 'ask';
+    this.refresh();
+};
+
+var _D678_tut_update = Scene_D678.prototype.update;
+Scene_D678.prototype.update = function () {
+    if (this._phase === 'ask') {
+        Scene_Base.prototype.update.call(this);
+        this._ovSprite.opacity = 255;
+        this.updateInput();
+        this.askUpdateInput();
+        return;
+    }
+    if (this._tutOn) {
+        Scene_Base.prototype.update.call(this);
+        this.updateCardSprites();
+        this.updateFxQueue();
+        this.updateFx();
+        this.updateShake();
+        // 教程固定打成 21:21 平局，不会满点，面板一律全不透明
+        this._ovSprite.opacity = 255;
+        if (this._noticeTime > 0) {
+            this._noticeTime--;
+            if (this._noticeTime === 0) { this._notice = ''; this.refresh(); }
+        }
+        this.tutUpdateInput();
+        this.updateTut();
+        return;
+    }
+    _D678_tut_update.call(this);
+};
+
+// 教程期间：按钮外观按当前步是否允许来画，其余点击区域一律不注册
+var _D678_tut_drawButtons = Scene_D678.prototype.drawButtons;
+Scene_D678.prototype.drawButtons = function (b) {
+    if (!this._tutOn) { _D678_tut_drawButtons.call(this, b); return; }
+    var s = this.tutStep();
+    var bmp = this._uiBmp, bw = 300, bh = 68, y = LY.BTN_Y;
+    var onHit   = !!(s && s.allow === 'hit');
+    var onStand = !!(s && s.allow === 'stand');
+    this.box(bmp, 30, y, bw, bh, onHit ? 'rgba(60,140,90,0.85)' : 'rgba(60,60,60,0.6)', COL.line, 10);
+    this.txt(bmp, '要牌', 30, y + 18, bw, 28, onHit ? COL.white : '#888', 'center');
+    this.box(bmp, 390, y, bw, bh, onStand ? 'rgba(150,110,40,0.85)' : 'rgba(60,60,60,0.6)', COL.line, 10);
+    this.txt(bmp, '过牌', 390, y + 18, bw, 28, onStand ? COL.white : '#888', 'center');
+};
+
+// 询问阶段只画问句；教程阶段在最上层补文字带与框选
+var _D678_tut_refresh = Scene_D678.prototype.refresh;
+Scene_D678.prototype.refresh = function () {
+    if (this._phase === 'ask') {
+        this.refreshCards();
+        this.drawAsk();
+        this._ovBmp.clear();
+        if (this._tutBmp) this._tutBmp.clear();
+        if (this._tutBoxBmp) this._tutBoxBmp.clear();
+        if (this._tutArrow) this._tutArrow.visible = false;
+        return;
+    }
+    _D678_tut_refresh.call(this);
+    if (this._tutOn) {
+        this._hits = [];          // 教程期间锁掉血条 / 卡牌 / 功能牌区的点击
+        this.drawTut();
+    }
+};
+
+// 教程的平局揭牌画面沿用 drawShowdown，但不走 tie 阶段的自动重发
+var _D678_tut_drawOverlay = Scene_D678.prototype.drawOverlay;
+Scene_D678.prototype.drawOverlay = function () {
+    if (this._tutOn) {
+        var bmp = this._ovBmp;
+        bmp.clear();
+        if (this._showList) { this.drawRankList(); this._hits = []; return; }
+        if (this._tutShowdown) this.drawShowdown();
+        return;
+    }
+    _D678_tut_drawOverlay.call(this);
+};
+
+//=============================================================================
+// 插件命令
+//=============================================================================
+
+var _D678_pluginCommand = Game_Interpreter.prototype.pluginCommand;
+Game_Interpreter.prototype.pluginCommand = function (command, args) {
+    _D678_pluginCommand.call(this, command, args);
+    if (command && command.toLowerCase() === 'start678') {
+        D678.Game = new D678_Game();
+        SceneManager.push(Scene_D678);
+    }
+};
+
+})();
