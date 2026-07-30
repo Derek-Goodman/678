@@ -300,7 +300,7 @@ Scene_D678Net.prototype.create = function () {
     this._hits   = [];
     this._notice = '';
     this._noticeTime = 0;
-    this._press  = -1;
+    this._press  = null;   // null = 没按下；不能用 -1，返回按钮的 i 就是 -1
     this._roomInfo = null;
     this._busy   = false;
 
@@ -518,15 +518,17 @@ Scene_D678Net.prototype.updateInput = function () {
             this.refresh();
         }
     } else if (TouchInput.isReleased()) {
-        if (this._press !== -1 && hit >= 0 && this._hits[hit].i === this._press) {
+        // 空闲哨兵用 null 而不是 -1 —— 返回按钮的 i 就是 -1，
+        // 用 -1 当哨兵会让它永远点不动（这就是「返回按钮没反应」的原因）
+        if (this._press !== null && hit >= 0 && this._hits[hit].i === this._press) {
             var cb = this._hits[hit].cb;
-            this._press = -1;
+            this._press = null;
             this.refresh();
             SoundManager.playOk();
             cb();
             return;
         }
-        this._press = -1;
+        this._press = null;
         this.refresh();
     }
 
@@ -650,6 +652,12 @@ Scene_D678.prototype.create = function () {
     this._netOver     = null;
     this._netPre      = null;    // 揭牌演出期间显示的发牌前手牌
     this._netApplied  = 0;
+    this._netPlayedResolve = 0;  // 已播过演出的结算编号（同一次不重播）
+    this._netTurnLeft = 0;       // 回合剩余毫秒（收到时的快照）
+    this._netTurnAt   = 0;
+    this._netDiscardLeft = 0;
+    this._netDiscardAt   = 0;
+    this._netAckCool  = 0;       // 点「继续」后的冷却帧，防误触
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -674,8 +682,31 @@ Scene_D678.prototype.netApply = function (m) {
     var g = D678N.buildReplica(v.players, m.round, this._netStartHp);
     D678.Game = g;
     this._battle = D678N.buildBattle(v, g);
-    this._netDeadline = m.deadline || 0;
     this._netOwes = !!m.owesDiscard;
+
+    // 倒计时按「还剩多少毫秒」+ 收到的时刻算，不用服务器的绝对时间戳 ——
+    // 两台设备的钟差几分钟很常见，用时间戳会算出离谱的秒数
+    if (m.turnLeft !== undefined) {
+        this._netTurnLeft = m.turnLeft;
+        this._netTurnAt = Date.now();
+    }
+    if (m.discardLeft !== undefined) {
+        this._netDiscardLeft = m.discardLeft;
+        this._netDiscardAt = Date.now();
+    }
+
+    // 副本是新建的，_discardFor 还指着上一份副本里的旧 Player 对象。
+    // 不重新指过来的话，onDiscardConfirm 读的是旧 funcs，弃牌必然对不上。
+    if (this._discardFor) {
+        if (m.owesDiscard) this._discardFor = g.human();
+        else {
+            // 服务器已经替我自动弃了（超时），把界面收掉
+            this._discardFor = null;
+            this._discardSel = [];
+            this.clearDiscardSprites();
+            if (m.autoDiscarded) this.notice('弃牌超时，已自动弃牌');
+        }
+    }
 
     // 揭牌演出期间先显示发牌前的手牌，等 finishBattle 再切到发牌后的
     if (v.preFuncs) {
@@ -708,12 +739,19 @@ Scene_D678.prototype.netApply = function (m) {
     if (m.resolved) {
         this.netSetLast(v.result);
         this._roundInfo = { pairs: [[g.players[0], g.players[1]]], bye: null };
-        if (this._phase !== 'resolve' && this._phase !== 'tie') {
-            this._phase = 'battle';
-            this.onBattleEnd();
-        } else {
+
+        // 同一次结算只播一次演出。弃牌后服务器会把 resolved 状态再推一遍，
+        // 少了这道判断就会把已经走到 roundResult 的客户端打回 resolve，
+        // 而 _netFinished 已是 true → netFinish 立刻 return → 双方各自卡死。
+        var rid = m.resolveId || 0;
+        if (rid && rid === this._netPlayedResolve) {
             this.refresh();
+            return;
         }
+        this._netPlayedResolve = rid;
+        this._netFinished = false;
+        this._phase = 'battle';
+        this.onBattleEnd();
         return;
     }
 
@@ -843,12 +881,24 @@ Scene_D678.prototype.netPoll = function () {
     }
 };
 
-// 回合倒计时：每秒重画一次就够，不必每帧
+// 剩余秒数：拿收到时的剩余毫秒减去本地流逝的时间，全程只用本地时钟，
+// 所以两台设备钟不同步也不影响
+Scene_D678.prototype.netTurnSec = function () {
+    if (!this._netTurnLeft || !this._netTurnAt) return -1;
+    return Math.max(0, Math.ceil((this._netTurnLeft - (Date.now() - this._netTurnAt)) / 1000));
+};
+Scene_D678.prototype.netDiscardSec = function () {
+    if (!this._netDiscardLeft || !this._netDiscardAt) return -1;
+    return Math.max(0, Math.ceil((this._netDiscardLeft - (Date.now() - this._netDiscardAt)) / 1000));
+};
+
+// 每秒重画一次就够，不必每帧
 Scene_D678.prototype.netTickClock = function () {
-    if (!this._netDeadline || this._phase !== 'battle') return;
-    var left = Math.max(0, Math.ceil((this._netDeadline - Date.now()) / 1000));
-    if (left !== this._netClockShown) {
-        this._netClockShown = left;
+    var show = -1;
+    if (this._phase === 'battle') show = this.netTurnSec();
+    else if (this._discardFor) show = this.netDiscardSec();
+    if (show !== this._netClockShown) {
+        this._netClockShown = show;
         this.refresh();
     }
 };
@@ -911,7 +961,7 @@ Scene_D678.prototype.netToRoundResult = function () {
     this._lastLog = this._netLog ? this._netLog.slice(0) : null;
     this._battleKeep = this._battle;
     this._phase = 'roundResult';
-    this._notice = '本轮结束　点击继续';
+    this._notice = this._netWaitAck ? '' : '本轮结束　点击继续';
     this._wait = 20;
     this.buildRoundReport();
     this._battle = null;
@@ -941,6 +991,7 @@ Scene_D678.prototype.onDiscardConfirm = function () {
         self._discardSel = [];
         self._netOwes = false;
         self.clearDiscardSprites();
+        self._netAckCool = 20;   // 约 1/3 秒，够挡住同一下点击的余波
         self.netToRoundResult();
     });
 };
@@ -1014,9 +1065,11 @@ Scene_D678.prototype.onUseFunc = function () {
 Scene_D678.prototype.netAckOnce = function () {
     if (this._netWaitAck) return;
     this._netWaitAck = true;
+    this._notice = '';          // 收掉「点击继续」，换成下面那块「已确认」
     var self = this;
     D678N.Net.post('/api/ack', { sid: D678N.Net.sid }, function (r) {
-        if (r && r.waiting) { self._netWaiting = true; self.refresh(); }
+        self._netWaiting = !!(r && r.waiting);
+        self.refresh();
     });
     this.refresh();
 };
@@ -1024,8 +1077,22 @@ Scene_D678.prototype.netAckOnce = function () {
 var _nr = Scene_D678.prototype.nextRound;
 Scene_D678.prototype.nextRound = function () {
     if (!this._net) { _nr.call(this); return; }
+    if (this._netAckCool > 0) return;   // 刚点过弃牌确认，别把那一下也算成「继续」
     this._netFinished = false;
     this.netAckOnce();
+};
+
+// 联机下轮结果画面必须等玩家自己点，而且刚从弃牌界面出来的那几帧不收点击 ——
+// 否则确认弃牌的那一下会在下一帧被轮结果画面再吃一次，看起来就像自动跳了
+var _ui = Scene_D678.prototype.updateInput;
+Scene_D678.prototype.updateInput = function () {
+    if (!this._net) { _ui.call(this); return; }
+    if (this._netAckCool > 0) {
+        this._netAckCool--;
+        // 冷却期间仍然要把点击区画出来（_hits 由 refresh 填），只是不响应
+        if (TouchInput.isTriggered()) return;
+    }
+    _ui.call(this);
 };
 
 // 联机下由服务器判定结束（over 消息），这里不本地判
@@ -1044,6 +1111,45 @@ Scene_D678.prototype.backToTitle = function () {
         D678.Game = null;
     }
     _bt.call(this);
+};
+
+//--- 长名字不撞血条 --------------------------------------------------------
+// 单机里玩家永远叫「我」，所以 drawHpBar 给名字留了 x=26 起 120px 就够。
+// 联机的名字是玩家自己起的，长了会压到 x=110 的血条上。
+// 这里在联机下重画一次名字：先按可用宽度缩字号，还超就截断加省略号。
+
+var _hp = Scene_D678.prototype.drawHpBar;
+Scene_D678.prototype.drawHpBar = function () {
+    if (!this._net) { _hp.call(this); return; }
+
+    var me = D678.Game.human();
+    var real = me.name;
+    // 先用一个占位的短名走原逻辑，把血条那些都画对
+    me.name = '';
+    _hp.call(this);
+    me.name = real;
+
+    // 再自己把名字画在同一位置，限制在 x=26..104（血条从 110 开始）
+    var bmp = this._uiBmp;
+    var maxW = 78, size = 24;
+    bmp.fontSize = size;
+    var w = bmp.measureTextWidth(real);
+    if (w > maxW) {
+        size = 18;
+        bmp.fontSize = size;
+        w = bmp.measureTextWidth(real);
+    }
+    var show = real;
+    if (w > maxW) {
+        // 逐字砍到放得下，末尾加省略号
+        for (var n = real.length - 1; n >= 1; n--) {
+            show = real.slice(0, n) + '…';
+            bmp.fontSize = size;
+            if (bmp.measureTextWidth(show) <= maxW) break;
+        }
+    }
+    // 字号小了要往下挪一点，视觉上和血条中线对齐
+    this.txt(bmp, show, 26, 22 + (24 - size) / 2, maxW + 4, size, LC.white, 'left');
 };
 
 //--- 绘制：叠一层联机状态 --------------------------------------------------
@@ -1075,14 +1181,25 @@ Scene_D678.prototype.refresh = function () {
 Scene_D678.prototype.netDrawOverlay = function () {
     var bmp = this._uiBmp;
 
-    // 回合倒计时：只在自己回合、且快到时间了才显眼
-    if (this._phase === 'battle' && this._netDeadline && this._battle &&
-        !this._battle.finished) {
-        var left = Math.max(0, Math.ceil((this._netDeadline - Date.now()) / 1000));
-        var mine = (this._battle.turn === 0);
-        var col = (left <= D678N.TURN_WARN) ? LC.red : LC.gray;
-        this.txt(bmp, (mine ? '你的回合 ' : '对方回合 ') + left + 's',
-            440, 72, 256, 20, col, 'right');
+    // 回合倒计时。只在自己回合走 —— 计时本身是服务器的单一时钟，
+    // 但显示上标明「谁的回合」，免得看着像双方各跑一个表。
+    if (this._phase === 'battle' && this._battle && !this._battle.finished) {
+        var left = this.netTurnSec();
+        if (left >= 0) {
+            var mine = (this._battle.turn === 0);
+            var col = (mine && left <= D678N.TURN_WARN) ? LC.red : LC.gray;
+            this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
+                440, 72, 256, 20, col, 'right');
+        }
+    }
+
+    // 弃牌倒计时：画在覆盖层上（弃牌界面用的是 _ovBmp，画 _uiBmp 会被盖住）
+    if (this._discardFor) {
+        var ds = this.netDiscardSec();
+        if (ds >= 0) {
+            this.txt(this._ovBmp, '剩 ' + ds + ' 秒，超时自动弃',
+                0, 252, NLY.SW, 22, ds <= 10 ? LC.red : LC.gray, 'center');
+        }
     }
 
     // 对手掉线：盖一层，明确告诉玩家在等什么
@@ -1095,9 +1212,13 @@ Scene_D678.prototype.netDrawOverlay = function () {
             60, 528, 600, 22, LC.gray, 'center');
     }
 
-    // 已点继续、等对手也点
-    if (this._netWaiting && this._phase === 'roundResult') {
-        this.txt(bmp, '已确认，等待对手…', 0, 1088, NLY.SW, 22, LC.gold, 'center');
+    // 已点继续、等对手也点。原来直接叠在「本轮结束　点击继续」上，两行字
+    // 糊成一团 —— 这里改成先铺一块底再写，而且把那句提示本身也换掉。
+    if (this._netWaitAck && this._phase === 'roundResult') {
+        var by = 1074, bh = 40;
+        this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
+        this.txt(bmp, this._netWaiting ? '已确认，等待对手…' : '已确认',
+            150, by + 9, 420, 22, LC.gold, 'center');
     }
 
     // 等服务器发牌 / 房间被终止

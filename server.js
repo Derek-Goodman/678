@@ -80,7 +80,13 @@ const CFG = {
     graceSec: Number(argOf('--grace-sec', 60)),
 
     // 「继续」确认的超时（秒）。有人挂机不点继续时自动替他确认。
-    ackSec: Number(argOf('--ack-sec', 45)),
+    // 给足时间 —— 这是「看结算面板」的时间，不该催人。
+    ackSec: Number(argOf('--ack-sec', 120)),
+
+    // 弃牌选择的时限（秒）。独立于 ackSec：弃牌要挑牌，
+    // 不能和「看完结算点继续」共用一个计时器，否则演出耗掉的时间
+    // 会算在挑牌头上，看起来就像只给了十几秒。
+    discardSec: Number(argOf('--discard-sec', 60)),
 
     // 空房间清理（分钟）
     idleMin: Number(argOf('--idle-min', 30)),
@@ -322,8 +328,15 @@ function newRoom() {
         battle: null,
         phase: 'lobby',      // lobby | battle | resolved | over
         seq: 0,
+        // 每次结算 +1。客户端记住自己播过哪一次，同一次不再重播演出。
+        // 少了它，弃牌后服务器重推的那份 resolved 状态会被当成新结算，
+        // 客户端从 roundResult 被打回 resolve —— 而 _netFinished 已经是 true，
+        // netFinish 立刻 return，于是双方各自卡死在不同阶段。
+        resolveId: 0,
         turnTimer: null,
         ackTimer: null,
+        discardTimer: null,
+        discardDeadline: 0,
         createdAt: Date.now(),
         touched: Date.now(),
         overInfo: null,
@@ -358,7 +371,12 @@ function addSeat(room, name) {
 function dropRoom(room, why) {
     clearTimeout(room.turnTimer);
     clearTimeout(room.ackTimer);
-    room.seats.forEach(s => { if (s) bySid.delete(s.sid); });
+    clearTimeout(room.discardTimer);
+    room.seats.forEach(s => {
+        if (!s) return;
+        clearTimeout(s.graceTimer);
+        bySid.delete(s.sid);
+    });
     rooms.delete(room.code);
     log('房间 %s 关闭（%s）', room.code, why);
 }
@@ -401,14 +419,22 @@ function pushState(room, extra) {
     room.seats.forEach(seat => {
         if (!seat) return;
         const me = seat.index;
+        const other = room.seats.find(s => s && s !== seat);
         sendTo(seat, 'state', Object.assign({
             seq: room.seq,
+            resolveId: room.resolveId,
             phase: room.phase,
             round: room.game ? room.game.round : 1,
             b: maskView(b, me, room.preFuncs),
             log: maskLog(b, me),
-            deadline: room.turnDeadline || 0,
+            // 发「还剩多少毫秒」而不是绝对时间戳：两台设备的钟差几分钟很常见，
+            // 客户端拿时间戳减本地 Date.now() 会算出离谱的倒计时。
+            turnLeft: room.turnDeadline ? Math.max(0, room.turnDeadline - Date.now()) : 0,
+            discardLeft: (seat.owesDiscard && room.discardDeadline)
+                ? Math.max(0, room.discardDeadline - Date.now()) : 0,
             owesDiscard: seat.owesDiscard,
+            peerWaiting: !!(other && (other.acked || other.owesDiscard === false)),
+            peerOwes: !!(other && other.owesDiscard),
         }, extra || {}));
     });
 }
@@ -462,8 +488,10 @@ function nextBattle(room) {
     room.phase = 'battle';
     room.preFuncs = null;
     room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
-    pushState(room, { fresh: true });
+    // 计时器必须在 pushState 之前武装 —— 否则这一份状态里的 turnLeft 是 0，
+    // 客户端第一回合就没有倒计时可显示（这就是「第一回合不显示」的原因）
     armTurnTimer(room);
+    pushState(room, { fresh: true });
 }
 
 //--- 回合计时 --------------------------------------------------------------
@@ -529,8 +557,8 @@ function applyAction(room, si, action, forced) {
     if (b.result && b.result.tie) { enterResolved(room, true); return { ok: true, fail: failNote }; }
     if (b.finished) { enterResolved(room, false); return { ok: true, fail: failNote }; }
 
+    armTurnTimer(room);   // 先武装再推，让这份状态带上新的 turnLeft
     pushState(room);
-    armTurnTimer(room);
     return { ok: true, fail: failNote };
 }
 
@@ -544,6 +572,7 @@ function enterResolved(room, isTie) {
     room.turnDeadline = 0;
     room.phase = 'resolved';
     room.isTie = !!isTie;
+    room.resolveId++;    // 客户端靠它判断「这次结算我播过没有」
     room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
 
     // 发牌前先拍一张手牌快照，客户端在揭牌演出期间显示这份，
@@ -564,14 +593,47 @@ function enterResolved(room, isTie) {
         });
     }
 
+    // 弃牌计时从「客户端演出走完、弃牌界面真正打开」那一刻算起才公平。
+    // 服务器不知道各人的演出进度，所以给一个够宽的窗口：
+    // 演出最长 200 帧（约 3.3 秒），discardSec 是净挑牌时间。
+    if (room.seats.some(s => s && s.owesDiscard)) {
+        armDiscardTimer(room, CFG.discardSec * 1000 + 4000);
+    }
+
     pushState(room, { resolved: true, tie: !!isTie });
     armAckTimer(room);
+}
+
+// 弃牌超时：只替还欠弃牌的人自动弃，不动别人的 acked
+function armDiscardTimer(room, ms) {
+    clearTimeout(room.discardTimer);
+    room.discardDeadline = 0;
+    if (!CFG.discardSec) return;
+    room.discardDeadline = Date.now() + ms;
+    room.discardTimer = setTimeout(() => {
+        if (room.phase !== 'resolved') return;
+        const owing = room.seats.filter(s => s && s.owesDiscard);
+        if (!owing.length) return;
+        withRoom(room, () => {
+            owing.forEach(s => {
+                log('房间 %s 座位 %d 弃牌超时 -> 自动弃', room.code, s.index);
+                D678.autoDiscard(s.player);
+                s.owesDiscard = false;
+            });
+        });
+        room.discardDeadline = 0;
+        pushState(room, { resolved: true, tie: !!room.isTie, autoDiscarded: true });
+        advanceAfterResolve(room);
+    }, ms);
 }
 
 // 有人挂机不点「继续」时替他确认，免得另一个人无限等
 function armAckTimer(room) {
     clearTimeout(room.ackTimer);
     if (!CFG.ackSec) return;
+    // 还要挑牌的话，「继续」的窗口得把挑牌时间也算进去
+    const extra = room.seats.some(s => s && s.owesDiscard)
+        ? CFG.discardSec * 1000 + 4000 : 0;
     room.ackTimer = setTimeout(() => {
         if (room.phase !== 'resolved') return;
         withRoom(room, () => {
@@ -583,7 +645,7 @@ function armAckTimer(room) {
         });
         log('房间 %s 继续确认超时 -> 自动推进', room.code);
         advanceAfterResolve(room);
-    }, CFG.ackSec * 1000);
+    }, CFG.ackSec * 1000 + extra);
 }
 
 // 双方都点过「继续」且都处理完弃牌，才推进 —— 否则一个人已经在打下一局、
@@ -593,6 +655,8 @@ function advanceAfterResolve(room) {
     const seats = room.seats.filter(Boolean);
     if (seats.some(s => s.owesDiscard || !s.acked)) return;
     clearTimeout(room.ackTimer);
+    clearTimeout(room.discardTimer);
+    room.discardDeadline = 0;
 
     if (room.isTie) {
         // 平局重新发牌：沿用同一个 Battle，只 newDeal（和单机 doRedeal 一致）
@@ -686,17 +750,9 @@ function onReconnect(room, seat) {
             stats: (me === 0) ? room.overInfo : [room.overInfo[1], room.overInfo[0]],
         });
     } else if (room.battle) {
-        room.seq++;
-        sendTo(seat, 'state', {
-            seq: room.seq,
-            phase: room.phase,
-            round: room.game ? room.game.round : 1,
-            b: maskView(room.battle, seat.index),
-            log: maskLog(room.battle, seat.index),
-            deadline: room.turnDeadline || 0,
-            owesDiscard: seat.owesDiscard,
-            resync: true,
-        });
+        // 直接复用 pushState 的字段构造，免得重连这条路上的字段名慢慢走偏
+        pushState(room, { resync: true, resolved: room.phase === 'resolved',
+                          tie: !!room.isTie });
     }
 }
 
@@ -856,6 +912,11 @@ const server = http.createServer((req, res) => {
                 });
             });
             seat.owesDiscard = false;
+            // 没人再欠弃牌就把弃牌计时收掉，免得它稍后误触发 autoDiscard
+            if (!room.seats.some(s => s && s.owesDiscard)) {
+                clearTimeout(room.discardTimer);
+                room.discardDeadline = 0;
+            }
             pushState(room, { resolved: true, tie: !!room.isTie });
             advanceAfterResolve(room);
             json(res, 200, { ok: true });
@@ -921,6 +982,11 @@ if (!fs.existsSync(path.join(CFG.dir, 'index.html'))) {
     console.error('目录里没有 index.html: ' + CFG.dir);
     process.exit(1);
 }
+
+// 给测试用：房间状态是模块内私有的，而 D678.Game 只在 withRoom 期间有效，
+// 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出弃牌）。
+// 只导出引用，不导出任何操作函数。
+module.exports = { rooms, CFG, withRoom };
 
 server.listen(CFG.port, '0.0.0.0', () => {
     console.log('');
