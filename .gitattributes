@@ -1,2 +1,39 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# 全链路都是 LF：装配脚本写 LF、RMMV 原始文件是 LF、Railway 跑在 Linux。
+# 所以不让 Git 在中间转换 —— 否则重新克隆后工作区变成 CRLF，
+# 下次装配（写 LF）会让 Git 认为每一行都改了，两千行的 678.js 全标成改动。
+#
+# 原来 GitHub Desktop 生成的是 `* text=auto`，它在 Windows 上意味着
+# 「签出时转成 CRLF」，这就是那个换行警告的来源。
+
+# 默认：文本一律 LF，不随平台变
+* text=auto eol=lf
+
+# 二进制显式标注。`text=auto` 靠内容里的 NUL 字节自动判断，
+# 对 PNG/TTF/OGG 实测是准的，但 32MB 卡牌图和字体不该依赖这层隐式保护。
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.webp   binary
+*.bmp    binary
+*.ico    binary
+
+*.ogg    binary
+*.m4a    binary
+*.mp3    binary
+*.wav    binary
+
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.eot    binary
+
+*.webm   binary
+*.mp4    binary
+
+# RMMV 加密素材（本项目没用，留着以防以后开加密）
+*.rpgmvp binary
+*.rpgmvo binary
+*.rpgmvm binary
+*.rpgmvw binary
