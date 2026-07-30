@@ -662,6 +662,8 @@ Scene_D678.prototype.create = function () {
     this._netAckSentAt = 0;      // 上次发 ack 的时刻（等太久时提示可重发）
     this._netPeerGoneMs = 0;     // 对手已掉线多久
     this._netPeerGoneAt = 0;
+    this._netPeerOwes = false;   // 对方还欠弃牌
+    this._netAdvancing = false;  // 服务器已在倒数「开下一局」
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -711,6 +713,10 @@ Scene_D678.prototype.netApply = function (m) {
     // 对手是否已点继续，用来显示「等待对手」还是「对方已确认」
     this._netWaiting = !!(m.myAcked && !m.peerAcked);
     if (m.myAcked !== undefined) this._netWaitAck = !!m.myAcked || this._netWaitAck;
+    // 对方是否还欠弃牌（决定我这边显示轮结果还是等待屏）
+    if (m.peerOwes !== undefined) this._netPeerOwes = !!m.peerOwes;
+    // 服务器已经在倒数「2 秒后开下一局」
+    if (m.advancing) this._netAdvancing = true;
 
     // 副本是新建的，_discardFor 还指着上一份副本里的旧 Player 对象。
     // 不重新指过来的话，onDiscardConfirm 读的是旧 funcs，弃牌必然对不上。
@@ -752,8 +758,16 @@ Scene_D678.prototype.netApply = function (m) {
         this._panelHold = 0;
         this._panelFade = 1;
         this._netWaitAck = false;
+        this._netWaiting = false;
+        this._netAdvancing = false;
+        this._netPeerOwes = false;
+        this._netFinished = false;
         this._report = null;
         this._lastLog = null;
+        // 上一局可能停在弃牌 / 等待屏，这些残留必须清掉
+        this._discardFor = null;
+        this._discardSel = [];
+        this.clearDiscardSprites();
         this._phase = 'battle';
         this._wait = 40;
         this.dealFx();
@@ -846,6 +860,8 @@ Scene_D678.prototype.update = function () {
     this.netTickClock();
 
     if (this._discardFor || this._showList) return;
+    // 等待对方弃牌：这一屏纯等服务器，不做任何本地推进
+    if (this._phase === 'peerDiscard') return;
     if (this._wait > 0) { this._wait--; return; }
 
     // 联机下这两个分支不能本地推进（会改状态），改成发意图后等服务器
@@ -991,7 +1007,19 @@ Scene_D678.prototype.netFinish = function () {
             return;
         }
     }
+    // 我不用弃、但对方要弃：不进轮结果，直接进等待屏。
+    // 弃完由服务器推下一局，全程不需要点确认。
+    if (this._netPeerOwes) { this.netToPeerDiscard(); return; }
     this.netToRoundResult();
+};
+
+// 对方还在弃牌时的等待屏
+Scene_D678.prototype.netToPeerDiscard = function () {
+    this._lastLog = this._netLog ? this._netLog.slice(0) : null;
+    this._phase = 'peerDiscard';
+    this._notice = '';
+    this._wait = 0;
+    this.refresh();
 };
 
 Scene_D678.prototype.netToRoundResult = function () {
@@ -1030,7 +1058,9 @@ Scene_D678.prototype.onDiscardConfirm = function () {
         self._netOwes = false;
         self.clearDiscardSprites();
         self._netAckCool = 20;   // 约 1/3 秒，够挡住同一下点击的余波
-        self.netToRoundResult();
+        // 我弃完了但对方还在挑 -> 等待屏；都弃完了服务器会直接推下一局，
+        // 这里也进等待屏顶一下，免得空一帧闪出旧画面
+        self.netToPeerDiscard();
     });
 };
 
@@ -1284,29 +1314,30 @@ Scene_D678.prototype.netDrawOverlay = function () {
         }
     }
 
-    // 轮结果画面：没确认时给一个明确的「继续」按钮（而不是只能点空白处），
-    // 确认后换成状态条。原来两行字直接叠在一起糊成一团。
+    // 轮结果画面：只有一行状态字，点画面任意位置继续。
+    // 之前既有「继续」按钮又有「点击任意位置」提示，两者位置重叠、语义冲突，
+    // 所以按钮整个删掉，只留一行字说明当前在等什么。
     if (this._phase === 'roundResult' && !this._showList && !this._discardFor) {
-        var by = 1070, bh = 46, bx = 210, bw = 300;
-        if (!this._netWaitAck) {
-            this.box(bmp, bx, by, bw, bh, 'rgba(60,140,90,0.95)', LC.gold, 8);
-            this.txt(bmp, '继续', bx, by + 11, bw, 24, LC.white, 'center');
-            if (this._wait <= 0 && this._netAckCool <= 0) {
-                this._hits.push({ x: bx, y: by, w: bw, h: bh,
-                                  cb: this.nextRound.bind(this) });
-            }
-        } else {
-            this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
-            this.txt(bmp, this._netWaiting ? '已确认，等待对手…' : '已确认',
-                150, by + 12, 420, 22, LC.gold, 'center');
-            // 等太久说明可能丢包或对方挂着了，给一条出路
-            if (this._netAckSentAt && Date.now() - this._netAckSentAt > 20000) {
-                this.txt(bmp, '等待较久？点这里重发确认', 150, by + bh + 6, 420, 18,
-                    LC.gray, 'center');
-                this._hits.push({ x: 150, y: by + bh + 2, w: 420, h: 26,
-                                  cb: this.netSendAck.bind(this) });
-            }
+        var by = 1070, bh = 46;
+        var msg, col;
+        if (this._netAdvancing) { msg = '即将开始下一局…';        col = LC.green; }
+        else if (this._netWaitAck) { msg = '已确认，即将开始下一局…'; col = LC.gold; }
+        else { msg = '点击任意位置继续';   col = LC.white; }
+        this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
+        this.txt(bmp, msg, 150, by + 12, 420, 22, col, 'center');
+    }
+
+    // 对方还在弃牌：整屏压暗只留一句话。画在 _ovBmp 上才能盖住卡牌层。
+    // 这一屏没有任何可点的东西 —— 弃完由服务器直接开下一局，不需要确认。
+    if (this._phase === 'peerDiscard') {
+        var ob = this._ovBmp;
+        this.box(ob, 0, 0, NLY.SW, NLY.SH, 'rgba(0,0,0,0.92)', null, 0);
+        this.txt(ob, '对方丢弃功能牌中……', 0, 600, NLY.SW, 28, LC.gold, 'center');
+        var ps = this.netDiscardSec();
+        if (ps >= 0) {
+            this.txt(ob, '剩 ' + ps + ' 秒', 0, 646, NLY.SW, 20, LC.gray, 'center');
         }
+        this._hits = [];   // 这一屏不接受任何点击
     }
 
     // 等服务器发牌 / 房间被终止

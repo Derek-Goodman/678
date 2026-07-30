@@ -88,7 +88,11 @@ const CFG = {
     // 弃牌选择的时限（秒）。独立于 ackSec：弃牌要挑牌，
     // 不能和「看完结算点继续」共用一个计时器，否则演出耗掉的时间
     // 会算在挑牌头上，看起来就像只给了十几秒。
-    discardSec: Number(argOf('--discard-sec', 60)),
+    discardSec: Number(argOf('--discard-sec', 10)),
+
+    // 一方点了「继续」之后，等这么久双方一起进下一局（毫秒）。
+    // 不再要求双方各点一次 —— 谁先点谁触发，另一方跟着走。
+    advanceMs: Number(argOf('--advance-ms', 2000)),
 
     // 空房间清理（分钟）
     idleMin: Number(argOf('--idle-min', 30)),
@@ -339,6 +343,8 @@ function newRoom() {
         ackTimer: null,
         discardTimer: null,
         discardDeadline: 0,
+        advanceTimer: null,      // 「2 秒后开下一局」的定时器
+        advanceAt: 0,            // 那一刻的时间戳，用来给客户端显示
         createdAt: Date.now(),
         touched: Date.now(),
         overInfo: null,
@@ -631,7 +637,7 @@ function armDiscardTimer(room, ms) {
         });
         room.discardDeadline = 0;
         pushState(room, { resolved: true, tie: !!room.isTie, autoDiscarded: true });
-        advanceAfterResolve(room);
+        advanceIfDiscardsDone(room);   // 自动弃完就直接开下一局
     }, ms);
 }
 
@@ -652,16 +658,46 @@ function armAckTimer(room) {
             });
         });
         log('房间 %s 继续确认超时 -> 自动推进', room.code);
-        advanceAfterResolve(room);
+        doAdvance(room);   // 兜底：无条件推进，不再看 acked / owesDiscard
     }, CFG.ackSec * 1000 + extra);
 }
 
-// 双方都点过「继续」且都处理完弃牌，才推进 —— 否则一个人已经在打下一局、
-// 另一个还在看结算面板
-function advanceAfterResolve(room) {
+// 排一次「延后推进」。谁先点继续谁触发，双方一起走 ——
+// 延迟由服务器统一计时，所以两边看到的下一局是同一时刻开始的。
+// 已经在倒数时不重排，免得后点的那一方把时间又往后推。
+function scheduleAdvance(room, ms) {
     if (room.phase !== 'resolved') return;
-    const seats = room.seats.filter(Boolean);
-    if (seats.some(s => s.owesDiscard || !s.acked)) return;
+    if (room.advanceTimer) return;
+    room.advanceAt = Date.now() + ms;
+    room.advanceTimer = setTimeout(() => {
+        room.advanceTimer = null;
+        room.advanceAt = 0;
+        doAdvance(room);
+    }, ms);
+    // 让双方立刻知道「要开下一局了」，好把界面切成过渡态
+    pushState(room, { resolved: true, tie: !!room.isTie, advancing: true });
+}
+
+function clearAdvance(room) {
+    clearTimeout(room.advanceTimer);
+    room.advanceTimer = null;
+    room.advanceAt = 0;
+}
+
+// 弃牌路径专用：所有人都弃完了就立刻开下一局，不需要任何人点确认。
+// 名字写清楚是为了和「点继续 + 2 秒延迟」那条路区分开 ——
+// 之前两条路共用一个函数，而它里面有「必须有人 acked」的守卫，
+// 于是弃牌走完永远推进不了（表现就是弃完卡住）。
+function advanceIfDiscardsDone(room) {
+    if (room.phase !== 'resolved') return;
+    if (room.seats.some(s => s && s.owesDiscard)) return;   // 还有人在挑牌
+    doAdvance(room);
+}
+
+// 真正开下一局 / 平局重发
+function doAdvance(room) {
+    if (room.phase !== 'resolved') return;
+    clearAdvance(room);
     clearTimeout(room.ackTimer);
     clearTimeout(room.discardTimer);
     room.discardDeadline = 0;
@@ -922,8 +958,9 @@ const server = http.createServer((req, res) => {
                 room.discardDeadline = 0;
             }
             pushState(room, { resolved: true, tie: !!room.isTie });
-            advanceAfterResolve(room);
-            json(res, 200, { ok: true });
+            // 都弃完了就直接开下一局，不要求任何人点确认
+            advanceIfDiscardsDone(room);
+            json(res, 200, { ok: true, peerOwes: room.seats.some(s => s && s.owesDiscard) });
         });
         return;
     }
@@ -943,13 +980,16 @@ const server = http.createServer((req, res) => {
                 return json(res, 200, { ok: true, ignored: true, phase: room.phase });
             }
             seat.acked = true;
-            const other = room.seats.find(s => s && s !== seat);
-            const waiting = !!(other && (!other.acked || other.owesDiscard));
-            // 推一次状态，让还没点的那一方看到「对方已确认」，
-            // 也让已点的一方拿到确认回执（不然网络抖一下就永远显示等待）
-            if (waiting) pushState(room, { resolved: true, tie: !!room.isTie });
-            advanceAfterResolve(room);
-            json(res, 200, { ok: true, waiting: waiting });
+            // 还有人在挑牌就先不排推进 —— 弃牌那条路走完会自己开下一局
+            if (room.seats.some(s => s && s.owesDiscard)) {
+                pushState(room, { resolved: true, tie: !!room.isTie });
+                return json(res, 200, { ok: true, waiting: true });
+            }
+            // 谁先点谁触发：排一个统一的 2 秒延迟，双方一起进下一局。
+            // 这里必须是 scheduleAdvance 而不是立刻推进 —— 否则对方刚看到
+            // 结算就被拽走（这正是「另一方只有 2 秒」的直接原因）。
+            scheduleAdvance(room, CFG.advanceMs);
+            json(res, 200, { ok: true, waiting: false, advanceMs: CFG.advanceMs });
         });
         return;
     }
