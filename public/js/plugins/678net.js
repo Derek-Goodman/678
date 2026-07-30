@@ -251,6 +251,9 @@ var LC = {
     panel: 'rgba(0,0,0,0.78)',
     edge: '#ffeaa0', text: '#ffffff', gray: '#b9c8c0',
     gold: '#ffd766', red: '#ff5a5a', green: '#5cff9d',
+    // 和 678.js 里 COL 的取值保持一致：我方回合青色、对方回合橙色。
+    // COL 是那个 IIFE 里的 var，外面拿不到，所以在这儿抄一份。
+    aqua: '#48e6d2', orange: '#ff9a4d',
 };
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
@@ -1202,19 +1205,15 @@ Scene_D678.prototype.backToTitle = function () {
     _bt.call(this);
 };
 
-//--- 长名字不撞血条 --------------------------------------------------------
-// 单机里玩家永远叫「我」，所以 drawHpBar 给名字留了 x=26 起 120px 就够。
-// 联机的名字是玩家自己起的，长了会压到 x=110 的血条上。
-// 这里在联机下重画一次名字：先按可用宽度缩字号，还超就截断加省略号。
+//--- 自己的名字不显示，那个位置改放回合倒计时 ------------------------------
+// 单机里玩家永远叫「我」，名字和血条挤同一行没问题。联机下自己的名字
+// 对自己毫无信息量（对手名字在上方已经有了），所以整个不画，
+// 腾出来的第二行右侧放回合倒计时。
 
 var _hp = Scene_D678.prototype.drawHpBar;
 Scene_D678.prototype.drawHpBar = function () {
     if (!this._net) { _hp.call(this); return; }
 
-    // 单机里玩家永远叫「我」，所以名字和血条挤在同一行没问题。
-    // 联机的名字是玩家自己起的，长了会压掉血条的显示空间。
-    // 解法是把名字整个挪到下面那行（和「第 X 轮」并排），
-    // 血条行只留血条 —— 这样名字多长都不会影响血条。
     var me = D678.Game.human();
     var real = me.name;
     me.name = '';                // 让原逻辑不画名字
@@ -1223,22 +1222,21 @@ Scene_D678.prototype.drawHpBar = function () {
 
     var bmp = this._uiBmp;
 
-    // 血条空出来的左侧位置改放「你」，标明这条是自己的血
+    // 血条左侧只留一个「你」，标明这条是自己的血
     this.txt(bmp, '你', 26, 22, 70, 24, LC.gray, 'left');
 
-    // 名字画在第二行右侧（左侧是原有的「第 X 轮   存活 N 人」）。
-    // 这里宽度充裕，但还是留一道截断兜底，防止有人起超长名字。
-    var maxW = 300, size = 20;
-    bmp.fontSize = size;
-    var show = real;
-    if (bmp.measureTextWidth(show) > maxW) {
-        for (var n = real.length - 1; n >= 1; n--) {
-            show = real.slice(0, n) + '…';
-            bmp.fontSize = size;
-            if (bmp.measureTextWidth(show) <= maxW) break;
+    // 第二行右侧（原来放名字的位置）改放回合倒计时。
+    // 左侧是原有的「第 X 轮   存活 N 人」，两者不重叠。
+    var b = this._battle;
+    if (this._phase === 'battle' && b && !b.finished) {
+        var left = this.netTurnSec();
+        if (left >= 0) {
+            var mine = (b.turn === 0);
+            var col = mine ? (left <= D678N.TURN_WARN ? LC.red : LC.aqua) : LC.orange;
+            this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
+                408, 72, 300, 20, col, 'right');
         }
     }
-    this.txt(bmp, show, 708 - maxW, 72, maxW, size, LC.white, 'right');
 };
 
 //--- 绘制：叠一层联机状态 --------------------------------------------------
@@ -1270,18 +1268,8 @@ Scene_D678.prototype.refresh = function () {
 Scene_D678.prototype.netDrawOverlay = function () {
     var bmp = this._uiBmp;
 
-    // 回合倒计时。计时本身是服务器的单一时钟，显示上标明「谁的回合」，
-    // 免得看着像双方各跑一个表。
-    // 画在血条那一行的右侧 —— 第二行右边现在放名字了。
-    if (this._phase === 'battle' && this._battle && !this._battle.finished) {
-        var left = this.netTurnSec();
-        if (left >= 0) {
-            var mine = (this._battle.turn === 0);
-            var col = (mine && left <= D678N.TURN_WARN) ? LC.red : LC.gray;
-            this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
-                430, 22, 150, 22, col, 'right');
-        }
-    }
+    // 回合倒计时已经在 drawHpBar 里画到第二行右侧（原来放名字的位置），
+    // 这里不再重复画。
 
     // 弃牌倒计时：画在覆盖层上（弃牌界面用的是 _ovBmp，画 _uiBmp 会被盖住）
     if (this._discardFor) {

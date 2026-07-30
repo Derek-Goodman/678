@@ -584,6 +584,7 @@ function applyAction(room, si, action, forced) {
 function enterResolved(room, isTie) {
     clearTimeout(room.turnTimer);
     room.turnDeadline = 0;
+    clearAdvance(room);  // 上一次结算的推进定时器绝不能带进这一次
     room.phase = 'resolved';
     room.isTie = !!isTie;
     room.resolveId++;    // 客户端靠它判断「这次结算我播过没有」
@@ -667,13 +668,17 @@ function armAckTimer(room) {
 // 已经在倒数时不重排，免得后点的那一方把时间又往后推。
 function scheduleAdvance(room, ms) {
     if (room.phase !== 'resolved') return;
-    if (room.advanceTimer) return;
-    room.advanceAt = Date.now() + ms;
-    room.advanceTimer = setTimeout(() => {
-        room.advanceTimer = null;
-        room.advanceAt = 0;
-        doAdvance(room);
-    }, ms);
+    // 已经在倒数就不重排时间（免得后点的人把开局往后推），
+    // 但状态还是要推一次 —— 否则第二个人点继续时收不到任何回执，
+    // 界面会一直停在「点击任意位置继续」。
+    if (!room.advanceTimer) {
+        room.advanceAt = Date.now() + ms;
+        room.advanceTimer = setTimeout(() => {
+            room.advanceTimer = null;
+            room.advanceAt = 0;
+            doAdvance(room);
+        }, ms);
+    }
     // 让双方立刻知道「要开下一局了」，好把界面切成过渡态
     pushState(room, { resolved: true, tie: !!room.isTie, advancing: true });
 }
