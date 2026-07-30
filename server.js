@@ -74,10 +74,12 @@ const CFG = {
 
     // 回合超时（秒）。到时自动判过牌 —— stand 永远是合法动作。
     // 写 0 关掉计时（本地调试用）。
-    turnSec: Number(argOf('--turn-sec', 60)),
+    turnSec: Number(argOf('--turn-sec', 30)),
 
-    // 掉线宽限（秒）。SSE 断开后等这么久，没回来就结束房间。
-    graceSec: Number(argOf('--grace-sec', 60)),
+    // 掉线后多久强制结束房间（秒）。界面上不再显示这个倒计时 ——
+    // 玩家看到的是「对方已掉线 X 秒」并且随时可以自己点返回主菜单，
+    // 所以这里只是一道兜底，不需要催人。
+    graceSec: Number(argOf('--grace-sec', 300)),
 
     // 「继续」确认的超时（秒）。有人挂机不点继续时自动替他确认。
     // 给足时间 —— 这是「看结算面板」的时间，不该催人。
@@ -433,8 +435,14 @@ function pushState(room, extra) {
             discardLeft: (seat.owesDiscard && room.discardDeadline)
                 ? Math.max(0, room.discardDeadline - Date.now()) : 0,
             owesDiscard: seat.owesDiscard,
-            peerWaiting: !!(other && (other.acked || other.owesDiscard === false)),
+            myAcked: !!seat.acked,
+            // 对手状态：是否已点继续 / 是否还在弃牌 / 掉线了多久（毫秒）
+            peerAcked: !!(other && other.acked),
             peerOwes: !!(other && other.owesDiscard),
+            peerGone: !!(other && !other.connected),
+            peerGoneMs: (other && !other.connected && other.disconnectAt)
+                ? Date.now() - other.disconnectAt : 0,
+            peerName: other ? other.name : '',
         }, extra || {}));
     });
 }
@@ -713,13 +721,9 @@ function onDisconnect(room, seat) {
     pushRoom(room);
 
     const other = room.seats.find(s => s && s !== seat);
-    if (other) {
-        sendTo(other, 'peer', {
-            gone: true, name: seat.name,
-            graceSec: CFG.graceSec,
-            deadline: Date.now() + CFG.graceSec * 1000,
-        });
-    }
+    // 不发倒计时 —— 界面上改成「已掉线 X 秒」+ 随时可点返回主菜单。
+    // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
+    if (other) sendTo(other, 'peer', { gone: true, name: seat.name });
 
     clearTimeout(seat.graceTimer);
     seat.graceTimer = setTimeout(() => {
@@ -932,9 +936,18 @@ const server = http.createServer((req, res) => {
             if (!found) return json(res, 404, { err: '会话失效' });
             const { room, seat } = found;
             room.touched = Date.now();
+            // 只在结算阶段接受 —— 别的阶段来的 ack 一律无视，
+            // 否则一个迟到的请求会把下一局的 acked 提前置上，
+            // 表现就是「对方刚点完，我这边只看了两秒就自动跳了」
+            if (room.phase !== 'resolved') {
+                return json(res, 200, { ok: true, ignored: true, phase: room.phase });
+            }
             seat.acked = true;
             const other = room.seats.find(s => s && s !== seat);
             const waiting = !!(other && (!other.acked || other.owesDiscard));
+            // 推一次状态，让还没点的那一方看到「对方已确认」，
+            // 也让已点的一方拿到确认回执（不然网络抖一下就永远显示等待）
+            if (waiting) pushState(room, { resolved: true, tie: !!room.isTie });
             advanceAfterResolve(room);
             json(res, 200, { ok: true, waiting: waiting });
         });

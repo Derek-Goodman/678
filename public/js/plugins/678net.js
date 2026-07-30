@@ -653,11 +653,15 @@ Scene_D678.prototype.create = function () {
     this._netPre      = null;    // 揭牌演出期间显示的发牌前手牌
     this._netApplied  = 0;
     this._netPlayedResolve = 0;  // 已播过演出的结算编号（同一次不重播）
+    this._netPreApplied = 0;     // 已套用过发牌前快照的结算编号（同一次不重套）
     this._netTurnLeft = 0;       // 回合剩余毫秒（收到时的快照）
     this._netTurnAt   = 0;
     this._netDiscardLeft = 0;
     this._netDiscardAt   = 0;
     this._netAckCool  = 0;       // 点「继续」后的冷却帧，防误触
+    this._netAckSentAt = 0;      // 上次发 ack 的时刻（等太久时提示可重发）
+    this._netPeerGoneMs = 0;     // 对手已掉线多久
+    this._netPeerGoneAt = 0;
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -695,6 +699,19 @@ Scene_D678.prototype.netApply = function (m) {
         this._netDiscardAt = Date.now();
     }
 
+    // 对手掉线状态由每份盘面带过来，比 peer 消息可靠（重连后也能对上）
+    if (m.peerGone) {
+        if (!this._netPeerGone) this._netPeerGone = { name: m.peerName };
+        this._netPeerGoneMs = m.peerGoneMs || 0;
+        this._netPeerGoneAt = Date.now();
+    } else if (m.peerGone === false) {
+        this._netPeerGone = null;
+    }
+
+    // 对手是否已点继续，用来显示「等待对手」还是「对方已确认」
+    this._netWaiting = !!(m.myAcked && !m.peerAcked);
+    if (m.myAcked !== undefined) this._netWaitAck = !!m.myAcked || this._netWaitAck;
+
     // 副本是新建的，_discardFor 还指着上一份副本里的旧 Player 对象。
     // 不重新指过来的话，onDiscardConfirm 读的是旧 funcs，弃牌必然对不上。
     if (this._discardFor) {
@@ -708,12 +725,21 @@ Scene_D678.prototype.netApply = function (m) {
         }
     }
 
-    // 揭牌演出期间先显示发牌前的手牌，等 finishBattle 再切到发牌后的
-    if (v.preFuncs) {
+    // 揭牌演出期间先显示发牌前的手牌，等 finishBattle 再切到发牌后的。
+    //
+    // 只在「这次结算的第一份状态」上做这个替换。服务器每次推 resolved 都带
+    // preFuncs，包括对方弃完牌后的那次重推 —— 如果每次都替换，我正开着弃牌
+    // 界面（8 张）会被换成发牌前的快照（6 张），选中的下标随之错位，
+    // 看起来就是「对方弃的牌显示到我这边」。双方手牌都满时必然触发，
+    // 因为那时两边都欠弃牌，重推一定发生在我弃牌界面还开着的时候。
+    var rid0 = m.resolveId || 0;
+    if (v.preFuncs && rid0 !== this._netPreApplied && !this._discardFor) {
+        this._netPreApplied = rid0;
         this._netPre = { funcs: v.preFuncs, counts: v.preFuncCounts };
         this.netUsePre(true);
-    } else {
+    } else if (!v.preFuncs) {
         this._netPre = null;
+        this._netPost = null;
     }
 
     if (m.log) this._netLog = m.log;
@@ -849,8 +875,14 @@ Scene_D678.prototype.netPoll = function () {
     }
 
     if (b.peer) {
-        this._netPeerGone = b.peer.gone ? b.peer : null;
-        if (!b.peer.gone) this.notice(b.peer.name + ' 回来了');
+        if (b.peer.gone) {
+            this._netPeerGone = b.peer;
+            this._netPeerGoneMs = 0;
+            this._netPeerGoneAt = Date.now();
+        } else {
+            this._netPeerGone = null;
+            this.notice((b.peer.name || '对手') + ' 回来了');
+        }
         b.peer = null;
         this.refresh();
     }
@@ -895,8 +927,13 @@ Scene_D678.prototype.netDiscardSec = function () {
 // 每秒重画一次就够，不必每帧
 Scene_D678.prototype.netTickClock = function () {
     var show = -1;
-    if (this._phase === 'battle') show = this.netTurnSec();
-    else if (this._discardFor) show = this.netDiscardSec();
+    if (this._discardFor) show = this.netDiscardSec();
+    else if (this._phase === 'battle') show = this.netTurnSec();
+    // 掉线计时也要走，否则「已掉线 X 秒」不会自己往上跳
+    if (this._netPeerGone) {
+        var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
+        show = (show >= 0 ? show * 1000 : 0) + Math.floor(ms / 1000);
+    }
     if (show !== this._netClockShown) {
         this._netClockShown = show;
         this.refresh();
@@ -961,7 +998,8 @@ Scene_D678.prototype.netToRoundResult = function () {
     this._lastLog = this._netLog ? this._netLog.slice(0) : null;
     this._battleKeep = this._battle;
     this._phase = 'roundResult';
-    this._notice = this._netWaitAck ? '' : '本轮结束　点击继续';
+    // 提示语交给下面那个「继续」按钮，这里不再写字，免得两处叠在一起
+    this._notice = '';
     this._wait = 20;
     this.buildRoundReport();
     this._battle = null;
@@ -1066,12 +1104,33 @@ Scene_D678.prototype.netAckOnce = function () {
     if (this._netWaitAck) return;
     this._netWaitAck = true;
     this._notice = '';          // 收掉「点击继续」，换成下面那块「已确认」
+    this.netSendAck();
+    this.refresh();
+};
+
+// ack 要能重发：网络抖一下丢了这一个请求，服务器就永远等不到我，
+// 而客户端 _netWaitAck 已经置上、不会再发第二次 —— 那就真卡住了。
+// 失败就退回未确认状态让玩家再点，成功但对方还没点则起一个兜底重发。
+Scene_D678.prototype.netSendAck = function () {
     var self = this;
+    this._netAckSentAt = Date.now();
     D678N.Net.post('/api/ack', { sid: D678N.Net.sid }, function (r) {
-        self._netWaiting = !!(r && r.waiting);
+        if (!r) {
+            // 请求没到服务器，允许玩家再点一次
+            self._netWaitAck = false;
+            self._notice = '网络异常，请再点一次继续';
+            self._noticeTime = 180;
+            self.refresh();
+            return;
+        }
+        if (r.ignored) {
+            // 服务器已经不在结算阶段了（对方先推进了），等下一份盘面就好
+            self.refresh();
+            return;
+        }
+        self._netWaiting = !!r.waiting;
         self.refresh();
     });
-    this.refresh();
 };
 
 var _nr = Scene_D678.prototype.nextRound;
@@ -1122,34 +1181,34 @@ var _hp = Scene_D678.prototype.drawHpBar;
 Scene_D678.prototype.drawHpBar = function () {
     if (!this._net) { _hp.call(this); return; }
 
+    // 单机里玩家永远叫「我」，所以名字和血条挤在同一行没问题。
+    // 联机的名字是玩家自己起的，长了会压掉血条的显示空间。
+    // 解法是把名字整个挪到下面那行（和「第 X 轮」并排），
+    // 血条行只留血条 —— 这样名字多长都不会影响血条。
     var me = D678.Game.human();
     var real = me.name;
-    // 先用一个占位的短名走原逻辑，把血条那些都画对
-    me.name = '';
+    me.name = '';                // 让原逻辑不画名字
     _hp.call(this);
     me.name = real;
 
-    // 再自己把名字画在同一位置，限制在 x=26..104（血条从 110 开始）
     var bmp = this._uiBmp;
-    var maxW = 78, size = 24;
+
+    // 血条空出来的左侧位置改放「你」，标明这条是自己的血
+    this.txt(bmp, '你', 26, 22, 70, 24, LC.gray, 'left');
+
+    // 名字画在第二行右侧（左侧是原有的「第 X 轮   存活 N 人」）。
+    // 这里宽度充裕，但还是留一道截断兜底，防止有人起超长名字。
+    var maxW = 300, size = 20;
     bmp.fontSize = size;
-    var w = bmp.measureTextWidth(real);
-    if (w > maxW) {
-        size = 18;
-        bmp.fontSize = size;
-        w = bmp.measureTextWidth(real);
-    }
     var show = real;
-    if (w > maxW) {
-        // 逐字砍到放得下，末尾加省略号
+    if (bmp.measureTextWidth(show) > maxW) {
         for (var n = real.length - 1; n >= 1; n--) {
             show = real.slice(0, n) + '…';
             bmp.fontSize = size;
             if (bmp.measureTextWidth(show) <= maxW) break;
         }
     }
-    // 字号小了要往下挪一点，视觉上和血条中线对齐
-    this.txt(bmp, show, 26, 22 + (24 - size) / 2, maxW + 4, size, LC.white, 'left');
+    this.txt(bmp, show, 708 - maxW, 72, maxW, size, LC.white, 'right');
 };
 
 //--- 绘制：叠一层联机状态 --------------------------------------------------
@@ -1181,15 +1240,16 @@ Scene_D678.prototype.refresh = function () {
 Scene_D678.prototype.netDrawOverlay = function () {
     var bmp = this._uiBmp;
 
-    // 回合倒计时。只在自己回合走 —— 计时本身是服务器的单一时钟，
-    // 但显示上标明「谁的回合」，免得看着像双方各跑一个表。
+    // 回合倒计时。计时本身是服务器的单一时钟，显示上标明「谁的回合」，
+    // 免得看着像双方各跑一个表。
+    // 画在血条那一行的右侧 —— 第二行右边现在放名字了。
     if (this._phase === 'battle' && this._battle && !this._battle.finished) {
         var left = this.netTurnSec();
         if (left >= 0) {
             var mine = (this._battle.turn === 0);
             var col = (mine && left <= D678N.TURN_WARN) ? LC.red : LC.gray;
             this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
-                440, 72, 256, 20, col, 'right');
+                430, 22, 150, 22, col, 'right');
         }
     }
 
@@ -1202,23 +1262,51 @@ Scene_D678.prototype.netDrawOverlay = function () {
         }
     }
 
-    // 对手掉线：盖一层，明确告诉玩家在等什么
+    // 对手掉线：报「已掉线多久」而不是倒计时 —— 对方回不回来不是这边能
+    // 控制的事，倒计时只是干等。同时给一个立刻返回主菜单的按钮。
     if (this._netPeerGone) {
         var g = this._netPeerGone;
-        var sec = Math.max(0, Math.ceil((g.deadline - Date.now()) / 1000));
-        this.box(bmp, 60, 470, 600, 110, 'rgba(0,0,0,0.88)', LC.red, 12);
-        this.txt(bmp, g.name + ' 掉线了', 60, 492, 600, 26, LC.red, 'center');
-        this.txt(bmp, '等待重连… ' + sec + ' 秒后本场结束',
-            60, 528, 600, 22, LC.gray, 'center');
+        var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
+        var sec = Math.floor(ms / 1000);
+        var txt = sec < 60 ? ('已掉线 ' + sec + ' 秒')
+                           : ('已掉线 ' + Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒');
+        this.box(bmp, 60, 452, 600, 176, 'rgba(0,0,0,0.9)', LC.red, 12);
+        this.txt(bmp, (g.name || '对手') + ' 掉线了', 60, 470, 600, 26, LC.red, 'center');
+        this.txt(bmp, txt, 60, 506, 600, 24, LC.gray, 'center');
+        this.txt(bmp, '可以继续等，也可以直接退出', 60, 538, 600, 18, LC.gray, 'center');
+
+        var bx = 235, by = 570, bw = 250, bh = 46;
+        this.box(bmp, bx, by, bw, bh, 'rgba(60,140,90,0.95)', LC.gold, 8);
+        this.txt(bmp, '返回主菜单', bx, by + 11, bw, 24, LC.white, 'center');
+        if (!this._showList && !this._discardFor) {
+            this._hits.push({ x: bx, y: by, w: bw, h: bh,
+                              cb: this.backToTitle.bind(this) });
+        }
     }
 
-    // 已点继续、等对手也点。原来直接叠在「本轮结束　点击继续」上，两行字
-    // 糊成一团 —— 这里改成先铺一块底再写，而且把那句提示本身也换掉。
-    if (this._netWaitAck && this._phase === 'roundResult') {
-        var by = 1074, bh = 40;
-        this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
-        this.txt(bmp, this._netWaiting ? '已确认，等待对手…' : '已确认',
-            150, by + 9, 420, 22, LC.gold, 'center');
+    // 轮结果画面：没确认时给一个明确的「继续」按钮（而不是只能点空白处），
+    // 确认后换成状态条。原来两行字直接叠在一起糊成一团。
+    if (this._phase === 'roundResult' && !this._showList && !this._discardFor) {
+        var by = 1070, bh = 46, bx = 210, bw = 300;
+        if (!this._netWaitAck) {
+            this.box(bmp, bx, by, bw, bh, 'rgba(60,140,90,0.95)', LC.gold, 8);
+            this.txt(bmp, '继续', bx, by + 11, bw, 24, LC.white, 'center');
+            if (this._wait <= 0 && this._netAckCool <= 0) {
+                this._hits.push({ x: bx, y: by, w: bw, h: bh,
+                                  cb: this.nextRound.bind(this) });
+            }
+        } else {
+            this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
+            this.txt(bmp, this._netWaiting ? '已确认，等待对手…' : '已确认',
+                150, by + 12, 420, 22, LC.gold, 'center');
+            // 等太久说明可能丢包或对方挂着了，给一条出路
+            if (this._netAckSentAt && Date.now() - this._netAckSentAt > 20000) {
+                this.txt(bmp, '等待较久？点这里重发确认', 150, by + bh + 6, 420, 18,
+                    LC.gray, 'center');
+                this._hits.push({ x: 150, y: by + bh + 2, w: 420, h: 26,
+                                  cb: this.netSendAck.bind(this) });
+            }
+        }
     }
 
     // 等服务器发牌 / 房间被终止
