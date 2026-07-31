@@ -1520,7 +1520,10 @@ D678.AI.step = function (b, si) {
             if (b.sides[si].known.indexOf(f.num) < 0) b.sides[si].known.push(f.num);
         }
         if (!r.ok) return { side: si, action: 'stand', msg: '对方过牌', _forced: true, ev: b.act(si, 'stand') };
-        return { side: si, action: 'func', id: d.id, msg: r.msg, fail: !!r.fail, endTurn: !!r.endTurn };
+        // same 透出来给界面用：重抽拿到同一个数字时牌会原地不动，
+        // 界面靠这个标记把那张牌重新「发」一次（见 678.js 的 redealCard）
+        return { side: si, action: 'func', id: d.id, msg: r.msg, fail: !!r.fail,
+                 endTurn: !!r.endTurn, same: !!r.same };
     }
     if (d.action === 'hit' && b.canHit(si)) {
         var e = b.act(si, 'hit');

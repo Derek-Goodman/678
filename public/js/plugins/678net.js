@@ -306,6 +306,7 @@ Scene_D678Net.prototype.create = function () {
     this._press  = null;   // null = 没按下；不能用 -1，返回按钮的 i 就是 -1
     this._roomInfo = null;
     this._busy   = false;
+    this._resuming = false;   // 刷新后正在恢复对局
 
     var W = Graphics.width, H = Graphics.height;
     var bg = new Bitmap(W, H);
@@ -327,9 +328,48 @@ Scene_D678Net.prototype.start = function () {
     Scene_Base.prototype.start.call(this);
     this.startFadeIn(this.fadeSpeed(), false);
     this._guard = 10;
+    // 刷新页面后回来的：标题画面检测到会话，把我们推到这儿接着恢复
+    if (D678N.resumeSid) {
+        var sid = D678N.resumeSid;
+        D678N.resumeSid = null;
+        this.doResume(sid);
+        return;
+    }
     // 从链接带房号进来的（?room=XXXX）：直接尝试加入
     var auto = D678N.autoRoom;
     if (auto) { D678N.autoRoom = null; this.doJoin(auto); }
+};
+
+// 刷新后拿旧 sid 换回座位。必须先用 XHR 探一次再连 SSE ——
+// EventSource 拿不到 404，无效 sid 会让它无限重连、界面卡在「正在恢复」。
+Scene_D678Net.prototype.doResume = function (sid) {
+    var self = this;
+    this._resuming = true;
+    this._busy = true;
+    this._page = 'waiting';
+    this.refresh();
+    D678N.Net.post('/api/resume', { sid: sid }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200 || !r.ok) {
+            // 座位没了（房间已销毁 / 超过 5 分钟宽限）—— 清掉会话正常回菜单
+            self._resuming = false;
+            D678N.Net.reset();
+            self._page = 'menu';
+            self.notice(code === 404 ? '刚刚那局已经结束了' : '恢复对局失败');
+            self.refresh();
+            return;
+        }
+        // mySeat 必须从服务器拿回来 —— sessionStorage 只存了 {sid, room}，
+        // 不补这一步坐 1 号位的人回来镜像会整个反过来
+        D678N.Net.mySeat = r.mySeat;
+        D678N.Net.room = r.room;
+        self._roomInfo = { room: r.room, phase: r.phase, mySeat: r.mySeat };
+        // lobby 阶段（建了房还没人来）不会有盘面推过来，就停在等待页；
+        // 其余阶段 onReconnect 会推 resync 盘面，pollNet 收到就 push 对局场景
+        self._resuming = (r.phase !== 'lobby');
+        D678N.Net.connect(sid);
+        self.refresh();
+    });
 };
 
 Scene_D678Net.prototype.bindNet = function () {
@@ -388,13 +428,32 @@ Scene_D678Net.prototype.refresh = function () {
     this._hits = [];
 
     this.txt('多人游戏', 0, 120, W, 44, LC.gold, 'center');
+    // 玩家名条。原来是一行 20 号灰字（整屏最小）加一句「（点这里可改）」，
+    // 点击区还没画框 —— 看不出能点。现在名字提到 32 号白字，和菜单按钮同级，
+    // 「修改」做成独立小按钮。点名字本身不改名，避免误触。
     var nm = D678N.savedName();
-    if (nm) this.txt('玩家名：' + nm + '　（点这里可改）', 0, 180, W, 20, LC.gray, 'center');
+    var px = Math.round(W / 2 - BTN_W / 2), py = 186, ph = 96;
+    this.panel(px, py, BTN_W, ph);
+    this.txt('玩家名', px + 24, py + 12, 200, 18, LC.gray, 'left');
 
-    if (nm) {
-        this._hits.push({ x: W / 2 - 200, y: 176, w: 400, h: 30, i: -2,
-                          cb: this.onChangeName.bind(this) });
-    }
+    var mw = 96, mh = 56;
+    var mx = px + BTN_W - 20 - mw, my = py + (ph - mh) / 2;
+    this.txt(nm || '未设置', px + 24, py + 40, mx - px - 40, 32,
+             nm ? LC.text : LC.gray, 'left');
+
+    // 按下反馈沿用 i: -2（改名一直占着这个号），和菜单按钮同一套观感
+    var mpress = (this._press === -2);
+    drawBtn(this._bmp, mx, my, mw, mh, mpress, mpress);
+    this._bmp.fontSize = 24;
+    this._bmp.textColor = mpress ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText(nm ? '修改' : '设置', mx,
+        my + (mh - 34) / 2 + (mpress ? 2 : 0), mw, 34, 'center');
+    // 没存过名字时也要能点 —— 原来 if (nm) 为假整行都不画，
+    // 第一次进来看不到「我是谁」，也没法主动设名字
+    this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
+                      cb: this.onChangeName.bind(this) });
 
     if (this._page === 'menu')    this.drawMenu();
     if (this._page === 'duel')    this.drawDuel();
@@ -412,20 +471,22 @@ Scene_D678Net.prototype.refresh = function () {
     this._hits.push({ x: bx, y: by, w: 220, h: 62, i: -1, cb: this.onBack.bind(this) });
 };
 
+// 按钮不带 sub 说明 —— 标题已经说清是什么了，灰字副标题只是噪音。
+// buttons() 仍支持 sub 字段，以后想加回来传一下就行。
 Scene_D678Net.prototype.drawMenu = function () {
     this.buttons([
-        { label: '锦标赛', sub: '8 人淘汰赛（敬请期待）', dim: true,
-          cb: function () {} },
-        { label: '单人对决', sub: '两个人 1v1，规则同单机',
-          cb: this.onDuel.bind(this) },
+        // 「敬请期待」并进标题：它是 dim 按钮，点了没反应，
+        // 不说一句玩家会以为是坏的
+        { label: '锦标赛（敬请期待）', dim: true, cb: function () {} },
+        { label: '单人对决', cb: this.onDuel.bind(this) },
     ], 380);
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
     this.txt('单人对决', 0, 300, Graphics.width, 30, LC.gold, 'center');
     this.buttons([
-        { label: '建立房间', sub: '拿到房号后发给对方', cb: this.onCreate.bind(this) },
-        { label: '加入房间', sub: '输入对方给的 4 位房号', cb: this.onJoinPrompt.bind(this) },
+        { label: '建立房间', cb: this.onCreate.bind(this) },
+        { label: '加入房间', cb: this.onJoinPrompt.bind(this) },
     ], 400);
 };
 
@@ -433,6 +494,16 @@ Scene_D678Net.prototype.drawWaiting = function () {
     var W = Graphics.width;
     var info = this._roomInfo;
     if (!info) { this.txt('连接中…', 0, 400, W, 28, LC.gray, 'center'); return; }
+
+    // 刷新后正在恢复：盘面还没到，房间信息也还没带 seats，
+    // 直接走下面会踩 info.seats[i] 的空指针
+    if (this._resuming || !info.seats) {
+        this.panel(60, 340, W - 120, 200);
+        this.txt('正在恢复对局…', 60, 396, W - 120, 30, LC.gold, 'center');
+        this.txt('房间 ' + (info.room || ''), 60, 444, W - 120, 22, LC.gray, 'center');
+        this.txt('稍等一下，正在把你放回牌桌', 60, 480, W - 120, 18, LC.gray, 'center');
+        return;
+    }
 
     this.panel(60, 300, W - 120, 340);
     this.txt('房间号', 60, 322, W - 120, 20, LC.gray, 'center');
@@ -482,6 +553,7 @@ Scene_D678Net.prototype.pollNet = function () {
         D678N.Net.reset();
         this._page = 'menu';
         this._roomInfo = null;
+        this._resuming = false;   // 恢复途中房间被终止：别卡在「正在恢复」
         this.notice(why);
         this.refresh();
         return;
@@ -494,6 +566,9 @@ Scene_D678Net.prototype.pollNet = function () {
         D678N.Net.room = r.room;
         D678N.Net.mySeat = r.mySeat;
         if (this._page !== 'waiting') this._page = 'waiting';
+        // lobby 阶段恢复：没有盘面会来，收掉「正在恢复」显示正常的等待页。
+        // 其余阶段继续挂着，等下面那份 resync 盘面把我们推进对局场景。
+        if (this._resuming && r.phase === 'lobby') this._resuming = false;
         this.refresh();
     }
 
@@ -550,7 +625,7 @@ Scene_D678Net.prototype.askName = function () {
     var cur = D678N.savedName();
     var s = window.prompt('输入你的名字（最多 8 个汉字）', cur || '玩家');
     if (s === null) return null;
-    s = String(s).trim();
+    s = String(s).trim().slice(0, 8);  // 截断到 8 字符，免得超长名字压扁或溢出
     if (!s) { this.notice('名字不能为空'); this.refresh(); return null; }
     D678N.saveName(s);
     return s;
@@ -1272,11 +1347,16 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 这里不再重复画。
 
     // 弃牌倒计时：画在覆盖层上（弃牌界面用的是 _ovBmp，画 _uiBmp 会被盖住）
+    //
+    // y=280 不是随便挑的：678.js 的 drawDiscard 在 y=240 画「需要弃掉 N 张」，
+    // 22 号字经 drawText 后实占 240–272（高度是 size + 10），卡片区从 320 起。
+    // 原来这行画在 252，和上面那行重叠 20 像素，两行几乎叠在一起。
+    // 280 起画占 280–312，离卡片还有 8 像素余量。
     if (this._discardFor) {
         var ds = this.netDiscardSec();
         if (ds >= 0) {
             this.txt(this._ovBmp, '剩 ' + ds + ' 秒，超时自动弃',
-                0, 252, NLY.SW, 22, ds <= 10 ? LC.red : LC.gray, 'center');
+                0, 280, NLY.SW, 22, ds <= 10 ? LC.red : LC.gray, 'center');
         }
     }
 
@@ -1305,14 +1385,20 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 轮结果画面：只有一行状态字，点画面任意位置继续。
     // 之前既有「继续」按钮又有「点击任意位置」提示，两者位置重叠、语义冲突，
     // 所以按钮整个删掉，只留一行字说明当前在等什么。
+    //
+    // _netWaitAck（我点过）优先于 _netAdvancing（服务器在倒数）判断 ——
+    // advancing 是 pushState 推给所有座位的，两边同时置上，_netWaitAck
+    // 那个分支原来几乎轮不到显示（只在 ack 发出、advancing 状态还没回来的
+    // 几十毫秒里出现）。现在点了的人看「正在开启下一局」，没点的人看
+    // 「对方已确认」，两边有区分。
     if (this._phase === 'roundResult' && !this._showList && !this._discardFor) {
-        var by = 1070, bh = 46;
         var msg, col;
-        if (this._netAdvancing) { msg = '即将开始下一局…';        col = LC.green; }
-        else if (this._netWaitAck) { msg = '已确认，即将开始下一局…'; col = LC.gold; }
+        if (this._netWaitAck) { msg = '正在开启下一局';   col = LC.gold; }
+        else if (this._netAdvancing) { msg = '对方已确认'; col = LC.green; }
         else { msg = '点击任意位置继续';   col = LC.white; }
-        this.box(bmp, 150, by, 420, bh, 'rgba(0,0,0,0.9)', LC.gold, 8);
-        this.txt(bmp, msg, 150, by + 12, 420, 22, col, 'center');
+        // 不画背景框 —— 原来那个框（y=1070–1116）会压住 678.js:1492 那行
+        // 「点击上方血条查看全体排名与统计」（y=1100）。框删掉，字留着。
+        this.txt(bmp, msg, 0, 1070, NLY.SW, 24, col, 'center');
     }
 
     // 对方还在弃牌：整屏压暗只留一句话。画在 _ovBmp 上才能盖住卡牌层。
@@ -1402,12 +1488,35 @@ if (Scene_Title.prototype.callTitleButton) {
     } catch (e) {}
 })();
 
-// 带房号进来的话直接跳到大厅，省掉玩家自己点「多人游戏」
+//=============================================================================
+// 刷新后自动回到刚刚的对局
+//=============================================================================
+//
+// 会话存在 sessionStorage 里，刷新不丢（只有关标签页才清）。服务器那边
+// 掉线后座位保留 graceSec（默认 300 秒），/api/events 还会主动顶掉旧连接 ——
+// 整套重连逻辑本来就有，缺的只是刷新后没人去把 sid 捡回来。
+//
+// 不能从标题直接 push Scene_D678：它认不认联机全看 D678N.mode，而那个是
+// 大厅收到第一份盘面时才设的，跳过就会当单机局跑空的 D678.Game 然后炸。
+// 所以借道大厅，让它照原路走完（探测 → 连 SSE → 等盘面 → 设 mode → push）。
 var _stStart = Scene_Title.prototype.start;
 Scene_Title.prototype.start = function () {
     _stStart.call(this);
-    if (D678N.autoRoom && !D678N._autoDone) {
+    if (D678N._autoDone) return;
+
+    // 带房号进来的话直接跳到大厅，省掉玩家自己点「多人游戏」
+    if (D678N.autoRoom) {
         D678N._autoDone = true;
+        SceneManager.push(Scene_D678Net);
+        return;
+    }
+
+    // 刷新后捡回会话。链接带房号的优先 —— 那是玩家刚点了新链接，
+    // 意图明确，不该被旧会话截走。
+    var sess = D678N.session();
+    if (sess && sess.sid) {
+        D678N._autoDone = true;
+        D678N.resumeSid = sess.sid;
         SceneManager.push(Scene_D678Net);
     }
 };

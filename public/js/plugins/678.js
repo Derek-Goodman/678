@@ -581,7 +581,8 @@ Scene_D678.prototype.drawUseButton = function (b) {
     this.box(bmp, x + 6, y + 5, w - 12, 30, 'rgba(255,255,255,0.18)', null, 7);
     this.txt(bmp, '使 用', x, y + 32, w, 34, usable ? COL.white : '#888', 'center');
     if (usable) {
-        this._hits.push({ x: x, y: y, w: w, h: h, cb: this.onUseFunc.bind(this) });
+        this._hits.push({ x: x, y: y, w: w, h: h, fx: true,
+                          cb: this.onUseFunc.bind(this) });
     }
 };
 
@@ -616,8 +617,11 @@ Scene_D678.prototype.drawButtons = function (b) {
     this.box(bmp, 390, y, bw, bh, active ? 'rgba(150,110,40,0.85)' : 'rgba(60,60,60,0.6)', COL.line, 10);
     this.txt(bmp, '过牌', 390, y + 18, bw, 28, active ? COL.white : '#888', 'center');
     if (active) {
-        this._hits.push({ x: 30, y: y, w: bw, h: bh, cb: this.onHit.bind(this) });
-        this._hits.push({ x: 390, y: y, w: bw, h: bh, cb: this.onStand.bind(this) });
+        // fx: true —— 点中时放一下高光脉冲（见 updateInput / tapFx）
+        this._hits.push({ x: 30, y: y, w: bw, h: bh, fx: true,
+                          cb: this.onHit.bind(this) });
+        this._hits.push({ x: 390, y: y, w: bw, h: bh, fx: true,
+                          cb: this.onStand.bind(this) });
     }
 };
 
@@ -647,8 +651,7 @@ Scene_D678.prototype.drawShowdown = function () {
 
     // 对方
     this.txt(bmp, opp.name, 60, 318, 600, 24, COL.gray, 'center');
-    this.txt(bmp, String(t1) + (r.busts[1] ? '　爆牌' : (r.maxes[1] ? '　满点' : '')),
-        60, 348, 600, 60, r.busts[1] ? COL.red : (r.maxes[1] ? COL.gold : COL.white), 'center');
+    this.drawShowdownTotal(t1, r.busts[1], r.maxes[1], 348);
 
     // 中间大字：以我方为准写“胜 / 负”，胜为红色、负为绿色
     var mid, midCol;
@@ -659,13 +662,39 @@ Scene_D678.prototype.drawShowdown = function () {
 
     // 我方
     this.txt(bmp, '我', 60, 512, 600, 24, COL.gray, 'center');
-    this.txt(bmp, String(t0) + (r.busts[0] ? '　爆牌' : (r.maxes[0] ? '　满点' : '')),
-        60, 542, 600, 60, r.busts[0] ? COL.red : (r.maxes[0] ? COL.gold : COL.white), 'center');
+    this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542);
 
     // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）
     if (r.tie) {
         this.txt(bmp, '重新发牌', 60, 622, 600, 26, COL.gray, 'center');
     }
+};
+
+// 结算面板里的一行点数。
+//
+// 数字必须在面板正中间，不管有没有「爆牌 / 满点」后缀 —— 原来是把
+// String(t) 和后缀拼成一整串再居中，居中的是「21　满点」这整串，
+// 数字就被后缀往左推了。普通情况画的是「18」，居中的就是数字本身，
+// 于是满点/爆牌时数字位置和平时对不上，看着就是偏的。
+//
+// 现在数字独立居中，后缀画在数字右边 —— 数字的位置和有没有后缀无关。
+Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y) {
+    var bmp = this._ovBmp;
+    var col = bust ? COL.red : (max ? COL.gold : COL.white);
+    var s = String(t);
+
+    // 数字居中在面板宽度上（面板 x 60 宽 600）
+    this.txt(bmp, s, 60, y, 600, 60, col, 'center');
+
+    var tag = bust ? '爆牌' : (max ? '满点' : '');
+    if (!tag) return;
+
+    // 后缀紧跟在数字右侧。数字实际宽度要按 60 号字量出来，
+    // 不能猜 —— 一位数和两位数差一半宽度。
+    bmp.fontSize = 60;
+    var numW = bmp.measureTextWidth(s);
+    var tagX = 60 + 300 + numW / 2 + 16;      // 面板中线 + 数字半宽 + 间距
+    this.txt(bmp, tag, tagX, y + 16, 120, 30, col, 'left');
 };
 
 // 排名里的胜负一栏。本轮还没打完时退回上一轮的结果（prev=true 时标注“上轮”），
@@ -789,7 +818,17 @@ Scene_D678.prototype.updateInput = function () {
     var x = TouchInput.x, y = TouchInput.y;
     for (var i = this._hits.length - 1; i >= 0; i--) {
         var h = this._hits[i];
-        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) { h.cb(); return; }
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+            // 反馈要在回调之前放 —— 回调往往立刻换状态重画（要牌之后按钮就
+            // 灰掉了），先放特效才保证这一下看得见。特效在 _fxLayer 上，
+            // 不受随后 refresh 的影响。
+            if (h.fx) {
+                this.tapFx(h.x, h.y, h.w, h.h);
+                SoundManager.playCursor();
+            }
+            h.cb();
+            return;
+        }
     }
     // 满点演出可以点击跳过：赶时间的玩家不必等完整 3.3 秒
     if (this._phase === 'resolve' && this._panelHold > 0) {
@@ -887,8 +926,58 @@ Scene_D678.prototype.onUseFunc = function () {
     if (!r.ok) { this.notice(r.err || '无法使用'); this.refresh(); return; }
     this.funcFx();
     if (r.fail) this.notice('此号牌已在场上');
+    // 重抽必须在 refresh 之前重置精灵，否则那一帧就已经复用了旧精灵
+    if (r.same) this.redealCard(0);
     this._selFunc = null;
     this.afterPlayerAction();
+};
+
+// 让某一方最后一张牌重新「发」一次。
+//
+// 重抽拿到同一个数字时，cardKey（si_idx_值_正反）和原来完全一致 ——
+// refreshCards 认为这张牌没变，直接复用旧精灵，不新建也不重置 opacity，
+// 于是牌原地不动，看起来像什么都没发生（其实牌已经洗回去又抽出来了）。
+//
+// 做法：把那个 key 对应的精灵直接扔掉。下一次 refreshCards 找不到它就会新建，
+// 而新建的精灵天生从画面中央、opacity 0 开始飞向目标位 —— 和发牌入场
+// 完全同一套动画，不用另写。
+Scene_D678.prototype.redealCard = function (si) {
+    var b = this._battle;
+    if (!b) return;
+    var cards = b.sides[si].cards;
+    if (!cards.length) return;
+    // doDraw 是 push，重抽出来的那张一定在末尾
+    var idx = cards.length - 1;
+    var key = this.cardKey(si, idx, cards[idx], b.revealed);
+    var sp = this._cardSprites[key];
+    if (!sp) return;                     // 值变了的话 key 本来就不同，正常路径已经会重新入场
+    this._cardLayer.removeChild(sp);
+    delete this._cardSprites[key];
+    this.redealSweepFx(si);
+};
+
+// 重抽用的横扫光。不能直接用 dealFx —— 它的 y 固定在 380，那是整局发牌用的
+// 位置，正好落在两排牌之间的空档里（对方牌在 y=190，我方在 y=660），
+// 两边都不挨着。这里按行定位，光带扫过那一排。
+Scene_D678.prototype.redealSweepFx = function (si) {
+    var rowY = (si === 0) ? LY.MY_CARD_Y : LY.OPP_CARD_Y;
+    var H = LY.CARD_H + 40;
+    var bmp = new Bitmap(LY.SW, H), ctx = bmp._context;
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0,    'rgba(255,255,255,0)');
+    g.addColorStop(0.5,  'rgba(255,255,255,0.42)');
+    g.addColorStop(1,    'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, LY.SW, H);
+    bmp._setDirty();
+
+    var sp = new Sprite(bmp);
+    sp.y = rowY - 20;
+    sp.blendMode = 1;                 // 叠加，像光扫过去
+    this.addFx(sp, 26, function (s, r) {
+        s.opacity = 220 * (1 - r);
+        s.scale.y = 1 + r * 0.5;
+    });
 };
 
 Scene_D678.prototype.afterPlayerAction = function () {
@@ -1005,6 +1094,32 @@ Scene_D678.prototype.funcFx = function (cx, cy) {
     this.addFx(sp2, 26, function (s, r) {
         s.scale.x = s.scale.y = 1.6 - r * 1.2;
         s.opacity = 255 * (1 - r * r);
+    });
+};
+
+// 按钮点击反馈。
+//
+// 这个场景的输入是「isTriggered 那一帧直接跑回调」，没有按下/抬起状态，
+// 所以按钮天生没有任何反馈 —— 点了要牌、过牌、使用，画面上看不出被点过。
+// 补一个短促的高光脉冲：画在 _fxLayer 上（在 _uiBmp 的按钮之上、_ovSprite
+// 的面板之下），所以不用改任何绘制函数，也不会盖住排名列表和弃牌界面。
+//
+// 走现有的 addFx / updateFx 机制，两条 update 路径（正常 + 教程）都会跑到。
+Scene_D678.prototype.tapFx = function (x, y, w, h) {
+    var pad = 6;
+    var bw = w + pad * 2, bh = h + pad * 2;
+    // 圆角用 this.box —— 这个文件里没有独立的 roundRect
+    var bmp = new Bitmap(bw, bh);
+    this.box(bmp, 2, 2, bw - 4, bh - 4, 'rgba(255,255,255,0.42)', '#ffeaa0', 12);
+
+    var sp = new Sprite(bmp);
+    sp.anchor.x = sp.anchor.y = 0.5;
+    sp.x = x + w / 2;
+    sp.y = y + h / 2;
+    this.addFx(sp, 14, function (s, r) {
+        // 先快速亮起再淡出，同时轻微放大 —— 像按下去弹回来
+        s.opacity = 255 * (1 - r * r);
+        s.scale.x = s.scale.y = 1 + r * 0.06;
     });
 };
 
@@ -1264,6 +1379,9 @@ Scene_D678.prototype.updateBattle = function () {
         if (ev.action === 'func') this.funcFx();
         this.pushMsg(ev.msg);
         this._wait = 45;
+        // 对方重抽到同一张也要重发一次 —— 否则那张牌原地不动，
+        // 看不出对方到底做了什么
+        if (ev.same) this.redealCard(1);
         this.refresh();
         if (b.finished || (b.result && b.result.tie)) this.onBattleEnd();
     }
@@ -1779,12 +1897,18 @@ Scene_D678.prototype.tutUpdateInput = function () {
     var inRect = function (r) {
         return r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
     };
+    // 教程自己算命中区（tutRect），绕开了 _hits，所以点击反馈得在这儿单独放。
+    // 不允许的那一步也放 —— 否则玩家会以为没点到，而不是「这一步不能这么做」。
     if (inRect(rh)) {
+        this.tapFx(rh.x, rh.y, rh.w, rh.h);
+        SoundManager.playCursor();
         if (s.allow === 'hit') this.tutAct('hit');
         else { this.notice(s.hitMsg || '教程里这一步还不能要牌'); this.refresh(); }
         return true;
     }
     if (inRect(rs)) {
+        this.tapFx(rs.x, rs.y, rs.w, rs.h);
+        SoundManager.playCursor();
         if (s.allow === 'stand') this.tutAct('stand');
         else { this.notice(s.standMsg || '教程里这一步还不能过牌'); this.refresh(); }
         return true;

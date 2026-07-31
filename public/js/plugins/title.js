@@ -225,15 +225,18 @@ Scene_Title.prototype.createTitleButtons = function () {
             label: list[i].name, symbol: list[i].symbol
         });
     }
-    this._btnHover = -1;
     this._btnPress = -1;
     this._btnCache = '';
     this.refreshTitleButtons();
 };
 
+// 高亮只跟「正在按下」走。命令窗口的下标和鼠标位置都不参与绘制 ——
+// 原来是 on = (i === _btnHover) || (_btnHover < 0 && i === idx)，
+// 两截都会造成「某个按钮莫名亮着」：idx 那截让当前下标常驻高亮，
+// _btnHover 那截会捡到上一个场景遗留的触摸坐标（详见 updateTitleButtons）。
+// 键盘和手柄照旧能用（命令表与 handler 都还在），只是屏幕上不显示光标位置。
 Scene_Title.prototype.refreshTitleButtons = function () {
-    var idx = this._commandWindow ? this._commandWindow.index() : 0;
-    var key = idx + '|' + this._btnHover + '|' + this._btnPress;
+    var key = String(this._btnPress);
     if (key === this._btnCache) return;      // 没变化就不重画，省开销
     this._btnCache = key;
 
@@ -241,8 +244,8 @@ Scene_Title.prototype.refreshTitleButtons = function () {
     bmp.clear();
     for (var i = 0; i < this._btns.length; i++) {
         var b = this._btns[i];
-        var on = (i === this._btnHover) || (this._btnHover < 0 && i === idx);
         var press = (i === this._btnPress);
+        var on = press;
         D678T.drawButton(bmp, b.x, b.y, b.w, b.h, on, press);
         bmp.fontSize = 30;
         bmp.textColor = (on || press) ? TC.edge : TC.textD;
@@ -260,6 +263,20 @@ Scene_Title.prototype.update = function () {
     this.updateTitleButtons();
 };
 
+// 只认「按下」，不认「悬停」。
+//
+// RMMV 里没有真正的悬停：TouchInput._onMouseMove 只在按住时才更新 x/y，
+// 鼠标空移根本不动坐标，触屏更是停在最后一次触摸点不放。所以原来那个
+// _btnHover 从来不是悬停，只是「上次按的位置」，而且下一次触摸之前一直不变。
+//
+// 这造成一个实际 bug：大厅的「返回」按钮（x 250–470, y 1170–1232）正好压在
+// 标题的「说明」按钮（x 180–540, y 1136–1210）上。点返回弹回标题后，坐标
+// 还停在那儿，下一帧 _btnHover 就被算成「说明」并且一直亮着 ——
+// 表现就是「每次从多人游戏出来都默认选中说明」。
+//
+// 这两块必然重叠，不是巧合：按钮组底部锚定（BTN_BOTTOM=70），最后一个按钮
+// 永远贴在 y 1136–1210；而大厅的返回按钮也贴着底边。所以就算以后往标题
+// 加减命令项，最后那一个还是会被返回按钮的坐标扫到。
 Scene_Title.prototype.updateTitleButtons = function () {
     if (!this._btns || !this._btnSprite) return;
     var w = this._commandWindow;
@@ -268,37 +285,33 @@ Scene_Title.prototype.updateTitleButtons = function () {
     this._btnSprite.visible = true;
 
     if (!live) {
-        if (this._btnPress >= 0 || this._btnHover >= 0) {
-            this._btnPress = -1; this._btnHover = -1;
+        if (this._btnPress >= 0) {
+            this._btnPress = -1;
             this.refreshTitleButtons();
         }
         return;
     }
 
-    var x = TouchInput.x, y = TouchInput.y;
-    var hit = D678T.hitTest(this._btns, x, y);
+    var hit = D678T.hitTest(this._btns, TouchInput.x, TouchInput.y);
 
-    // 鼠标悬停（触屏上 TouchInput.x/y 停在最后一次触摸点，不影响单击逻辑）
     if (TouchInput.isPressed()) {
+        // 只在真的「这一下刚按下」时才认，避免把上一个场景遗留的按压状态算进来
         if (this._btnPress < 0 && TouchInput.isTriggered() && hit >= 0) {
             this._btnPress = hit;
-            this._commandWindow.select(hit);
+            this._commandWindow.select(hit);   // 同步键盘光标，不影响绘制
             SoundManager.playCursor();
         } else if (this._btnPress >= 0 && hit !== this._btnPress) {
             this._btnPress = -1;      // 手指滑出按钮 -> 取消
         }
-        this._btnHover = hit;
     } else {
         if (TouchInput.isReleased() && this._btnPress >= 0 && hit === this._btnPress) {
             var b = this._btns[this._btnPress];
             this._btnPress = -1;
-            this._btnHover = -1;
             this.refreshTitleButtons();
             this.callTitleButton(b.symbol);
             return;
         }
         this._btnPress = -1;
-        this._btnHover = hit;
     }
     this.refreshTitleButtons();
 };
@@ -318,7 +331,7 @@ Scene_Title.prototype.start = function () {
     _ST_start.call(this);
     if (this._commandWindow) this._commandWindow.activate();
     this._btnPress = -1;
-    this._btnHover = -1;
+    // 缓存清空强制重画一次 —— 从别的场景弹回来时确保没有残留高亮
     this._btnCache = '';
     this.refreshTitleButtons();
 };

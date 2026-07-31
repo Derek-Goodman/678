@@ -908,6 +908,30 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    //--- 恢复会话 ----------------------------------------------------------
+    // 客户端刷新后拿 sessionStorage 里的 sid 来问「我这个座位还在吗」。
+    //
+    // 必须是 XHR 能打的普通接口，不能让客户端靠 EventSource 的 onerror 判断 ——
+    // EventSource 不暴露 HTTP 状态码（404 / 500 / 断网都是同一个空事件），
+    // 而且浏览器对 4xx 会无限重连，表现就是卡在「正在重连」永远出不来。
+    //
+    // 必须回 mySeat：它原来只在 create / join 的响应里给，sessionStorage 只存了
+    // {sid, room}，刷新后 mySeat 归 0 —— 坐 1 号位的人回来镜像会整个反过来。
+    // phase 一起带上，客户端靠它决定回大厅等待页还是进对局场景。
+    if (u === '/api/resume' && req.method === 'POST') {
+        readBody(req, body => {
+            if (!body) return json(res, 400, { err: '请求格式错误' });
+            const found = seatOf(body.sid);
+            if (!found) return json(res, 404, { err: '会话已失效' });
+            const { room, seat } = found;
+            json(res, 200, {
+                ok: true, room: room.code, mySeat: seat.index,
+                phase: room.phase, name: seat.name,
+            });
+        });
+        return;
+    }
+
     //--- 动作 --------------------------------------------------------------
     if (u === '/api/act' && req.method === 'POST') {
         readBody(req, body => {
