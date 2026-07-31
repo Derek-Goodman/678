@@ -76,6 +76,12 @@ const CFG = {
     // 写 0 关掉计时（本地调试用）。
     turnSec: Number(argOf('--turn-sec', 30)),
 
+    // 掉线的人轮到他时用这个更短的时限（秒）。他不会来操作，让在线的那个人
+    // 干等满 turnSec 没有意义 —— 而且 678core 里 standStreak>=2 才结算、
+    // hit 会把它归零，所以在线方每要一张牌都要多买一个完整回合的等待。
+    // 重连回来立刻恢复成 turnSec（见 armTurnTimer）。
+    goneTurnSec: Number(argOf('--gone-turn-sec', 10)),
+
     // 掉线后多久强制结束房间（秒）。界面上不再显示这个倒计时 ——
     // 玩家看到的是「对方已掉线 X 秒」并且随时可以自己点返回主菜单，
     // 所以这里只是一道兜底，不需要催人。
@@ -96,6 +102,11 @@ const CFG = {
 
     // 空房间清理（分钟）
     idleMin: Number(argOf('--idle-min', 30)),
+
+    // 访客多久没心跳就算离线（秒）。客户端在大厅里每 5 秒 ping 一次，
+    // 给到 15 秒是留两次丢包的余量 —— 手机切后台会掉几次，
+    // 卡太紧的话人数会一直跳。
+    visitorSec: Number(argOf('--visitor-sec', 15)),
 };
 
 // 时间戳要拼进格式串里，不能当第一个参数传 —— 那样 %s 不会被替换
@@ -390,8 +401,77 @@ function dropRoom(room, why) {
 }
 
 //=============================================================================
+// 在线人数
+//=============================================================================
+//
+// 服务器本来只认识「坐进座位的人」—— 有 sid 才有 SSE 连接。站在多人菜单上
+// 还没建房的人是完全看不见的，而那恰恰是最该数进去的：两个人同时在菜单上
+// 却互相看到「0 人在线」，然后各自走掉，这个功能就白做了。
+//
+// 所以让大厅页每 5 秒 POST 一次 /api/stats，这个请求本身就是心跳。
+// 去重靠客户端的 tab 令牌（sessionStorage，同浏览器两个标签页算两个人）：
+//   · 还在菜单上晃：只有 token，没有 sid
+//   · 建了房在等人：token 不变，多带一个 sid
+// 统计时凡是「sid 指向一个还连着的座位」的访客一律跳过 —— 那个人已经被
+// 座位那一遍数过了。token 不变是去重能成立的前提，别改成每次随机。
+//
+// 进了对局就不再 ping（大厅场景已经不在了），那条访客记录 15 秒后自然过期，
+// 而这期间他一直被座位数着，所以人数不会因此跳动。
+
+const visitors = new Map();   // token -> {at, sid}
+
+// 上限纯粹是防刷：这接口不需要鉴权，谁都能拿不同 token 灌进来。
+// 满了就不再收新的（老的照常刷新），最坏情况是人数偏小，不会把内存吃光。
+const VISITOR_MAX = 5000;
+
+function touchVisitor(token, sid) {
+    if (!token) return;
+    if (!visitors.has(token) && visitors.size >= VISITOR_MAX) return;
+    visitors.set(token, { at: Date.now(), sid: sid || null });
+}
+
+function sweepVisitors() {
+    const dead = Date.now() - CFG.visitorSec * 1000;
+    for (const [k, v] of visitors) {
+        if (v.at < dead) visitors.delete(k);
+    }
+}
+
+// online  = 还连着的座位 + 没被座位数过的访客
+// playing = 已经开打的房间里还连着的座位
+// waiting = 建好了、还差一个人的房间数（至少有一个人真连着）
+function computeStats() {
+    sweepVisitors();
+
+    const liveSids = new Set();
+    let playing = 0, waiting = 0, seated = 0;
+
+    for (const room of rooms.values()) {
+        const live = room.seats.filter(s => s && s.connected);
+        live.forEach(s => liveSids.add(s.sid));
+        seated += live.length;
+        if (room.phase === 'lobby') {
+            if (live.length > 0 && live.length < 2) waiting++;
+        } else {
+            playing += live.length;
+        }
+    }
+
+    let loose = 0;
+    for (const v of visitors.values()) {
+        // sid 指向活座位的已经数过了；sid 失效（房间销毁了但页面还开着）
+        // 的仍然算在线 —— 那个人确实还盯着屏幕
+        if (v.sid && liveSids.has(v.sid)) continue;
+        loose++;
+    }
+
+    return { online: seated + loose, playing: playing, waiting: waiting };
+}
+
+//=============================================================================
 // 推送（SSE）
 //=============================================================================
+
 
 function sendTo(seat, type, data) {
     if (!seat || !seat.sse) return;
@@ -502,6 +582,8 @@ function nextBattle(room) {
     room.phase = 'battle';
     room.preFuncs = null;
     room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
+    room.turnStartAt = 0;
+    room.turnGoneDeadline = 0;
     // 计时器必须在 pushState 之前武装 —— 否则这一份状态里的 turnLeft 是 0，
     // 客户端第一回合就没有倒计时可显示（这就是「第一回合不显示」的原因）
     armTurnTimer(room);
@@ -512,19 +594,61 @@ function nextBattle(room) {
 // 超时判过牌：stand 永远是合法动作，不会因为「明牌已满 21 不能要牌」这类
 // 限制而失败。CFG.turnSec = 0 时不计时（本地调试）。
 
+// 每次行动后重排。掉线 / 重连时也要重排（onDisconnect / onReconnect 各调一次）——
+// 时限是在行动那一刻算好的，中途掉线不重排的话那一个回合仍然等满 turnSec。
+//
+// 截止时间一律从 room.turnStartAt 这个锚点算，不是从「现在」算：
+//   · 在线   -> 开始 + turnSec
+//   · 掉线   -> 开始 + goneTurnSec，且不允许比原截止时间更晚（取 min）
+// 锚定到回合起点是为了让重连能干净地恢复：直接重算成 开始+turnSec 就行，
+// 不用记「掉线时还剩多少」。取 min 是防一种钻空子 —— 回合过了 21 秒才掉线，
+// 若直接设成 开始+10s 那已经是过去时间、会当场判过牌，取 min 后他保住
+// 原本剩下的 9 秒。所以晚掉线不吃亏，10 秒只在回合早期掉线时才真正生效。
 function armTurnTimer(room) {
     clearTimeout(room.turnTimer);
     room.turnDeadline = 0;
     if (!CFG.turnSec || room.phase !== 'battle' || !room.battle) return;
     if (room.battle.finished) return;
-    room.turnDeadline = Date.now() + CFG.turnSec * 1000;
+
+    const now = Date.now();
+    if (!room.turnStartAt) room.turnStartAt = now;
+
+    const si = room.battle.turn;
+    const seat = room.seats[si];
+    const gone = !!(seat && !seat.connected);
+
+    // 在线：回合起点 + turnSec。锚在起点上，所以重连时直接重算就恢复了，
+    // 不用记「掉线时还剩多少」，也不会因为掉线一次白拿满一个回合。
+    const full = room.turnStartAt + CFG.turnSec * 1000;
+
+    let deadline;
+    if (!gone) {
+        deadline = full;
+    } else {
+        // 掉线：从「现在」起 goneTurnSec，但不许超过原本的截止时间。
+        //
+        // 【别改回锚在 turnStartAt 上】那样写在回合末尾掉线会算出一个已经
+        // 过去的时刻（回合走了 27 秒时 起点+10s 是 17 秒前），于是当场判过牌 ——
+        // 恰好是「晚掉线不吃亏」想避免的事。取 min 也救不回来，因为 min
+        // 挑的就是那个更早的过去时刻。回归测试 D 段卡的就是这个。
+        deadline = Math.min(now + (CFG.goneTurnSec || CFG.turnSec) * 1000, full);
+        // 掉线期间若重复武装（onDisconnect 走了两次之类），别每次都从新的
+        // 「现在」再续 10 秒 —— 认第一次算出来的那个
+        if (room.turnGoneDeadline && room.turnGoneDeadline > now) {
+            deadline = Math.min(deadline, room.turnGoneDeadline);
+        }
+        room.turnGoneDeadline = deadline;
+    }
+    if (!gone) room.turnGoneDeadline = 0;   // 重连后作废，下次掉线重新算
+
+    room.turnDeadline = deadline;
     room.turnTimer = setTimeout(() => {
         const b = room.battle;
         if (!b || b.finished || room.phase !== 'battle') return;
-        const si = b.turn;
-        log('房间 %s 座位 %d 回合超时 -> 判过牌', room.code, si);
-        applyAction(room, si, { type: 'stand' }, true);
-    }, CFG.turnSec * 1000);
+        log('房间 %s 座位 %d 回合超时 -> 判过牌%s',
+            room.code, b.turn, gone ? '（掉线，' + sec + ' 秒时限）' : '');
+        applyAction(room, b.turn, { type: 'stand' }, true);
+    }, Math.max(0, deadline - Date.now()));
 }
 
 //--- 应用一个动作 ----------------------------------------------------------
@@ -533,6 +657,10 @@ function applyAction(room, si, action, forced) {
     const b = room.battle;
     if (!b || b.finished || room.phase !== 'battle') return { ok: false, err: '当前不能行动' };
     if (b.turn !== si) return { ok: false, err: '还没轮到你' };
+
+    // 只有抽牌类动作会结束回合（用功能牌通常不会），所以不能无条件重置锚点，
+    // 否则每用一张功能牌都白送一个完整回合的时间
+    const turnBefore = b.turn;
 
     let msg = '', ok = true, err = '', failNote = '';
 
@@ -571,6 +699,10 @@ function applyAction(room, si, action, forced) {
     if (b.result && b.result.tie) { enterResolved(room, true); return { ok: true, fail: failNote }; }
     if (b.finished) { enterResolved(room, false); return { ok: true, fail: failNote }; }
 
+    if (b.turn !== turnBefore) {
+        room.turnStartAt = 0;        // 换人了：下面 armTurnTimer 会重新锚定
+        room.turnGoneDeadline = 0;
+    }
     armTurnTimer(room);   // 先武装再推，让这份状态带上新的 turnLeft
     pushState(room);
     return { ok: true, fail: failNote };
@@ -766,6 +898,14 @@ function onDisconnect(room, seat) {
     // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
     if (other) sendTo(other, 'peer', { gone: true, name: seat.name });
 
+    // 正好轮到掉线这个人时，把他的回合缩到 goneTurnSec。必须重排 + 推一次状态：
+    // 时限是行动那一刻算好的，不重排的话这一个回合仍然等满 turnSec；
+    // 而 pushRoom / peer 都不带 turnLeft，不推 state 在线方的倒计时不会更新。
+    if (room.phase === 'battle' && room.battle && !room.battle.finished) {
+        armTurnTimer(room);
+        pushState(room);
+    }
+
     clearTimeout(seat.graceTimer);
     seat.graceTimer = setTimeout(() => {
         if (seat.connected) return;
@@ -785,6 +925,14 @@ function onReconnect(room, seat) {
 
     const other = room.seats.find(s => s && s !== seat);
     if (other) sendTo(other, 'peer', { gone: false, name: seat.name });
+
+    // 恢复回 turnSec。turnStartAt 不动 —— 锚点还是这个回合真正开始的时刻，
+    // 所以他拿回的是「本回合剩下的时间」，不是重新给满 30 秒。
+    // 必须在下面 pushState 之前重排，否则 resync 那份状态带的还是缩短后的
+    // turnLeft，刚回来的人看到 3 秒而其实有 20 秒。
+    if (room.phase === 'battle' && room.battle && !room.battle.finished) {
+        armTurnTimer(room);
+    }
 
     // 重连后要能接着打：先补房间信息，再补当前盘面
     pushRoom(room);
@@ -932,6 +1080,24 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    //--- 在线人数（兼心跳）-------------------------------------------------
+    // 大厅页每 5 秒打一次。故意不更新 room.touched —— 那是「房间有人在用」的
+    // 判据，被一个只是站在菜单上的旁观者刷新的话，空房间永远等不到清理。
+    if (u === '/api/stats' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            // 令牌只用来去重，不做身份用途，所以限个长度就够。
+            // 客户端发的一律不可信，别直接拿去当 Map 的键。
+            const token = String(body.token == null ? '' : body.token)
+                .replace(/[^A-Za-z0-9]/g, '').slice(0, 40);
+            // sid 要验过才认，否则随便编一个就能把自己从统计里抹掉
+            const found = body.sid ? seatOf(body.sid) : null;
+            touchVisitor(token, found ? body.sid : null);
+            json(res, 200, computeStats());
+        });
+        return;
+    }
+
     //--- 动作 --------------------------------------------------------------
     if (u === '/api/act' && req.method === 'POST') {
         readBody(req, body => {
@@ -1053,6 +1219,8 @@ setInterval(() => {
             dropRoom(room, '长时间无人');
         }
     }
+    // 没人来问人数时也得扫，否则关掉页面的访客会一直留在表里
+    sweepVisitors();
 }, 60 * 1000);
 
 if (!fs.existsSync(CFG.dir)) {
@@ -1068,7 +1236,7 @@ if (!fs.existsSync(path.join(CFG.dir, 'index.html'))) {
 // 给测试用：房间状态是模块内私有的，而 D678.Game 只在 withRoom 期间有效，
 // 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出弃牌）。
 // 只导出引用，不导出任何操作函数。
-module.exports = { rooms, CFG, withRoom };
+module.exports = { rooms, CFG, withRoom, visitors };
 
 server.listen(CFG.port, '0.0.0.0', () => {
     console.log('');
@@ -1077,6 +1245,7 @@ server.listen(CFG.port, '0.0.0.0', () => {
     console.log('  游戏目录  %s', CFG.dir);
     console.log('  起始 HP   %d', CFG.startHp);
     console.log('  回合超时  %s', CFG.turnSec ? CFG.turnSec + ' 秒' : '关闭');
+    console.log('  在线判定  %d 秒无心跳算离线', CFG.visitorSec);
     console.log('');
     console.log('  本机      http://localhost:%d', CFG.port);
     lanIPs().forEach(ip => console.log('  局域网    http://%s:%d', ip, CFG.port));

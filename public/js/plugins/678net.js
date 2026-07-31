@@ -75,6 +75,33 @@ D678N.setSession = function (o) {
     } catch (e) {}
 };
 
+// 在线人数的去重令牌。和会话一样存 sessionStorage —— 同一浏览器开两个
+// 标签页测试时会各拿一个令牌，各算一个人（存 localStorage 的话两个标签页
+// 共享，两个人只会显示成一个）。
+// 必须整个会话稳定不变：服务器靠它认「还是那个访客」，每次随机就成了
+// 每 5 秒新增一个人，人数会一路涨。
+D678N.visitorToken = function () {
+    try {
+        var t = sessionStorage.getItem('d678_tab');
+        if (!t) {
+            t = String(Date.now() % 1e8) +
+                Math.random().toString(36).slice(2, 10).replace(/[^a-z0-9]/g, '');
+            sessionStorage.setItem('d678_tab', t);
+        }
+        return t;
+    } catch (e) {
+        // 隐私模式下 sessionStorage 会抛。给个进程内的临时值，
+        // 人数照样准（只是刷新后换个身份）
+        if (!D678N._tabFallback) {
+            D678N._tabFallback = 'x' + Math.random().toString(36).slice(2, 10);
+        }
+        return D678N._tabFallback;
+    }
+};
+
+// 最近一次拿到的在线人数。null = 还没问到
+D678N.stats = null;
+
 //=============================================================================
 // 传输层：SSE 收 + POST 发
 //=============================================================================
@@ -258,6 +285,10 @@ var LC = {
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
 
+// 在线人数那一行的 y。玩家名条占 186~282，菜单按钮从 380 起，
+// 这一行塞在中间的空档里。
+var ONLINE_Y = 292;
+
 function roundRect(ctx, x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y);
@@ -307,6 +338,8 @@ Scene_D678Net.prototype.create = function () {
     this._roomInfo = null;
     this._busy   = false;
     this._resuming = false;   // 刷新后正在恢复对局
+    this._statsWait = 1;      // 1 = 下一帧就问一次，别等满 5 秒
+    this._statsFail = false;  // 服务器没有 /api/stats（老版本）
 
     var W = Graphics.width, H = Graphics.height;
     var bg = new Bitmap(W, H);
@@ -374,6 +407,58 @@ Scene_D678Net.prototype.doResume = function (sid) {
 
 Scene_D678Net.prototype.bindNet = function () {
     D678N.clearInbox();
+};
+
+//--- 在线人数 --------------------------------------------------------------
+// 每 5 秒问一次，这个请求本身就是「我还在」的心跳。
+// 带上当前 sid（有的话）让服务器能去重 —— 建了房在等人的时候，
+// 我既是一个访客又是一个连着的座位，不带 sid 就会被数两次。
+
+Scene_D678Net.prototype.pingStats = function () {
+    var self = this;
+    D678N.Net.post('/api/stats', {
+        token: D678N.visitorToken(),
+        sid: D678N.Net.sid || null,
+    }, function (r, code) {
+        if (!r || code !== 200) {
+            // 老服务器没这个接口（404）。标记一下别再画那一行，
+            // 也别弹提示 —— 人数是附加信息，缺了不影响开局。
+            self._statsFail = true;
+            return;
+        }
+        self._statsFail = false;
+        var old = D678N.stats;
+        D678N.stats = r;
+        // 数字没变就不重绘，省得每 5 秒白刷一遍整个画面
+        if (!old || old.online !== r.online || old.playing !== r.playing ||
+            old.waiting !== r.waiting) {
+            self.refresh();
+        }
+    });
+};
+
+Scene_D678Net.prototype.updateStats = function () {
+    if (this._statsWait > 0) { this._statsWait--; return; }
+    this._statsWait = 300;   // 60fps → 5 秒
+    this.pingStats();
+};
+
+// 在线人数那一行。等待页不画 —— 那时候「谁在这个房间里」才是要紧事，
+// 全局人数只是噪音。
+Scene_D678Net.prototype.drawOnline = function () {
+    var W = Graphics.width;
+    var s = D678N.stats;
+    if (this._statsFail) return;
+    if (!s) {
+        this.txt('● 连接中…', 0, ONLINE_Y, W, 20, LC.gray, 'center');
+        return;
+    }
+    var parts = ['在线 ' + s.online + ' 人'];
+    if (s.playing > 0) parts.push(s.playing + ' 人对局中');
+    if (s.waiting > 0) parts.push(s.waiting + ' 个房间等人');
+    // 有人在等就标绿：这时候点「加入房间」马上能开一局
+    var col = s.waiting > 0 ? LC.green : (s.online > 1 ? LC.text : LC.gray);
+    this.txt('● ' + parts.join(' · '), 0, ONLINE_Y, W, 20, col, 'center');
 };
 
 //--- 绘制 ------------------------------------------------------------------
@@ -455,6 +540,8 @@ Scene_D678Net.prototype.refresh = function () {
     this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
                       cb: this.onChangeName.bind(this) });
 
+    if (this._page === 'menu' || this._page === 'duel') this.drawOnline();
+
     if (this._page === 'menu')    this.drawMenu();
     if (this._page === 'duel')    this.drawDuel();
     if (this._page === 'waiting') this.drawWaiting();
@@ -483,7 +570,8 @@ Scene_D678Net.prototype.drawMenu = function () {
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
-    this.txt('单人对决', 0, 300, Graphics.width, 30, LC.gold, 'center');
+    // 336 而不是原来的 300 —— 在线人数那一行占了 292~322
+    this.txt('单人对决', 0, 336, Graphics.width, 30, LC.gold, 'center');
     this.buttons([
         { label: '建立房间', cb: this.onCreate.bind(this) },
         { label: '加入房间', cb: this.onJoinPrompt.bind(this) },
@@ -541,6 +629,7 @@ Scene_D678Net.prototype.update = function () {
         if (this._noticeTime === 0) this.refresh();
     }
     this.pollNet();
+    this.updateStats();
     this.updateInput();
 };
 
@@ -1362,20 +1451,29 @@ Scene_D678.prototype.netDrawOverlay = function () {
 
     // 对手掉线：报「已掉线多久」而不是倒计时 —— 对方回不回来不是这边能
     // 控制的事，倒计时只是干等。同时给一个立刻返回主菜单的按钮。
+    // 摆在对方牌位左边的空档里（x=8~128）。对方牌是居中排的，2~4 张时
+    // 左边缘在 x≈248~136，所以这一竖条不会压到牌；而且掉线的人不会再要牌，
+    // 张数只会停在原地，不存在「牌变多了压过来」。
+    //
+    // 原来是屏幕中央 600×176 的大框，压住了牌桌中段，影响正常出牌 ——
+    // 在线方本来就该能照常打，框不该挡路。
     if (this._netPeerGone) {
         var g = this._netPeerGone;
         var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
         var sec = Math.floor(ms / 1000);
-        var txt = sec < 60 ? ('已掉线 ' + sec + ' 秒')
-                           : ('已掉线 ' + Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒');
-        this.box(bmp, 60, 452, 600, 176, 'rgba(0,0,0,0.9)', LC.red, 12);
-        this.txt(bmp, (g.name || '对手') + ' 掉线了', 60, 470, 600, 26, LC.red, 'center');
-        this.txt(bmp, txt, 60, 506, 600, 24, LC.gray, 'center');
-        this.txt(bmp, '可以继续等，也可以直接退出', 60, 538, 600, 18, LC.gray, 'center');
+        var tsec = sec < 60 ? (sec + ' 秒')
+                            : (Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒');
 
-        var bx = 235, by = 570, bw = 250, bh = 46;
+        var px = 8, py = 190, pw = 120, ph = 142;
+        this.box(bmp, px, py, pw, ph, 'rgba(0,0,0,0.88)', LC.red, 8);
+        // 名字不画在这儿 —— 上方 drawOppName 已经显示了，而这条只有 120 宽，
+        // 长名字（可到 16 显示宽度）会直接溢出
+        this.txt(bmp, '对方掉线', px, py + 8, pw, 18, LC.red, 'center');
+        this.txt(bmp, '已 ' + tsec, px, py + 34, pw, 16, LC.gray, 'center');
+
+        var bx = px + 10, by = py + 92, bw = pw - 20, bh = 40;
         this.box(bmp, bx, by, bw, bh, 'rgba(60,140,90,0.95)', LC.gold, 8);
-        this.txt(bmp, '返回主菜单', bx, by + 11, bw, 24, LC.white, 'center');
+        this.txt(bmp, '退出', bx, by + 9, bw, 20, LC.white, 'center');
         if (!this._showList && !this._discardFor) {
             this._hits.push({ x: bx, y: by, w: bw, h: bh,
                               cb: this.backToTitle.bind(this) });
