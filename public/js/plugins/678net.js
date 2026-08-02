@@ -170,6 +170,16 @@ D678N.inbox = {
 // （切场景的空档），丢最老的那些普通状态 —— 但**带事件标记的一份都不丢**。
 D678N.INBOX_MAX = 120;
 
+// 早结束的人在对战日志页上至少停留这么多帧（60 = 1 秒）。
+//
+// 【为什么需要】演出 2.5 秒比服务器的推进延迟（advanceMs，默认 2 秒）长，
+// 所以最慢那桌只要跟我差不到 0.5 秒，fresh 就会在我演出没走完时到达，
+// 日志页一帧都不显示。多留 1 秒把这个缝盖住。
+//
+// 代价：早结束的人比服务器落后最多 1 秒，下一轮开局时他的回合计时已经在跑。
+// 1 秒对 30 秒的回合可以接受；给太长就变成惩罚早打完的人了。
+D678N.LOG_DWELL = 60;
+
 D678N.clearInbox = function () {
     var b = D678N.inbox;
     b.room = null; b.states = []; b.events = [];
@@ -1395,6 +1405,14 @@ Scene_D678.prototype.netApply = function (m) {
         this._netPending = null;
         this._netPendFresh = false;
         this._netPendRedealt = false;
+        // 【必须重置这两个】resolveId 在锦标赛里是**每桌独立**的，新一轮换了桌
+        // 就从 0 重新数 —— 第一轮我那桌是 bt#0 数到 1，第二轮我那桌是 bt#1，
+        // 也会数到 1。不重置的话「同一次结算不重播」那道判断会把第二轮的结算
+        // 误认成第一轮那次，onBattleEnd 整个跳过：**拼点画面从第二轮起再也
+        // 不出现**（第一轮正常，所以看着像「偶尔显示 1-2 次」）。
+        // preFuncs 的判断同理。
+        this._netPlayedResolve = 0;
+        this._netPreApplied = 0;
         this._phase = 'battle';
         this._wait = 40;
         this.dealFx();
@@ -1419,20 +1437,23 @@ Scene_D678.prototype.netApply = function (m) {
         this._netFinished = false;
         this._phase = 'battle';
         this.onBattleEnd();
-        // 【保护期只盖住演出，一帧不多】演出期间来的 fresh 会把演出打断
-        // （m.fresh 分支在落定守卫之前，无条件把 _phase 打回 battle），
-        // 所以必须压住。onBattleEnd 刚把 _wait 设成演出长度
-        // （普通 150 帧 / 满点 200 帧 / 平局 100 帧）。
+        // 【保护期】演出期间来的 fresh 会把演出打断（m.fresh 分支在落定守卫
+        // 之前，无条件把 _phase 打回 battle），所以必须压住。
+        // onBattleEnd 刚把 _wait 设成演出长度（普通 150 / 满点 200 / 平局 100 帧）。
         //
-        // 【为什么不再多留 90 帧】你定的规则：早结束的人停在日志页等最慢那桌，
-        // 最后一桌不停、直接进下一轮，大家一起开始。
-        //   · 早结束 -> fresh 还没来，保护期烧完 netFinish 正常跑，进日志页；
-        //     之后靠落定守卫一直停在那儿，等 fresh 到了立刻进下一轮。
-        //   · 最后一桌 -> 屏障当场放开，fresh 在演出期间就到并被压住；
-        //     保护期和 _wait 同一帧归零，先释放 fresh 把阶段切成 battle，
-        //     netFinish 那一支就轮不到了 —— 日志页自然被跳过，不拖别人。
-        // 多留那 90 帧的话最后一桌会白等，正是你要避免的。
-        this.netHold(this._wait || 0);
+        // 早结束的人再多留 LOG_DWELL 帧，保证日志页真的看得见。
+        //
+        // 【为什么必须多留】演出 2.5 秒比服务器的推进延迟（advanceMs，默认 2 秒）
+        // 长。实测：我这桌 5183ms 结算、最后一桌 5437ms 结算，只差 254ms ——
+        // fresh 在我演出还没走完时就到了，保护期和 _wait 同一帧归零，
+        // 先释放 fresh 把阶段切成 battle，netFinish 那一支就轮不到，
+        // **日志页 0 帧**。只有最慢那桌比我晚 0.5 秒以上才碰巧看得到，
+        // 所以症状是「时有时无」。
+        //
+        // 最后一桌（waitingRound 为 false）一帧都不多留 —— 他停留就是在拖着
+        // 所有人，这是你定的。两种情况就靠这一个判断分流。
+        var dwell = this._netWaitRound ? D678N.LOG_DWELL : 0;
+        this.netHold((this._wait || 0) + dwell);
         return;
     }
 

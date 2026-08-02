@@ -1245,7 +1245,13 @@ function resolveTable(room, bt, isTie) {
     clearTimeout(bt.turnTimer);
     clearTimeout(bt.aiTimer);
     bt.turnDeadline = 0;
-    bt.resolveId++;
+    // 【全场唯一，不是每桌各数】客户端靠它判「这次结算我播过没有」。
+    // 原来是 bt.resolveId++（每桌独立、新一轮换桌就从 0 重新数），于是
+    // 第一轮我那桌数到 1、第二轮我那桌也数到 1 —— 客户端把第二轮的结算
+    // 误认成第一轮那次，演出整个跳过，**拼点画面从第二轮起再也不出现**。
+    // 用房间级的自增数就永远不会撞。
+    room.resolveId++;
+    bt.resolveId = room.resolveId;
     bt.isTie = !!isTie;
 
     if (isTie) {
