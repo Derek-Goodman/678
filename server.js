@@ -136,25 +136,27 @@ const CFG = {
 const log = (fmt, ...a) => console.log(new Date().toISOString().slice(11, 19) + ' ' + fmt, ...a);
 
 //=============================================================================
-// 本日计数：游玩 / 完局 / 冠军
+// 本日计数：游玩 / 完局 / 冠军 / 联机人数
 //=============================================================================
-// 标题画面上方那三行。**全服累计**，所有人看到同一个数（你定的）。
+// 标题画面上方那四行。**全服累计**，所有人看到同一个数（你定的）。
 //
-//   plays    进入对局的次数。单机点「开始游戏」真的进了牌桌算一次；
-//            多人任意模式开赛算一次 —— 按在场真人数加，2 真人的锦标赛 +2。
+//   plays    **只算单机**：点「开始游戏」真的进了牌桌算一次（你定的）。
+//            多人模式不计入 —— 那是 online 那一项的事。
 //   finishes 单机打到结算画面的次数（拿到第几名都算）。
 //   champs   单机最后幸存者的次数。冠军同时也计入 finishes。
+//   online   多人开局的人数：锦标赛或 1v1 正常开局时，按在场真人数加
+//            （2 真人的锦标赛 +2）。补位的 AI 不算。
 //
 // 【故意不做去重】同一台设备反复开局照样一直加（你定的）。代价是这个接口
 // 谁都能拿脚本刷 —— 朋友之间玩不管，所以只做一道单请求上限防呆，
 // 不做频率限制（那会误伤真的连着打好几局的人）。
 //
-// 【为什么多人模式不信客户端】开赛这件事服务器自己知道，让客户端上报等于
-// 白开一个能刷的口子。单机没办法 —— 服务器看不见单机局，只能由客户端报。
+// 【为什么 online 不信客户端】开赛这件事服务器自己知道，让客户端上报等于
+// 白开一个能刷的口子。单机那三项没办法 —— 服务器看不见单机局，只能客户端报。
 const DAILY_FILE = path.join(__dirname, '_daily.json');
 const DAILY_MAX_BUMP = 8;      // 单次请求最多加这么多（多人开赛按人数加，8 人赛顶格）
 
-const daily = { day: '', plays: 0, finishes: 0, champs: 0 };
+const daily = { day: '', plays: 0, finishes: 0, champs: 0, online: 0 };
 
 // 「今天」是哪天。按 CFG.tzOffset 校正后取 YYYY-MM-DD。
 function dayKey(t) {
@@ -168,11 +170,12 @@ function dailyRoll() {
     const k = dayKey();
     if (daily.day !== k) {
         if (daily.day) {
-            log('本日计数翻篇 %s -> %s（游玩 %d / 完局 %d / 冠军 %d）',
-                daily.day, k, daily.plays, daily.finishes, daily.champs);
+            log('本日计数翻篇 %s -> %s（游玩 %d / 完局 %d / 冠军 %d / 联机 %d）',
+                daily.day, k, daily.plays, daily.finishes, daily.champs,
+                daily.online);
         }
         daily.day = k;
-        daily.plays = 0; daily.finishes = 0; daily.champs = 0;
+        daily.plays = 0; daily.finishes = 0; daily.champs = 0; daily.online = 0;
         dailySave();
     }
 }
@@ -207,6 +210,7 @@ function dailyLoad() {
             daily.plays    = Number(o.plays)    || 0;
             daily.finishes = Number(o.finishes) || 0;
             daily.champs   = Number(o.champs)   || 0;
+            daily.online   = Number(o.online)   || 0;
         }
     } catch (e) { /* 没有文件是正常的（第一次跑） */ }
     dailyRoll();   // 存的是昨天的就地归零
@@ -218,6 +222,7 @@ function dailyBump(kind, n) {
     if (kind === 'play')   daily.plays    += k;
     else if (kind === 'finish') daily.finishes += k;
     else if (kind === 'champ')   daily.champs   += k;
+    else if (kind === 'online')  daily.online   += k;
     else return false;
     dailySave();
     return true;
@@ -226,7 +231,8 @@ function dailyBump(kind, n) {
 function dailyView() {
     dailyRoll();
     return { day: daily.day, plays: daily.plays,
-             finishes: daily.finishes, champs: daily.champs };
+             finishes: daily.finishes, champs: daily.champs,
+             online: daily.online };
 }
 
 // 锦标赛固定 8 个位置：真人占前面，其余由 AI 补齐（超哥必定在内）。
@@ -1029,9 +1035,10 @@ function startTourney(room) {
     }
 
     room.phase = 'battle';
-    // 本日游玩次数：按在场真人数加（2 真人的锦标赛 +2）。服务器自己知道
-    // 开赛这件事，不用客户端上报 —— 少一个能刷的口子。
-    dailyBump('play', humans.length);
+    // 本日**联机人数**：按在场真人数加（2 真人的锦标赛 +2），补位的 AI 不算。
+    // 【不是 plays】游玩次数只算单机（你定的）—— 光进多人模式不该让那个数涨。
+    // 服务器自己知道开赛这件事，不用客户端上报，少一个能刷的口子。
+    dailyBump('online', humans.length);
     log('房间 %s 锦标赛开始：%d 真人 + %d AI（超哥%s）',
         room.code, humans.length, aiNames.length,
         aiNames.indexOf(D678.GOD_NAME) >= 0 ? '在场' : '不在场');
@@ -1429,8 +1436,8 @@ function startDuel(room) {
     }
 
     room.phase = 'battle';
-    // 本日游玩次数：1v1 两个座位都是真人，开打就是 +2
-    dailyBump('play', room.seats.filter(s => s).length);
+    // 本日联机人数：1v1 两个座位都是真人，开打就是 +2（不计入 plays，见 startTourney）
+    dailyBump('online', room.seats.filter(s => s).length);
     pushRoom(room);
     nextBattle(room);
 }
@@ -2077,12 +2084,12 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    //--- 本日计数（标题画面上方三行）--------------------------------------
+    //--- 本日计数（标题画面上方四行）--------------------------------------
     // 不带 bump 就是纯读；带了就加一次再返回新值。
     //
-    // 【只接受单机的上报】多人模式的 play 由服务器在开赛时自己加
-    // （startTourney / startDuel），这个接口再收一次就重复了。
-    // finish / champ 服务器看不见单机局，只能由客户端报。
+    // 【只接受单机那三项】play / finish / champ 服务器看不见单机局，只能客户端报。
+    // online 由服务器在开赛时自己加（startTourney / startDuel）——
+    // 这里**故意不收** online，否则谁都能拿脚本把联机人数刷上去。
     if (u === '/api/daily' && req.method === 'POST') {
         readBody(req, body => {
             body = body || {};

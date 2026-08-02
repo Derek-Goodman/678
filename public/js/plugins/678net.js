@@ -1167,6 +1167,9 @@ Scene_D678.prototype.create = function () {
     this._netPeerGoneAt = 0;
     this._netAdvancing = false;  // 服务器已在倒数「开下一局」
     this._netWaitRound = false;  // 锦标赛：我这桌完了，还在等别人打完本轮
+    // 展示保护期：>0 时压住新状态，先把轮结果页看完（见 netApply 里的注释）
+    this._netHoldFrames = 0;
+    this._netPending = null;     // 保护期内收到的最新那份带牌面的状态
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -1248,6 +1251,24 @@ Scene_D678.prototype.netApply = function (m) {
                     m.btId !== m.myBtId);
     var replayed1 = !!(rid1 && rid1 === this._netPlayedResolve);
     var needBoard = !foreign1 && (m.fresh || (m.resolved && !replayed1));
+
+    // 【展示保护期】演出还没走完 / 轮结果页还没停够时间，就先把这份状态压住。
+    //
+    // 时序：演出 150 帧（满点 200 帧），而服务器屏障放开后只等 advanceMs
+    // （默认 2 秒）就推全场 fresh。我这桌**最后**打完时屏障当场放开，
+    // 那份 fresh 会在我演出没走完时到达 —— 下面 m.fresh 的分支会把 _phase
+    // 打回 'battle'、_lastLog 清空，netFinish 再也不跑，轮结果页和对战日志
+    // 整个被跳过。这就是「有时候看不到对局日志」剩下的那一半原因。
+    //
+    // 处理：保护期内只更新公共信息（排名、血量都靠上面的 buildReplica），
+    // 把最新那份带牌面的状态存进 _netPending，等保护期结束再应用。
+    // 存最新的而不是第一份 —— 中间对手可能已经动过了，应用旧的会闪一下。
+    if (this._netHoldFrames > 0) {
+        if (v) this._netPending = m;
+        this.refresh();
+        return;
+    }
+
     if (!this.netPhaseSettled() || needBoard) {
         this._battle = D678N.buildBattle(v, g);
     }
@@ -1331,6 +1352,8 @@ Scene_D678.prototype.netApply = function (m) {
         this._netAutoDiscarded = null;
         this._report = null;
         this._lastLog = null;
+        // 新一局真的开始了，压住的那份（如果还有）已经过时，丢掉免得回头又应用
+        this._netPending = null;
         this._phase = 'battle';
         this._wait = 40;
         this.dealFx();
@@ -1355,6 +1378,11 @@ Scene_D678.prototype.netApply = function (m) {
         this._netFinished = false;
         this._phase = 'battle';
         this.onBattleEnd();
+        // 【保护期要从这儿就起】演出**期间**来的 fresh 同样会把日志吞掉，
+        // 而那会儿还没走到 netToRoundResult。onBattleEnd 刚把 _wait 设成
+        // 演出长度（普通 150 帧 / 满点 200 帧 / 平局 100 帧），
+        // 加上轮结果的停留时间一起压住。
+        this.netHold((this._wait || 0) + 90);
         return;
     }
 
@@ -1443,6 +1471,14 @@ Scene_D678.prototype.update = function () {
     }
     this.updateInput();
     this.netTickClock();
+
+    // 展示保护期倒数。烧完就把压住的那份状态放出来 ——
+    // 放在 netPoll 之后、本地推进之前：这一帧收到的东西已经进了 _netPending，
+    // 现在正好是应用它的时机。
+    if (this._netHoldFrames > 0) {
+        this._netHoldFrames--;
+        if (this._netHoldFrames === 0) this.netReleaseHold();
+    }
 
     if (this._showList) return;
     if (this._wait > 0) { this._wait--; return; }
@@ -1658,7 +1694,30 @@ Scene_D678.prototype.netToRoundResult = function () {
     this._wait = 20;
     this.buildRoundReport();
     this._battle = null;
+    // 起展示保护期：这段时间里新到的状态会被压住（见 netApply）。
+    // 锦标赛里服务器只等 2 秒就推下一轮，而演出本身要 2.5~3.3 秒 ——
+    // 不压的话轮结果页和对战日志会被直接跳过。
+    //
+    // 90 帧（1.5 秒）是折中：足够看清结果，又不会让我比服务器落后太多。
+    // 落后的代价是真的 —— 下一轮开局时我的回合计时已经在跑了，
+    // 停留越久我这一回合可用的时间越少。
+    this.netHold(90);
     this.refresh();
+};
+
+// 起一段展示保护期（帧）。取最大值，不缩短已有的保护期。
+Scene_D678.prototype.netHold = function (frames) {
+    this._netHoldFrames = Math.max(this._netHoldFrames || 0, frames);
+};
+
+// 保护期结束：把压住的那份状态应用掉。
+Scene_D678.prototype.netReleaseHold = function () {
+    var m = this._netPending;
+    this._netPending = null;
+    if (!m) return;
+    // 已经走到终局画面了就别再把人拽回牌桌 —— 保护期内可能来过 over
+    if (this._phase === 'netover' || this._phase === 'gameover') return;
+    this.netApply(m);
 };
 
 // 这里原来包了 onDiscardConfirm（把手动挑好的牌 POST 给 /api/discard）。
@@ -2110,7 +2169,8 @@ Scene_Title.prototype.start = function () {
 //=============================================================================
 // 标题画面上方的本日计数
 //=============================================================================
-// 三行字：本日游玩次数 / 本日完局次数 / 本日冠军次数（全服累计，你定的）。
+// 四行字：本日游玩次数 / 本日完局次数 / 本日冠军次数 / 本日联机人数
+// （全服累计，你定的）。前三项只统计单机，联机人数是多人开局的人数。
 //
 // 【为什么放在 678net.js 而不是 title.js】取数要联网，而 title.js 先加载、
 // 那会儿还没有 D678N.Net。这个文件本来就已经包了 Scene_Title 的
@@ -2129,7 +2189,7 @@ var DAILY_LABEL_W = 168;
 var _stCreate = Scene_Title.prototype.create;
 Scene_Title.prototype.create = function () {
     _stCreate.call(this);
-    this._dailyBmp = new Bitmap(Graphics.width, DAILY_Y + DAILY_LH * 3 + 10);
+    this._dailyBmp = new Bitmap(Graphics.width, DAILY_Y + DAILY_LH * 4 + 10);
     this._dailySprite = new Sprite(this._dailyBmp);
     this._dailySprite.z = 101;      // 按钮层是 100，这层在它上面
     this.addChild(this._dailySprite);
@@ -2158,7 +2218,8 @@ Scene_Title.prototype.drawDailyCounts = function () {
     var d = D678N.daily;
     // 问不到就整块不画（单机 exe / 服务器没起）—— 留三个 0 在标题上
     // 比不显示更难看，还会让人以为功能坏了
-    var key = d ? (d.plays + '/' + d.finishes + '/' + d.champs) : '';
+    var key = d ? (d.plays + '/' + d.finishes + '/' + d.champs +
+                   '/' + (d.online || 0)) : '';
     if (key === this._dailyShown) return;    // 没变化不重画
     this._dailyShown = key;
 
@@ -2167,9 +2228,10 @@ Scene_Title.prototype.drawDailyCounts = function () {
     if (!d) return;
 
     var rows = [
-        ['本日游玩次数', d.plays,    '#ffd766'],
-        ['本日完局次数', d.finishes, '#ffffff'],
-        ['本日冠军次数', d.champs,   '#5cff9d'],
+        ['本日游玩次数', d.plays,        '#ffd766'],
+        ['本日完局次数', d.finishes,     '#ffffff'],
+        ['本日冠军次数', d.champs,       '#5cff9d'],
+        ['本日联机人数', d.online || 0,  '#7fd4ff'],
     ];
     // 整块靠左（你定的）。标签左对齐顶着 DAILY_X，数字紧跟在标签之后 ——
     // 标签都是 6 个字等宽，所以数字自然也对齐成一列，不用量宽度。
