@@ -411,6 +411,12 @@ function maskView(b, me, snapPre) {
                 // 自己的牌全给；对方的暗牌在揭牌前不给数值
                 v: (mine || b.revealed || !c.hidden) ? c.v : null,
                 hidden: c.hidden,
+                // 稳定身份，客户端的精灵靠它认牌（见 678.js 的 cardKey）。
+                // 【不算泄漏】uid 只是个自增序号，不带任何牌面信息 ——
+                // 从它只能看出「这张牌是第几张被造出来的」，而出牌顺序本来就
+                // 是双方都看得见的。不发的话客户端只能退回下标，
+                // 「删中间那张」时后面的牌会全部误判成新牌重新入场。
+                uid: c.uid,
             })),
             stood: s.stood,
             // 对方用过几张查看牌库不该暴露，只发自己的
@@ -532,6 +538,7 @@ function maskViewT(room, bt, seat, snapPre) {
                 cards: s.cards.map(c => ({
                     v: (mine || b.revealed || !c.hidden) ? c.v : null,
                     hidden: c.hidden,
+                    uid: c.uid,      // 见 maskSide（1v1 那份）里的注释
                 })),
                 stood: s.stood,
                 checkN: mine ? s.checkN : 0,
@@ -1200,6 +1207,7 @@ function applyActionT(room, bt, side, action, forced) {
 
     const turnBefore = b.turn;
     let msg = '', ok = true, err = '', failNote = '';
+    let repick = null;      // 见 applyAction 里的注释
 
     withRoom(room, () => {
         if (action.type === 'hit') {
@@ -1219,6 +1227,10 @@ function applyActionT(room, bt, side, action, forced) {
             if (!r.ok) { ok = false; err = r.err || '无法使用'; return; }
             msg = r.msg;
             if (r.fail) failNote = '此号牌已在场上';
+            if (r.kind === 'repick') {
+                const nc = b.sides[side].cards[b.sides[side].cards.length - 1];
+                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
+            }
         } else {
             ok = false; err = '未知动作';
         }
@@ -1234,7 +1246,7 @@ function applyActionT(room, bt, side, action, forced) {
 
     if (b.turn !== turnBefore) { bt.turnStartAt = 0; bt.turnGoneDeadline = 0; }
     armTurnTimerT(room, bt);
-    pushStateT(room);
+    pushStateT(room, repick ? { repick: repick } : null);
     stepAIIfNeeded(room, bt);
     return { ok: true, fail: failNote };
 }
@@ -1536,6 +1548,12 @@ function applyAction(room, si, action, forced) {
     const turnBefore = b.turn;
 
     let msg = '', ok = true, err = '', failNote = '';
+    // 重抽的动画信息（哪一方、洗回去的是哪个数字）。客户端要靠它播
+    // 「旧牌飞回牌库 + 新牌入场」那套完整动画 —— 少了收牌那一半，
+    // 玩家会觉得「用了重抽好像没反应」。
+    //
+    // 【不涉及遮蔽】洗回去那张是**明牌**，本来就双方可见。
+    let repick = null;
 
     withRoom(room, () => {
         if (action.type === 'hit') {
@@ -1558,6 +1576,13 @@ function applyAction(room, si, action, forced) {
             if (!r.ok) { ok = false; err = r.err || '无法使用'; return; }
             msg = r.msg;
             if (r.fail) failNote = '此号牌已在场上';
+            if (r.kind === 'repick') {
+                // 【发新牌的 uid，不发 side】extra 对所有座位是同一份，
+                // 没法按人镜像；而客户端恒把自己当 side 0。发 uid 的话它在
+                // 自己那份已镜像的盘面里一找就知道是哪一排，免疫镜像问题。
+                const nc = b.sides[si].cards[b.sides[si].cards.length - 1];
+                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
+            }
         } else {
             ok = false; err = '未知动作';
         }
@@ -1577,7 +1602,7 @@ function applyAction(room, si, action, forced) {
         room.turnGoneDeadline = 0;
     }
     armTurnTimer(room);   // 先武装再推，让这份状态带上新的 turnLeft
-    pushState(room);
+    pushState(room, repick ? { repick: repick } : null);
     return { ok: true, fail: failNote };
 }
 
@@ -1762,7 +1787,12 @@ function onDisconnect(room, seat) {
     // 锦标赛不需要它：同桌掉线由 maskViewT 的 status 标注（对手名字后缀
     // 「（掉线）」、排名列表显示「掉线」），是标注而不是挡路的框 —— 他那桌
     // goneTurnSec 自动过牌，赛事照走，玩家没有理由退出。
-    if (room.mode !== 'tourney') {
+    //
+    // 【赛事已经结束就不发】phase === 'over' 时对手关掉浏览器、或者看完战绩
+    // 自己走了 —— 那是「最后一局打完之后离开」，不是掉线。这时候在对方屏上
+    // 弹「对方掉线」是错的：这一场早就结束了，他掉不掉线都不影响任何东西
+    // （你定的）。
+    if (room.mode !== 'tourney' && room.phase !== 'over') {
         const other = room.seats.find(s => s && s !== seat);
         // 不发倒计时 —— 界面上改成「已掉线 X 秒」+ 随时可点返回主菜单。
         // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
@@ -1817,6 +1847,10 @@ function onDisconnect(room, seat) {
     clearTimeout(seat.graceTimer);
     seat.graceTimer = setTimeout(() => {
         if (seat.connected) return;
+        // 【赛事已结束就静静收房间】看完战绩离开的人不该让对方收到
+        // 「掉线未回来，本场结束」—— 那一场早就结束了，说「本场结束」是错的
+        // （你定的）。房间照旧要收，只是不通知。
+        if (room.phase === 'over') { dropRoom(room, '结束后对手离开'); return; }
         // 1v1 好友对战里让 AI 接管很别扭，直接结束房间让对方回大厅。
         // AI 托管留给第二步的锦标赛（那边一个人退出不该毁掉整场赛事）。
         const o = room.seats.find(s => s && s !== seat);
@@ -2211,6 +2245,12 @@ const server = http.createServer((req, res) => {
                 return json(res, 200, { ok: true });
             }
             if (found) {
+                // 【赛事已结束就不通知对方】看完战绩点返回是正常收尾，不是
+                // 「离开了房间」这种意外事件（你定的）。房间照旧收掉。
+                if (found.room.phase === 'over') {
+                    dropRoom(found.room, '结束后玩家返回');
+                    return json(res, 200, { ok: true });
+                }
                 const other = found.room.seats.find(s => s && s !== found.seat);
                 if (other) sendTo(other, 'abort', { reason: found.seat.name + ' 离开了房间' });
                 dropRoom(found.room, '玩家主动退出');

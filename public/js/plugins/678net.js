@@ -361,7 +361,11 @@ D678N.buildBattle = function (v, game) {
     b.sides = v.sides.map(function (s, i) {
         return {
             p: game.players[i], index: i,
-            cards: s.cards.map(function (c) { return { v: c.v, hidden: c.hidden }; }),
+            // uid 照抄服务器发的 —— 精灵靠它认牌。丢了的话「删中间那张」时
+            // 后面的牌会被当成新牌一起重新入场（见 678.js 的 cardKey）。
+            cards: s.cards.map(function (c) {
+                return { v: c.v, hidden: c.hidden, uid: c.uid };
+            }),
             stood: s.stood, checkN: s.checkN, known: [],
         };
     });
@@ -1365,6 +1369,19 @@ Scene_D678.prototype.netApply = function (m) {
 
     if (m.log) this._netLog = m.log;
 
+    // 重抽的完整动画（旧牌飞回牌库 + 新牌入场）。
+    //
+    // 【为什么要服务器告诉我】新牌的 uid 变了，所以它会自然重新入场 ——
+    // 但那只有「飞进来」没有「收回去」，看着像牌凭空闪了一下，玩家最常反馈的
+    // 就是「用了重抽好像没反应」。收牌那一半需要知道洗回去的是哪个数字，
+    // 那个信息只有服务器有。
+    //
+    // 发的是**新牌的 uid** 而不是 side —— extra 对所有座位是同一份、没法按人
+    // 镜像，而我恒把自己当 side 0。按 uid 在自己那份盘面里找就免疫镜像问题。
+    if (m.repick && this._battle) {
+        this.netRepickFx(m.repick);
+    }
+
     // 【别人桌的 fresh / resolved 一律不认】
     //
     // pushStateT 的 extra 是 Object.assign 合并进每一个座位的消息的，所以
@@ -1751,6 +1768,25 @@ Scene_D678.prototype.netFinish = function () {
     this.netToRoundResult();
 };
 
+// 联机下播重抽的完整动画。
+//
+// 服务器发的是新牌的 uid（不是 side）—— 在自己那份**已镜像**的盘面里找它属于
+// 哪一排，这样不管是我重抽还是对手重抽都能定位对。找不到就不播，
+// 不至于因为一次动画把别的事情搞坏。
+Scene_D678.prototype.netRepickFx = function (rp) {
+    var b = this._battle;
+    if (!b || !rp || !rp.uid) return;
+    for (var si = 0; si < 2; si++) {
+        var cards = b.sides[si].cards;
+        if (!cards.length) continue;
+        // 重抽的新牌一定在末尾（doDraw 是 push）
+        if (cards[cards.length - 1].uid === rp.uid) {
+            this.redealCard(si, rp.oldValue);
+            return;
+        }
+    }
+};
+
 // 报「超过 6 张，已随机弃掉 XX、YY」。只报一次，报完清掉。
 Scene_D678.prototype.netNoticeAutoDiscard = function () {
     var ids = this._netAutoDiscarded;
@@ -2097,7 +2133,13 @@ Scene_D678.prototype.netDrawOverlay = function () {
     //
     // 原来是屏幕中央 600×176 的大框，压住了牌桌中段，影响正常出牌 ——
     // 在线方本来就该能照常打，框不该挡路。
-    if (this._netPeerGone) {
+    //
+    // 【赛事结束后不画】那时候对手掉不掉线都不影响任何东西，弹「对方掉线」
+    // 只会让人以为出了问题（你定的）。服务器在 phase==='over' 之后已经不发
+    // peer 了，但结算**之前**就掉线的话这个标记早就置上了，会残留到结束画面
+    // —— 所以这儿也要判一道。
+    if (this._netPeerGone &&
+        this._phase !== 'gameover' && this._phase !== 'netover') {
         var g = this._netPeerGone;
         var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
         var sec = Math.floor(ms / 1000);
@@ -2162,9 +2204,13 @@ Scene_D678.prototype.netDrawOverlay = function () {
         this.txt(bmp, '等待服务器…', 0, 600, NLY.SW, 26, LC.gray, 'center');
     }
     if (this._phase === 'netover' && this._netOver && this._netOver.aborted) {
-        this.box(bmp, 60, 440, 600, 140, 'rgba(0,0,0,0.9)', LC.red, 14);
-        this.txt(bmp, '本场结束', 60, 466, 600, 30, LC.red, 'center');
-        this.txt(bmp, this._netOver.reason || '', 60, 508, 600, 22, LC.gray, 'center');
+        // 【挪到上方空白带】原来画在 y=440~580，正好压在牌桌中段：牌面、
+        // 点数、结算面板全被盖住，玩家看不到这一局到底打成什么样（你定的）。
+        // 血条占 y=10~66，对方牌区从 y≈130 起 —— 中间那条 76~126 是空的，
+        // 高度 96 的框放在 y=76 刚好卡进去，一点不压牌。
+        this.box(bmp, 60, 76, 600, 96, 'rgba(0,0,0,0.9)', LC.red, 12);
+        this.txt(bmp, '本场结束', 60, 90, 600, 26, LC.red, 'center');
+        this.txt(bmp, this._netOver.reason || '', 60, 124, 600, 20, LC.gray, 'center');
         this.drawBackButton();
     }
 

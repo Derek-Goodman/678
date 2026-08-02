@@ -279,9 +279,22 @@ Scene_D678.prototype.totalString = function (b, si, revealAll) {
 
 //--- 卡牌精灵 --------------------------------------------------------------
 
+// 卡牌精灵的身份。
+//
+// 【用 uid 不用下标】原来是 si_idx_值_正反，而「删掉中间那张牌」会让后面所有
+// 牌的下标往前挪、key 全变 —— refreshCards 把它们当新牌一起重新入场。
+// 实际症状：用过「抽底牌」之后再「重抽」，暗牌和新抽的明牌一起飞进来
+// （抽底牌把暗牌 push 到末尾，于是明牌在中间，repick 删的就是中间那张）。
+// rob / return 删的也是 newestUp，同样可能是中间那张。
+//
+// uid 由 D678.mkCard 发，整局唯一、只增不减，删谁都不影响别人。
+// 值和正反仍然进 key —— 互换明牌（swap）改的是 v、揭牌改的是正反，
+// 这两种都该重画。
 Scene_D678.prototype.cardKey = function (si, idx, c, revealAll) {
     var shown = (si === 0 || revealAll || !c.hidden);
-    return si + '_' + idx + '_' + c.v + '_' + (shown ? 'f' : 'b');
+    // uid 缺失时退回下标（AI 推演盘面、以及万一有没走 mkCard 的旧路径）
+    var id = (c.uid === undefined || c.uid === null) ? ('i' + idx) : c.uid;
+    return si + '_u' + id + '_' + c.v + '_' + (shown ? 'f' : 'b');
 };
 
 Scene_D678.prototype.refreshCards = function () {
@@ -946,34 +959,75 @@ Scene_D678.prototype.onUseFunc = function () {
     if (!r.ok) { this.notice(r.err || '无法使用'); this.refresh(); return; }
     this.funcFx();
     if (r.fail) this.notice('此号牌已在场上');
-    // 重抽必须在 refresh 之前重置精灵，否则那一帧就已经复用了旧精灵
-    if (r.same) this.redealCard(0);
+    // 【重抽一律播完整动画】必须在 refresh 之前动精灵，否则那一帧就已经
+    // 复用了旧精灵。收牌用 r.oldValue（洗回去那张的数值），发牌靠扔掉
+    // 新牌的精灵让它重新入场。
+    if (r.kind === 'repick') this.redealCard(0, r.oldValue);
     this._selFunc = null;
     this.afterPlayerAction();
 };
 
-// 让某一方最后一张牌重新「发」一次。
+// 重抽的完整动画：旧牌飞回牌库 + 新牌重新入场 + 横扫光。
 //
-// 重抽拿到同一个数字时，cardKey（si_idx_值_正反）和原来完全一致 ——
-// refreshCards 认为这张牌没变，直接复用旧精灵，不新建也不重置 opacity，
-// 于是牌原地不动，看起来像什么都没发生（其实牌已经洗回去又抽出来了）。
+// 【为什么不能只靠 key 变化】重抽拿到同一个数字时，新牌的值和正反都和旧牌
+// 一样。uid 变了所以 key 也变了、新精灵会入场 —— 但那只有「飞进来」没有
+// 「收回去」，看着像牌凭空闪了一下。而玩家反馈最多的正是「用了重抽好像没反应」。
 //
-// 做法：把那个 key 对应的精灵直接扔掉。下一次 refreshCards 找不到它就会新建，
-// 而新建的精灵天生从画面中央、opacity 0 开始飞向目标位 —— 和发牌入场
-// 完全同一套动画，不用另写。
-Scene_D678.prototype.redealCard = function (si) {
+// 所以这里做两件事：
+//   1. 旧牌：拿它的数值造一个临时精灵，从原位飞回牌库方向再淡出（收牌）
+//   2. 新牌：把末尾那张的精灵扔掉，下一次 refreshCards 会新建 ——
+//      而新建的精灵天生从画面中央、opacity 0 飞向目标位，和发牌入场同一套
+//
+// oldValue 可能是 undefined（比如联机下服务器没带过来），那就只播新牌入场，
+// 不至于什么都不显示。
+Scene_D678.prototype.redealCard = function (si, oldValue) {
     var b = this._battle;
     if (!b) return;
     var cards = b.sides[si].cards;
     if (!cards.length) return;
-    // doDraw 是 push，重抽出来的那张一定在末尾
-    var idx = cards.length - 1;
-    var key = this.cardKey(si, idx, cards[idx], b.revealed);
-    var sp = this._cardSprites[key];
-    if (!sp) return;                     // 值变了的话 key 本来就不同，正常路径已经会重新入场
-    this._cardLayer.removeChild(sp);
-    delete this._cardSprites[key];
+
+    // 【新牌不用管】uid 变了所以 key 一定是新的，refreshCards 会自己建精灵、
+    // 从画面中央飞过来。原来这儿要手工扔掉旧精灵，那是 key 用下标时代的事：
+    // 重抽到同一个数字时 si_idx_值_正反 完全一致，不扔就原地不动。
+    //
+    // 要做的是**旧牌**那一半：它已经从 cards 里删掉了，但精灵还在
+    // （refreshCards 要到下一次调用才会清）。趁它还在，读出坐标当收牌动画的
+    // 起点，看起来就是「那张牌从原位飞回牌库」。
+    var live = {};
+    for (var i = 0; i < cards.length; i++) {
+        live[this.cardKey(si, i, cards[i], b.revealed)] = true;
+    }
+    var fromX = LY.SW / 2 - LY.CARD_W / 2;
+    var fromY = (si === 0) ? LY.MY_CARD_Y : LY.OPP_CARD_Y;
+    var prefix = si + '_';
+    for (var k in this._cardSprites) {
+        if (k.indexOf(prefix) !== 0 || live[k]) continue;
+        // 这一排里已经不存在的精灵 = 刚被洗回牌库那张
+        var sp = this._cardSprites[k];
+        fromX = sp.x; fromY = sp.y;
+        break;
+    }
+
+    if (oldValue !== undefined && oldValue !== null) {
+        this.returnCardFx(si, oldValue, fromX, fromY);
+    }
     this.redealSweepFx(si);
+};
+
+// 收牌：一张牌从 (x,y) 飞向画面中央上方（牌库方向）并淡出、缩小。
+// 用临时精灵，不进 _cardSprites —— 它不代表场上的任何一张牌。
+Scene_D678.prototype.returnCardFx = function (si, v, x, y) {
+    var sp = new Sprite(ImageManager.loadPicture(String(v)));
+    sp.scale.x = sp.scale.y = LY.CARD_W / D678.CARD_W;
+    sp.x = x; sp.y = y;
+    var tx = LY.SW / 2 - LY.CARD_W / 2, ty = 380;   // 牌库方向（和 dealFx 同一处）
+    this.addFx(sp, 22, function (s, r) {
+        s.x = x + (tx - x) * r;
+        s.y = y + (ty - y) * r;
+        s.opacity = 255 * (1 - r);
+        var k = (LY.CARD_W / D678.CARD_W) * (1 - r * 0.45);
+        s.scale.x = s.scale.y = k;
+    });
 };
 
 // 重抽用的横扫光。不能直接用 dealFx —— 它的 y 固定在 380，那是整局发牌用的
@@ -1399,9 +1453,9 @@ Scene_D678.prototype.updateBattle = function () {
         if (ev.action === 'func') this.funcFx();
         this.pushMsg(ev.msg);
         this._wait = 45;
-        // 对方重抽到同一张也要重发一次 —— 否则那张牌原地不动，
-        // 看不出对方到底做了什么
-        if (ev.same) this.redealCard(1);
+        // 对方重抽也要播完整动画（收牌 + 发牌）—— 否则看不出他到底做了什么。
+        // 判 kind 而不是 ev.same：抽到不同数字时旧牌同样该飞回牌库。
+        if (ev.kind === 'repick') this.redealCard(1, ev.oldValue);
         this.refresh();
         if (b.finished || (b.result && b.result.tie)) this.onBattleEnd();
     }

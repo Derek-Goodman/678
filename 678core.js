@@ -328,7 +328,7 @@ D678_Battle.prototype.newDeal = function () {
     this.sides = this.players.map(function (p, i) {
         return {
             p: p, index: i,
-            cards: [],          // {v:数值, hidden:是否背面}
+            cards: [],          // {v:数值, hidden:是否背面, uid:稳定身份}
             stood: false,
             checkN: 0,          // 查看牌库剩余可见张数
             known: []           // AI 推理出的“对方底牌一定是X”
@@ -336,10 +336,10 @@ D678_Battle.prototype.newDeal = function () {
     });
     // 发牌: 每人 1 底牌 + 1 明牌
     for (var i = 0; i < 2; i++) {
-        this.sides[i].cards.push({ v: this.deck.shift(), hidden: true });
+        this.sides[i].cards.push(D678.mkCard(this.deck.shift(), true));
     }
     for (var j = 0; j < 2; j++) {
-        this.sides[j].cards.push({ v: this.deck.shift(), hidden: false });
+        this.sides[j].cards.push(D678.mkCard(this.deck.shift(), false));
     }
     // 明牌小的先手
     var u0 = this.sides[0].cards[1].v, u1 = this.sides[1].cards[1].v;
@@ -448,7 +448,7 @@ D678_Battle.prototype.doDraw = function (si, hidden) {
     if (this.deck.length === 0) return null;
     var v = this.deck.shift();
     this.consumeCheck();
-    this.sides[si].cards.push({ v: v, hidden: !!hidden });
+    this.sides[si].cards.push(D678.mkCard(v, hidden));
     return v;
 };
 D678_Battle.prototype.doPick = function (si, num, hidden) {
@@ -456,7 +456,7 @@ D678_Battle.prototype.doPick = function (si, num, hidden) {
     if (idx < 0) return null;
     this.deck.splice(idx, 1);
     this.consumeCheck();
-    this.sides[si].cards.push({ v: num, hidden: !!hidden });
+    this.sides[si].cards.push(D678.mkCard(num, hidden));
     return num;
 };
 // 牌库里当前最小的数值（空库返回 null）
@@ -520,7 +520,10 @@ D678_Battle.prototype.act = function (si, action) {
 D678_Battle.prototype.useFunc = function (si, id, simulate) {
     var f = D678.funcData(id);
     var side = this.sides[si], opp = this.sides[1 - si];
-    var res = { ok: false, endTurn: false, msg: '', err: '', id: id };
+    // kind 一起带出去 —— 界面靠它决定播哪套动画（比如重抽要播收牌+发牌）。
+    // 光靠 id 的话调用方得再查一次 funcData。
+    var res = { ok: false, endTurn: false, msg: '', err: '', id: id,
+                kind: f ? f.kind : '' };
     if (!f) return res;
 
     switch (f.kind) {
@@ -551,7 +554,9 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         if (!rb) { res.err = '对方场上没有明牌'; return res; }
         var pos = opp.cards.indexOf(rb);
         opp.cards.splice(pos, 1);
-        side.cards.push({ v: rb.v, hidden: false });
+        // 换手就是换阵营，给个新 uid —— 客户端会当成「新到我这边的牌」重新入场，
+        // 正是强夺该有的观感。沿用旧 uid 的话它会从对方那一排原地跳过来。
+        side.cards.push(D678.mkCard(rb.v, false));
         res.ok = true; res.msg = '对方使用了' + f.name;
         break;
     case 'return':
@@ -781,7 +786,11 @@ D678_Battle.prototype.clone = function () {
             p: { funcs: s.p.funcs.slice(0), isGod: s.p.isGod, name: s.p.name,
                  hp: s.p.hp, losses: s.p.losses, isHuman: s.p.isHuman },
             index: s.index,
-            cards: s.cards.map(function (c) { return { v: c.v, hidden: c.hidden }; }),
+            // uid 照抄 —— 克隆是给 AI 推演用的，不进画面，但 newestUp / indexOf
+            // 那些定位逻辑要跟真盘面一致，别在这儿引入差异
+            cards: s.cards.map(function (c) {
+                return { v: c.v, hidden: c.hidden, uid: c.uid };
+            }),
             stood: s.stood, checkN: s.checkN, known: s.known.slice(0)
         };
     });
@@ -1179,7 +1188,9 @@ D678.AI.standValue = function (b, si) {
 // 在克隆盘面上加一张牌（用于推演）
 D678.AI.simAdd = function (b, si, v, hidden) {
     D678.remove(b.deck, v);
-    b.sides[si].cards.push({ v: v, hidden: !!hidden });
+    // 推演盘面不进画面，uid 用不上；但给一个负数占位，免得 undefined
+    // 混进 cardKey 那类拼字符串的地方（推演不该影响真实 uid 的计数）
+    b.sides[si].cards.push({ v: v, hidden: !!hidden, uid: -1 });
 };
 
 // 当前局面的最优价值（停牌 / 要牌 递归，单位 HP）
@@ -1549,10 +1560,12 @@ D678.AI.step = function (b, si) {
             if (b.sides[si].known.indexOf(f.num) < 0) b.sides[si].known.push(f.num);
         }
         if (!r.ok) return { side: si, action: 'stand', msg: '对方过牌', _forced: true, ev: b.act(si, 'stand') };
-        // same 透出来给界面用：重抽拿到同一个数字时牌会原地不动，
-        // 界面靠这个标记把那张牌重新「发」一次（见 678.js 的 redealCard）
+        // kind / oldValue 透出来给界面用：重抽要播「旧牌飞回牌库 + 新牌入场」
+        // 那套完整动画，收牌那一半需要知道洗回去的是哪个数字
+        // （见 678.js 的 redealCard）。same 留着，别的地方还在读。
         return { side: si, action: 'func', id: d.id, msg: r.msg, fail: !!r.fail,
-                 endTurn: !!r.endTurn, same: !!r.same };
+                 endTurn: !!r.endTurn, same: !!r.same,
+                 kind: r.kind, oldValue: r.oldValue };
     }
     if (d.action === 'hit' && b.canHit(si)) {
         var e = b.act(si, 'hit');
@@ -1580,6 +1593,23 @@ D678.simulateMatch = function (pA, pB) {
     // AI 超过 6 张自动弃掉价值最低的（对 AI 而言的暂停选择）
     need.forEach(function (p) { D678.autoDiscard(p); });
     return b.result;
+};
+
+// 造一张牌。uid 是**稳定身份**，整局唯一、只增不减。
+//
+// 【为什么需要】客户端的 refreshCards 靠 cardKey 判断「这张牌还是原来那张吗」，
+// key 一样就复用旧精灵（原地不动），不一样就新建精灵、从画面中央飞过来
+// （发牌入场动画）。key 原来用**数组下标**，于是「删掉中间那张牌」会让后面
+// 所有牌的下标往前挪、key 全变 —— 它们被当成新牌一起重新入场。
+//
+// 实际症状：用过「抽底牌」之后再「重抽」，暗牌和新抽的明牌**一起**重新入场。
+// 抽底牌把一张暗牌 push 到了末尾，于是明牌在中间，repick 删的就是中间那张。
+// rob / return 删的也是 newestUp，同样可能是中间那张。
+//
+// 用 uid 代替下标之后，删谁都不影响别人的身份。
+D678._cardUid = 0;
+D678.mkCard = function (v, hidden) {
+    return { v: v, hidden: !!hidden, uid: ++D678._cardUid };
 };
 
 // 记一场对手战绩。me 对 op 赢了没有 -> me.vsLog[op.id] 累加。
