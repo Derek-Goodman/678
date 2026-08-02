@@ -125,16 +125,18 @@ D678N.inbox = {
     room:   null,    // 最新房间状态
     state:  null,    // 最新盘面
     events: [],      // 对手动作文字，按顺序
-    over:   null,    // 决斗结束
+    over:   null,    // 决斗结束 / 锦标赛结束
     abort:  null,    // 房间被终止
     peer:   null,    // 对手掉线 / 回来
+    elim:   null,    // 锦标赛：我被淘汰了（带名次）
     netdown: false,  // 连接断了
 };
 
 D678N.clearInbox = function () {
     var b = D678N.inbox;
     b.room = null; b.state = null; b.events = [];
-    b.over = null; b.abort = null; b.peer = null; b.netdown = false;
+    b.over = null; b.abort = null; b.peer = null; b.elim = null;
+    b.netdown = false;
 };
 
 D678N.Net.emit = function (type, data) {
@@ -146,6 +148,7 @@ D678N.Net.emit = function (type, data) {
     case 'over':    b.over = data; break;
     case 'abort':   b.abort = data; break;
     case 'peer':    b.peer = data; break;
+    case 'eliminated': b.elim = data; break;
     case 'netdown': b.netdown = true; break;
     }
 };
@@ -229,7 +232,11 @@ D678N.buildReplica = function (players, round, startHp) {
         // 自己的功能牌是真 id；对手只知道张数，用占位补齐长度
         // （drawOppName 只读 .length，不会去看内容）
         p.funcs = info.funcs ? info.funcs.slice(0) : new Array(info.funcCount).fill(null);
-        p.isGod = false;   // 1v1 里两边都是真人
+        // 锦标赛的 8 人里可能有超哥；1v1 不发这个字段，两边都是真人
+        p.isGod = !!info.isGod;
+        // 真人的连线状态（''/'gone'/'left'）。AI 一律空串，所以排名表里
+        // 看不出谁是 AI —— 那是服务器那边故意的。
+        p.netStatus = info.status || '';
         return p;
     });
     g.round    = round || 1;
@@ -240,6 +247,19 @@ D678N.buildReplica = function (players, round, startHp) {
     if (startHp) D678.START_HP = startHp;   // 血条分母
     return g;
 };
+
+// 连线状态的中文标注。空串表示不标注 —— AI 和正常在线的人都走这一支，
+// 所以排名表里看不出谁是 AI。
+D678N.statusText = function (st) {
+    if (st === 'left') return '离开';
+    if (st === 'gone') return '掉线';
+    return '';
+};
+
+// 锦标赛：我被淘汰后暂存的名次（跨场景，Scene_D678 pop 回大厅要用）
+D678N.elim = null;
+// 赛事最终排名，大厅收到 over 时存这里
+D678N.finalOver = null;
 
 // 把服务器发来的盘面套到一个 D678.Battle 形状的对象上，
 // 这样 total / adj / mod / isMaxVal / canHit / target / handStr 这些
@@ -361,6 +381,13 @@ Scene_D678Net.prototype.start = function () {
     Scene_Base.prototype.start.call(this);
     this.startFadeIn(this.fadeSpeed(), false);
     this._guard = 10;
+    // 锦标赛里被淘汰、从牌桌 pop 回来的。SSE 不断（Net 没 reset），
+    // 所以赛事结束时那份 over 还会推过来，pollNet 收到就切到排名页。
+    if (D678N.elim) {
+        this._page = 'elim';
+        this.refresh();
+        return;
+    }
     // 刷新页面后回来的：标题画面检测到会话，把我们推到这儿接着恢复
     if (D678N.resumeSid) {
         var sid = D678N.resumeSid;
@@ -540,11 +567,15 @@ Scene_D678Net.prototype.refresh = function () {
     this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
                       cb: this.onChangeName.bind(this) });
 
-    if (this._page === 'menu' || this._page === 'duel') this.drawOnline();
+    if (this._page === 'menu' || this._page === 'duel' ||
+        this._page === 'tourney') this.drawOnline();
 
     if (this._page === 'menu')    this.drawMenu();
     if (this._page === 'duel')    this.drawDuel();
+    if (this._page === 'tourney') this.drawTourney();
     if (this._page === 'waiting') this.drawWaiting();
+    if (this._page === 'elim')    this.drawElim();
+    if (this._page === 'ranks')   this.drawFinalRanks();
 
     if (this._noticeTime > 0 && this._notice) {
         this.panel(60, H - 200, W - 120, 64);
@@ -562,11 +593,19 @@ Scene_D678Net.prototype.refresh = function () {
 // buttons() 仍支持 sub 字段，以后想加回来传一下就行。
 Scene_D678Net.prototype.drawMenu = function () {
     this.buttons([
-        // 「敬请期待」并进标题：它是 dim 按钮，点了没反应，
-        // 不说一句玩家会以为是坏的
-        { label: '锦标赛（敬请期待）', dim: true, cb: function () {} },
+        { label: '锦标赛', cb: this.onTourney.bind(this) },
         { label: '单人对决', cb: this.onDuel.bind(this) },
     ], 380);
+};
+
+Scene_D678Net.prototype.drawTourney = function () {
+    this.txt('锦标赛', 0, 336, Graphics.width, 30, LC.gold, 'center');
+    this.buttons([
+        { label: '匹配模式', cb: this.onMatch.bind(this) },
+        // 「暂未开启」并进标题：它是 dim 按钮，点了没反应，
+        // 不说一句玩家会以为是坏的
+        { label: '天体模式（暂未开启）', dim: true, cb: function () {} },
+    ], 400);
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
@@ -593,6 +632,8 @@ Scene_D678Net.prototype.drawWaiting = function () {
         return;
     }
 
+    if (info.mode === 'tourney') { this.drawTourneyLobby(info); return; }
+
     this.panel(60, 300, W - 120, 340);
     this.txt('房间号', 60, 322, W - 120, 20, LC.gray, 'center');
     this.txt(info.room, 60, 350, W - 120, 56, LC.gold, 'center');
@@ -617,6 +658,114 @@ Scene_D678Net.prototype.drawWaiting = function () {
     var ready = info.seats.filter(function (s) { return s && s.connected; }).length;
     this.txt(ready >= 2 ? '双方就绪，即将开始…' : '等待对手加入…',
         0, 660, W, 24, ready >= 2 ? LC.green : LC.gray, 'center');
+};
+
+// 锦标赛大厅。8 席分两列画 —— 单列 8 行会撞到底部的返回按钮。
+//
+// 没有「开始」按钮：全员就绪且 ≥2 人时服务器自己开赛（你定的）。谁没点准备
+// 在这张表里一眼看得见，所以不需要手动兜底。
+Scene_D678Net.prototype.drawTourneyLobby = function (info) {
+    var W = Graphics.width;
+    var seats = info.seats || [];
+    var taken = info.takenN || 0;
+    var readyN = 0;
+    for (var k = 0; k < seats.length; k++) if (seats[k] && seats[k].ready) readyN++;
+
+    this.txt('锦标赛 · 匹配模式', 0, 300, W, 30, LC.gold, 'center');
+    this.txt('房间 ' + (info.room || '') + '　　已就绪 ' + readyN + '/' + taken,
+        0, 336, W, 20, LC.gray, 'center');
+
+    // 准备按钮。一个人也能点 —— 他确实准备好了，只是还差人，
+    // 下面那行提示会说明为什么没开赛
+    this.buttons([{
+        label: info.myReady ? '取消准备' : '准备',
+        cb: this.onReady.bind(this),
+    }], 366);
+
+    this.txt('选手（' + taken + '/' + (info.seatN || 8) + '）',
+        0, 462, W, 20, LC.gray, 'center');
+
+    // 两列 × 4 行。i 是真实座位号（自己那行要标 ▶），空位不画。
+    var col = [90, 380], colW = 250, y0 = 492, rowH = 34, per = 4;
+    var shown = 0;
+    for (var i = 0; i < seats.length; i++) {
+        var s = seats[i];
+        if (!s) continue;
+        var cx = col[Math.floor(shown / per)], cy = y0 + (shown % per) * rowH;
+        shown++;
+        var st, cl;
+        if (!s.connected)   { st = '掉线';   cl = LC.red; }
+        else if (s.ready)   { st = '就绪';   cl = LC.green; }
+        else                { st = '未就绪'; cl = LC.gray; }
+        var mark = (i === info.mySeat) ? '▶ ' : '　';
+        this.txt(mark + s.name, cx, cy, colW - 70, 20, LC.text, 'left');
+        this.txt(st, cx + colW - 70, cy, 70, 20, cl, 'right');
+    }
+
+    // AI 补位说明：8 个真人时不补，超哥也不在场（你定的）
+    var seatN = info.seatN || 8;
+    this.txt(taken >= seatN
+        ? '满员，本场没有 AI'
+        : '其余 ' + (seatN - taken) + ' 席开赛时由 AI 补齐（含超哥）',
+        0, 636, W, 18, LC.gray, 'center');
+
+    // 为什么还没开赛，一句话说清 —— 少了这句，一个人点了准备什么也没发生，
+    // 看起来像按钮坏了
+    var hint, hcol;
+    if (info.needMore) {
+        hint = '至少需要 2 名玩家才能开赛，等人来…'; hcol = LC.gray;
+    } else if (!info.myReady) {
+        hint = '点「准备」，全员就绪立刻开赛'; hcol = LC.gold;
+    } else {
+        hint = '等其他选手准备…'; hcol = LC.gray;
+    }
+    this.txt(hint, 0, 664, W, 22, hcol, 'center');
+};
+
+// 被淘汰后的等待页。赛事还在跑，等最终排名推过来。
+//
+// 为什么不直接回主菜单：朋友局里「最后谁赢了」是必问的一句。连接留着，
+// 赛事结束时服务器会把 over 推给所有座位（含已淘汰的），这边收到就弹排名。
+Scene_D678Net.prototype.drawElim = function () {
+    var W = Graphics.width, e = D678N.elim || {};
+    this.panel(60, 320, W - 120, 260);
+    this.txt('你被淘汰了', 60, 356, W - 120, 34, LC.red, 'center');
+    if (e.rank) {
+        this.txt('第 ' + e.rank + ' 名' + (e.total ? ' / 共 ' + e.total + ' 人' : ''),
+            60, 404, W - 120, 28, LC.gold, 'center');
+    }
+    this.txt('赛事仍在进行，最终排名出来会显示在这里',
+        60, 456, W - 120, 20, LC.gray, 'center');
+    this.txt('不想等就点下面的返回', 60, 492, W - 120, 18, LC.gray, 'center');
+};
+
+// 赛事最终排名。行高 62 × 8 行放不进大厅这块地方，所以压成一行一条，
+// 只保留名次 / 名字 / HP / 状态 —— 详细战绩牌桌上的排名表已经有了。
+Scene_D678Net.prototype.drawFinalRanks = function () {
+    var W = Graphics.width, o = D678N.finalOver || {};
+    var list = o.ranks || [];
+    var myRank = o.myRank || 0;
+
+    this.txt(o.win ? '你是本届冠军！' : '赛事结束', 0, 300, W, 32,
+        o.win ? LC.gold : LC.text, 'center');
+    if (list[0]) {
+        this.txt('冠军：' + list[0].name + (myRank ? '　　你：第 ' + myRank + ' 名' : ''),
+            0, 340, W, 20, LC.gray, 'center');
+    }
+
+    this.panel(50, 372, W - 100, 12 + list.length * 34);
+    for (var i = 0; i < list.length; i++) {
+        var p = list[i], y = 382 + i * 34;
+        var mine = (i + 1 === myRank);
+        var col = mine ? LC.gold : (p.alive ? LC.text : '#8a9a92');
+        this.txt(String(i + 1), 72, y, 40, 20, mine ? LC.gold : LC.gray, 'left');
+        this.txt(p.name, 112, y, 220, 20, col, 'left');
+        this.txt('HP ' + Math.max(0, p.hp), 340, y, 90, 20,
+            p.hp > 30 ? col : LC.red, 'left');
+        // 掉线 / 离开标在最右边（你定的）。AI 和正常在线的人这里是空的。
+        var st = D678N.statusText(p.status);
+        if (st) this.txt(st, W - 180, y, 110, 20, LC.red, 'right');
+    }
 };
 
 //--- 输入 ------------------------------------------------------------------
@@ -648,21 +797,39 @@ Scene_D678Net.prototype.pollNet = function () {
         return;
     }
 
+    // 赛事结束（我已被淘汰，在大厅等最终排名）
+    if (b.over) {
+        D678N.finalOver = b.over;
+        b.over = null;
+        this._page = 'ranks';
+        this.refresh();
+        return;
+    }
+
     if (b.room) {
         var r = b.room;
         b.room = null;
         this._roomInfo = r;
         D678N.Net.room = r.room;
         D678N.Net.mySeat = r.mySeat;
-        if (this._page !== 'waiting') this._page = 'waiting';
+        // 淘汰后停在名次页 / 排名页，别被房间消息拽回等待页 —— pushRoom 是
+        // 发给所有座位的（包括已淘汰的），别人一掉线就会推一份，
+        // 不加这个判断淘汰画面会被冲掉
+        if (this._page !== 'waiting' &&
+            this._page !== 'elim' && this._page !== 'ranks') {
+            this._page = 'waiting';
+        }
         // lobby 阶段恢复：没有盘面会来，收掉「正在恢复」显示正常的等待页。
         // 其余阶段继续挂着，等下面那份 resync 盘面把我们推进对局场景。
         if (this._resuming && r.phase === 'lobby') this._resuming = false;
         this.refresh();
     }
 
-    // 第一份盘面到了就进对局场景（盘面留在 inbox 里，由那边取用）
-    if (b.state && !this._leaving) {
+    // 第一份盘面到了就进对局场景（盘面留在 inbox 里，由那边取用）。
+    // 淘汰后不再进 —— 服务器本来就不给已淘汰的座位推盘面（pushStateT 跳过
+    // left 的人），这里是第二道锁。
+    if (b.state && !this._leaving &&
+        this._page !== 'elim' && this._page !== 'ranks') {
         this._leaving = true;
         D678N.mode = 'duel';
         SceneManager.push(Scene_D678);
@@ -729,17 +896,78 @@ Scene_D678Net.prototype.onDuel = function () {
     this.refresh();
 };
 
+Scene_D678Net.prototype.onTourney = function () {
+    this._page = 'tourney';
+    this.refresh();
+};
+
+// 匹配：服务器找一个未满未开始的锦标赛房，没有就建。不要房号 —— 朋友局
+// 直接进同一个空房就行（你定的）。
+Scene_D678Net.prototype.onMatch = function () {
+    var name = D678N.savedName() || this.askName();
+    if (!name) return;
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/match', { name: name }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200) {
+            self.notice((r && r.err) || '匹配失败，服务器没响应');
+            self.refresh();
+            return;
+        }
+        D678N.setSession({ sid: r.sid, room: r.room });
+        D678N.Net.mySeat = r.mySeat;
+        D678N.Net.connect(r.sid);
+        self._page = 'waiting';
+        self.refresh();
+    });
+};
+
+// 准备 / 取消准备。全员就绪且 ≥2 人时服务器立刻开赛，这边不用判 ——
+// 开赛的信号是第一份盘面到达（pollNet 里那条 b.state）。
+Scene_D678Net.prototype.onReady = function () {
+    if (!D678N.Net.sid) return;
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/ready', { sid: D678N.Net.sid }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200) {
+            self.notice((r && r.err) || '操作失败');
+            self.refresh();
+            return;
+        }
+        // 界面不在这里改 —— 服务器会推一份新的 room 消息，
+        // 以那份为准，免得本地状态和服务器打架
+        self.refresh();
+    });
+};
+
 Scene_D678Net.prototype.onBack = function () {
-    if (this._page === 'waiting') {
-        // 已经建/进了房，退出要通知服务器把房间关掉
-        if (D678N.Net.sid) D678N.Net.post('/api/leave', { sid: D678N.Net.sid }, null);
+    // 淘汰等待页 / 最终排名页：赛事跟我已经没关系了，直接清会话回子页。
+    // 不发 /api/leave —— 服务器那边我早就是 left 了，再发一次没有意义。
+    if (this._page === 'elim' || this._page === 'ranks') {
+        D678N.elim = null;
+        D678N.finalOver = null;
         D678N.Net.reset();
-        this._page = 'menu';
+        this._page = 'tourney';
         this._roomInfo = null;
         this.refresh();
         return;
     }
-    if (this._page === 'duel') { this._page = 'menu'; this.refresh(); return; }
+    if (this._page === 'waiting') {
+        // 已经建/进了房，退出要通知服务器（1v1 关房间，锦标赛只摘席位）
+        if (D678N.Net.sid) D678N.Net.post('/api/leave', { sid: D678N.Net.sid }, null);
+        var wasTourney = !!(this._roomInfo && this._roomInfo.mode === 'tourney');
+        D678N.Net.reset();
+        // 锦标赛退回子页而不是主菜单 —— 想再匹配一次少点一下
+        this._page = wasTourney ? 'tourney' : 'menu';
+        this._roomInfo = null;
+        this.refresh();
+        return;
+    }
+    if (this._page === 'duel' || this._page === 'tourney') {
+        this._page = 'menu'; this.refresh(); return;
+    }
     SceneManager.pop();
 };
 
@@ -848,12 +1076,33 @@ Scene_D678.prototype.start = function () {
 //--- 应用服务器盘面 --------------------------------------------------------
 
 Scene_D678.prototype.netApply = function (m) {
+    var tourney = (m.mode === 'tourney');
     var v = m.b;
-    var first = !this._battle;
+
+    // 【两种模式的盘面形状不一样】1v1 的 maskView 把 players 嵌在 m.b 里；
+    // 锦标赛的 pushStateT 把牌面和玩家列表发成两个平级字段（m.b / m.players），
+    // 因为那份 players 是全场 8 人（排名列表要），不属于某一桌。
+    var plist = tourney ? m.players : (v && v.players);
+    if (!plist) return;   // 不该发生，但别让一份坏消息把场景搞崩
 
     // 副本：players[0] 永远是本地玩家（服务器已镜像）
-    var g = D678N.buildReplica(v.players, m.round, this._netStartHp);
+    var g = D678N.buildReplica(plist, m.round, this._netStartHp);
     D678.Game = g;
+
+    // 锦标赛：轮空、或者我这桌打完了而本轮还没结束 —— 服务器不发牌面
+    // （m.b 为 null）。这时候没有 battle 可建，停在轮次等待屏。
+    if (tourney && !v) {
+        this._battle = null;
+        this._netBye = !!m.bye;
+        this._netBusyTables = m.busyTables || 0;
+        this._phase = 'netwaitround';
+        this.refresh();
+        return;
+    }
+    this._netBye = false;
+    this._netBusyTables = m.busyTables || 0;
+
+    var first = !this._battle;
     this._battle = D678N.buildBattle(v, g);
     this._netOwes = !!m.owesDiscard;
 
@@ -1082,17 +1331,39 @@ Scene_D678.prototype.netPoll = function () {
         this.netApply(m);
     }
 
+    // over 必须在 elim 之前判：服务器在同一个 tick 里先发 eliminated
+    // 再发 over（最后一轮把人淘汰完就宣布结束），两条会在同一帧到达。
+    // 先处理 elim 的话会把人踢回大厅，然后大厅再弹一次排名 —— 明明还在
+    // 牌桌上却被弹回去，很突然。over 自带 myRank，信息一条都不少。
     if (b.over) {
         this._netOver = b.over;
+        var tourney = (b.over.mode === 'tourney');
         b.over = null;
-        // 决斗结束：沿用单机的淘汰 / 通关画面
+        b.elim = null;              // 同一帧的淘汰通知并进这次结算
+        // 沿用单机的淘汰 / 通关画面
         this._phase = 'gameover';
         this._battle = null;
-        this._notice = this._netOver.win
-            ? '你赢下了这场决斗！'
-            : '你被淘汰了……';
-        this._report = this.netFinalReport();
+        if (tourney) {
+            this._notice = this._netOver.win
+                ? '你是本届冠军！'
+                : '你获得第 ' + (this._netOver.myRank || 0) + ' 名';
+            this._report = this.netTourneyReport();
+        } else {
+            this._notice = this._netOver.win
+                ? '你赢下了这场决斗！'
+                : '你被淘汰了……';
+            this._report = this.netFinalReport();
+        }
         this.refresh();
+        return;
+    }
+
+    // 锦标赛：我被淘汰但赛事还在继续 —— 退回大厅等最终排名。
+    // 连接不断（Net 不 reset），赛事结束时那份 over 会推到大厅去。
+    if (b.elim) {
+        D678N.elim = { rank: b.elim.rank || 0, total: b.elim.total || 0 };
+        b.elim = null;
+        SceneManager.pop();
     }
 };
 
@@ -1137,6 +1408,26 @@ Scene_D678.prototype.netFinalReport = function () {
         '胜 ' + me.wins + '　负 ' + me.losses + '　胜率 ' + rate(me.wins, me.losses),
         '满点 ' + me.maxPoint + ' 次',
         '共使用功能牌 ' + (me.funcUses || 0) + ' 次',
+    ];
+};
+
+// 锦标赛的结算文字。1v1 那份读 o.stats（只有两个人），锦标赛发的是
+// o.ranks（全场 8 人的名次表），字段不一样所以分开写。
+Scene_D678.prototype.netTourneyReport = function () {
+    var o = this._netOver;
+    if (!o || !o.ranks || !o.ranks.length) return null;
+    var champ = o.ranks[0];
+    var me = o.ranks[(o.myRank || 1) - 1] || o.ranks[0];
+    var rate = function (a, b) {
+        var g = a + b;
+        return g > 0 ? Math.round(a / g * 100) + '%' : '—';
+    };
+    return [
+        '冠军：' + (champ ? champ.name : '?'),
+        '我的名次：第 ' + (o.myRank || 0) + ' 名 / 共 ' + o.ranks.length + ' 人',
+        '最终 HP：' + Math.max(0, me.hp) + '　对局 ' + (me.games || 0) + ' 场',
+        '胜 ' + me.wins + '　负 ' + me.losses + '　胜率 ' + rate(me.wins, me.losses),
+        '满点 ' + me.maxPoint + ' 次　共使用功能牌 ' + (me.funcUses || 0) + ' 次',
     ];
 };
 
@@ -1403,6 +1694,37 @@ Scene_D678.prototype.drawHpBar = function () {
     }
 };
 
+//--- 绘制：掉线 / 离开的标注 ------------------------------------------------
+//
+// 两处都用「改一下再调原函数」的写法，不动 678.js 本体。
+
+// 对手名字后缀（掉线）/（离开）（你定的）。1v1 不发 status，所以那边不受影响
+// —— 1v1 本来就有「对方已掉线 X 秒」那行提示。
+var _oppName = Scene_D678.prototype.drawOppName;
+Scene_D678.prototype.drawOppName = function (opp) {
+    var st = this._net ? D678N.statusText(opp.netStatus) : '';
+    if (!st) { _oppName.call(this, opp); return; }
+    var real = opp.name;
+    opp.name = real + '（' + st + '）';
+    _oppName.call(this, opp);
+    opp.name = real;
+};
+
+// 排名表：状态标在每行最右边（你定的）。原函数把名次 / HP / 战绩画到
+// x≈600 为止，600~690 是空的。
+var _rankList = Scene_D678.prototype.drawRankList;
+Scene_D678.prototype.drawRankList = function () {
+    _rankList.call(this);
+    if (!this._net || !D678.Game) return;
+    var bmp = this._ovBmp;
+    var list = D678.Game.rankedPlayers();
+    for (var i = 0; i < list.length; i++) {
+        var st = D678N.statusText(list[i].netStatus);
+        // 行距和原函数一致（140 + i*68，名字画在 y+6）
+        if (st) this.txt(bmp, st, 600, 140 + i * 68 + 6, 88, 22, LC.red, 'right');
+    }
+};
+
 //--- 绘制：叠一层联机状态 --------------------------------------------------
 // 这个包装必须是最外层的 refresh —— 678.js 自己已经包了两层
 // （非对局画面补充绘制 + 教程），所以 678net.js 必须最后加载。
@@ -1425,8 +1747,42 @@ Scene_D678.prototype.refresh = function () {
         return;
     }
 
+    // 锦标赛：本轮轮空、或者我这桌打完了在等最慢那一桌。此时服务器不发牌面
+    // （m.b 为 null），交给 678.js 的 refresh 会按 _phase 分发到认不得的分支，
+    // 所以这个阶段自己画。
+    if (this._phase === 'netwaitround') { this.netDrawWaitRound(); return; }
+
     _rf.call(this);
     this.netDrawOverlay();
+};
+
+// 轮次等待屏。轮次屏障是设计决定（每轮所有人都打过一场），代价就是打完的人
+// 要等最慢那一桌 —— 所以这里必须说清在等什么，不然像卡住了。
+Scene_D678.prototype.netDrawWaitRound = function () {
+    var bmp = this._uiBmp, W = NLY.SW;
+    bmp.clear();
+    if (this._ovBmp) this._ovBmp.clear();
+    this._hits = [];
+
+    if (this._showList) { this.drawRankList(); return; }
+
+    var g = D678.Game;
+    this.txt(bmp, '第 ' + (g ? g.round : 1) + ' 轮', 0, 200, W, 34, LC.gold, 'center');
+    this.txt(bmp, this._netBye ? '本轮轮空' : '你这桌打完了',
+        0, 260, W, 30, LC.text, 'center');
+
+    var n = this._netBusyTables || 0;
+    this.txt(bmp, n > 0
+        ? '还有 ' + n + ' 桌在打，等他们打完开下一轮'
+        : '正在开下一轮…', 0, 320, W, 22, LC.gray, 'center');
+    if (g) {
+        this.txt(bmp, '场上还有 ' + g.alivePlayers().length + ' 人',
+            0, 360, W, 20, LC.gray, 'center');
+    }
+
+    this.txt(bmp, '点击任意处查看全场排名', 0, 440, W, 20, LC.gray, 'center');
+    this._hits.push({ x: 0, y: 0, w: W, h: NLY.SH,
+        cb: this.onToggleList.bind(this) });
 };
 
 Scene_D678.prototype.netDrawOverlay = function () {

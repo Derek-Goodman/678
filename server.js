@@ -76,6 +76,14 @@ const CFG = {
     // 写 0 关掉计时（本地调试用）。
     turnSec: Number(argOf('--turn-sec', 30)),
 
+    // 锦标赛：AI 走一步之前停多久（毫秒）。0 = 立刻。
+    // 给一点延迟是为了让人看清对手做了什么，不是为了拟人。
+    aiStepMs: Number(argOf('--ai-step-ms', 900)),
+
+    // 锦标赛的回合时限。默认沿用 turnSec；想让 8 人赛更紧凑就单独调这个，
+    // 不影响 1v1。轮次屏障下每轮耗时 = 最慢那一桌，所以这个值放大了 8 倍效果。
+    tourneyTurnSec: Number(argOf('--tourney-turn-sec', 0)),
+
     // 掉线的人轮到他时用这个更短的时限（秒）。他不会来操作，让在线的那个人
     // 干等满 turnSec 没有意义 —— 而且 678core 里 standStreak>=2 才结算、
     // hit 会把它归零，所以在线方每要一张牌都要多买一个完整回合的等待。
@@ -86,6 +94,15 @@ const CFG = {
     // 玩家看到的是「对方已掉线 X 秒」并且随时可以自己点返回主菜单，
     // 所以这里只是一道兜底，不需要催人。
     graceSec: Number(argOf('--grace-sec', 300)),
+
+    // 锦标赛【大厅】里掉线多久就彻底移除座位（秒）。开赛后走 graceSec，
+    // 两者不是一回事：大厅里的人还没投入任何东西，占着席位挡别人。
+    //
+    // 为什么不是「立刻移除」：EventSource 遇到网络抖动会断开再自动重连，
+    // 通常一两秒就回来；刷新页面也是断开重连（靠 sessionStorage 找回座位）。
+    // 判得太急，抖一下或刷一次页面就被踢回菜单。10 秒足够盖住这两种情况，
+    // 而真走掉的人最多多占 10 秒席位。
+    lobbyGraceSec: Number(argOf('--lobby-grace-sec', 10)),
 
     // 「继续」确认的超时（秒）。有人挂机不点继续时自动替他确认。
     // 给足时间 —— 这是「看结算面板」的时间，不该催人。
@@ -111,6 +128,36 @@ const CFG = {
 
 // 时间戳要拼进格式串里，不能当第一个参数传 —— 那样 %s 不会被替换
 const log = (fmt, ...a) => console.log(new Date().toISOString().slice(11, 19) + ' ' + fmt, ...a);
+
+// 锦标赛固定 8 个位置：真人占前面，其余由 AI 补齐（超哥必定在内）。
+// 和单机一致 —— 单机就是 1 真人 + 7 AI。
+const TOURNEY_SEATS = 8;
+
+// 8 个真人就不放超哥了 —— 8 席全是人的时候他没位置坐。
+// 所以真人上限就是 TOURNEY_SEATS 本身，不留席位。
+const TOURNEY_MAX_HUMANS = TOURNEY_SEATS;
+
+// 本局要补的 AI 名单。rollAINames 里 AI_COUNT 是写死的 6（单机 1 人 + 7 AI），
+// 锦标赛的补位数随真人数变，所以临时改再还原 —— 和 startDuel 处理
+// START_HP 的手法一致。超哥由 rollAINames 无条件塞进去，只要 need >= 1
+// 他就一定在场；need === 0（8 个真人）时整份名单为空，他自然不登场。
+function rollFillNames(need) {
+    if (need <= 0) return [];
+    const saved = D678.AI_COUNT;
+    // rollAINames 返回 AI_COUNT + 1 个（多的那个是超哥），所以少要一个
+    D678.AI_COUNT = Math.max(0, need - 1);
+    try {
+        return D678.rollAINames().slice(0, need);
+    } finally {
+        D678.AI_COUNT = saved;
+    }
+}
+
+// 每个房间的回合时限（秒）。锦标赛可以单独设，没设就沿用 turnSec。
+function turnSecOf(room) {
+    if (room.mode === 'tourney' && CFG.tourneyTurnSec) return CFG.tourneyTurnSec;
+    return CFG.turnSec;
+}
 
 //=============================================================================
 // 静态文件
@@ -225,6 +272,25 @@ function cleanName(s, fallback) {
 // drawShowdown 读 result.totals，unseenForPlayer 跳过未揭示暗牌。
 // 以后改界面时如果需要对方点数，一律从 result.totals 取，别调 total(1)。
 //
+// 视角置换：把「我」搬到 players[0]、对手搬到 players[1]，其余按原序跟在后面。
+//
+// 为什么对手一定放 1 号位：客户端 buildBattle 是按 sides[i] <-> players[i]
+// 平行数组接的（`b.sides[i].p = game.players[i]`）。让对手固定落在 1 号位，
+// 那段代码在 8 人赛下一行都不用改，而排名列表读的是整个 players 数组、
+// 按 outAt/hp 自己排序，不依赖数组顺序。
+//
+// 轮空的人没有对手：只有自己在 0 号位，其余原序跟随。
+function viewOrder(playerN, mePIdx, oppPIdx) {
+    const ord = [mePIdx];
+    if (oppPIdx >= 0 && oppPIdx !== mePIdx) ord.push(oppPIdx);
+    for (let i = 0; i < playerN; i++) {
+        if (i !== mePIdx && i !== oppPIdx) ord.push(i);
+    }
+    return ord;
+}
+
+// b 是一桌对局；me / opp 是这桌的两个 side 对应的 game.players 下标。
+// meSide 是「我」在这桌的 side（0 或 1）—— 镜像后我永远显示成 side 0。
 function maskView(b, me, snapPre) {
     const mySide = b.sides[me];
 
@@ -304,6 +370,103 @@ function maskView(b, me, snapPre) {
     };
 }
 
+// 锦标赛版的遮蔽。和 1v1 那个分开写，不去改已经跑通的那条路。
+//
+// 差别只有两处：
+//   · players 是全部 8 个（排名列表要），sides 仍然只有 2 个（一桌就两个人）
+//   · players 多带 isHuman / isGod / status，客户端 buildReplica 靠它们
+//     正确构造副本 —— 1v1 版那边写死了 isHuman=(i===0) 和 isGod=false
+//
+// bt 是一桌（含 pIdx 对、side 映射）；seat 是看这份数据的那个人。
+// bt 为 null 表示这个人本轮轮空或已经打完，此时不发任何牌面。
+function maskViewT(room, bt, seat, snapPre) {
+    const g = room.game;
+    const mePIdx = seat.pIdx;
+    const oppPIdx = bt ? (bt.pIdx[0] === mePIdx ? bt.pIdx[1] : bt.pIdx[0]) : -1;
+    const ord = viewOrder(g.players.length, mePIdx, oppPIdx);
+
+    const P = (pIdx) => {
+        const p = g.players[pIdx];
+        const st = room.seats.find(s => s && s.pIdx === pIdx);
+        return {
+            name: p.name, hp: p.hp, alive: p.alive,
+            wins: p.wins, losses: p.losses, maxPoint: p.maxPoint,
+            funcUses: p.funcUses,
+            funcs: (pIdx === mePIdx) ? p.funcs.slice(0) : null,
+            funcCount: p.funcs.length,
+            // 客户端要靠这两个还原 AI 行为（超哥按超哥打）
+            isHuman: !!p.isHuman, isGod: !!p.isGod,
+            // 真人的连线状态。AI 一律不标注 —— 排名列表里看不出谁是 AI。
+            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone')) : '',
+            // 这个人此刻是否还在打（等待画面里「谁在对局」用）
+            inBattle: !!room.battles.find(x => !x.done && x.pIdx.indexOf(pIdx) >= 0),
+        };
+    };
+
+    let view = null;
+    if (bt) {
+        const b = bt.b;
+        const meSide = (bt.pIdx[0] === mePIdx) ? 0 : 1;
+        const sw = (arr) => (meSide === 0 ? arr : [arr[1], arr[0]]);
+
+        const maskSide = (si) => {
+            const s = b.sides[si];
+            const mine = (si === meSide);
+            return {
+                v: undefined,
+                cards: s.cards.map(c => ({
+                    v: (mine || b.revealed || !c.hidden) ? c.v : null,
+                    hidden: c.hidden,
+                })),
+                stood: s.stood,
+                checkN: mine ? s.checkN : 0,
+            };
+        };
+
+        let result = null;
+        if (b.result) {
+            const r = b.result;
+            result = {
+                totals: sw(r.totals), busts: sw(r.busts), maxes: sw(r.maxes),
+                winner: r.tie ? -1 : (r.winner === meSide ? 0 : 1),
+                tie: !!r.tie,
+                dmg: r.dmg || 0, items: r.items || 0, target: r.target,
+                winnerName: r.winnerP ? r.winnerP.name : '',
+                loserName:  r.loserP  ? r.loserP.name  : '',
+            };
+        }
+
+        const preOf = (pIdx) => {
+            if (!snapPre) return null;
+            return (pIdx === mePIdx) ? (snapPre[pIdx] || []).slice(0) : null;
+        };
+
+        view = {
+            deck: b.deck.map((v, i) => (i < b.sides[meSide].checkN ? v : null)),
+            rule: b.rule,
+            standStreak: b.standStreak,
+            turn: (b.turn === meSide) ? 0 : 1,
+            revealed: !!b.revealed,
+            finished: !!b.finished,
+            redeals: b.redeals,
+            sides: [maskSide(meSide), maskSide(1 - meSide)],
+            result: result,
+            preFuncs: snapPre ? ord.map(preOf) : null,
+            preFuncCounts: snapPre
+                ? ord.map(i => (snapPre[i] ? snapPre[i].length : null)) : null,
+        };
+    }
+
+    return {
+        b: view,
+        players: ord.map(P),
+        // 我在这份 players 里的下标恒为 0；对手恒为 1（有对手时）
+        oppIdx: (oppPIdx >= 0) ? 1 : -1,
+        round: g.round,
+        bye: !bt && !!(room.byePIdx === mePIdx),
+    };
+}
+
 // 对战日志：只在揭牌后才允许下发（logAct 记的 hand 含暗牌数值）。
 // side 也要镜像 —— drawBattleLog 按 side 上色（我方青、对方橙）。
 function maskLog(b, me) {
@@ -329,20 +492,44 @@ const bySid = new Map();   // sid  -> {room, seatIndex}
 // 必须包在这里面，否则 A 房的结算可能把牌还进 B 房的池子。
 // Node 单线程 + 每次推进都是同步的，所以这样就够 —— 但绝不能在
 // fn 里面 await，那会让另一个房间的回调插进来。
+// 锦标赛版日志遮蔽。和 1v1 同一条规矩：揭牌前一律不发（logAct 记的 hand
+// 含暗牌数值）。side 要按「我在这桌是 side 几」镜像，drawBattleLog 按 side 上色。
+function maskLogT(bt, meSide) {
+    const b = bt.b;
+    if (!b.revealed) return null;
+    return (b.log || []).map(e => ({
+        name: e.name, what: e.what, hand: e.hand,
+        side: (e.side === meSide) ? 0 : 1,
+    }));
+}
+
 function withRoom(room, fn) {
     const prev = D678.Game;
     D678.Game = room.game;
     try { return fn(); } finally { D678.Game = prev; }
 }
 
-function newRoom() {
+// mode: 'duel'（1v1，2 座）| 'tourney'（8 人存活赛，AI 补位）
+//
+// 【锦标赛的三个身份别混用】一个人有三个下标，1v1 里它们恰好重合，
+// 所以那套代码通篇用一个 si 兼职三者。8 人赛必须分开：
+//   seatIdx  0..N-1   座位号（bySid 找人用）
+//   pIdx     0..7     game.players 的下标（规则层认这个）
+//   side     0 | 1    所在那一桌的 side（b.turn / b.sides 认这个）
+// 一旦有一处拿 seatIdx 当 side 用，症状是「某人的操作打到别人桌上」，
+// 而且只在特定配对下出现 —— 命名分开就是为了让这种错写不出来。
+function newRoom(mode) {
     let code;
     do { code = rndId(4); } while (rooms.has(code));
+    const seatN = (mode === 'tourney') ? TOURNEY_SEATS : 2;
     const room = {
         code: code,
-        seats: [null, null],
+        mode: mode || 'duel',
+        seats: new Array(seatN).fill(null),
         game: null,
-        battle: null,
+        // 本轮所有对局。1v1 恒定一条；锦标赛一轮最多 4 条同时进行。
+        battles: [],
+        byePIdx: -1,         // 本轮轮空的 game.players 下标（锦标赛，奇数人时）
         phase: 'lobby',      // lobby | battle | resolved | over
         seq: 0,
         // 每次结算 +1。客户端记住自己播过哪一次，同一次不再重播演出。
@@ -375,10 +562,17 @@ function addSeat(room, name) {
     const seat = {
         sid: sid, name: name, index: i,
         player: null,
+        // game.players 的下标。锦标赛里 index（座位号）和 pIdx 未必相等 ——
+        // 有人离开后座位号会留着空洞，而 pIdx 是开赛时定死的。
+        pIdx: -1,
+        left: false,        // 永久离开（宽限期满 / 被淘汰踢回大厅）
         sse: null, connected: false,
         disconnectAt: 0,
         owesDiscard: false,
         acked: false,
+        // 锦标赛大厅的「准备」。全员就绪且 ≥2 人就自动开赛（你定的）。
+        // 掉线立刻清掉 —— 否则赛事可能在他人不在的情况下开打。
+        ready: false,
     };
     room.seats[i] = seat;
     bySid.set(sid, { room: room, index: i });
@@ -387,10 +581,29 @@ function addSeat(room, name) {
     return seat;
 }
 
+// 把座位从房间里彻底摘掉，席位重新变空（只用于锦标赛大厅阶段）。
+//
+// 和 seat.left 的区别：left 是「开赛后离开」—— 位置必须留着，因为规则层
+// 还要按 pIdx 找他、按 outAt 给他排名。大厅阶段还没有 game，没有这个包袱，
+// 所以直接摘掉让席位能给下一个人。
+function removeSeat(room, seat) {
+    clearTimeout(seat.graceTimer);
+    bySid.delete(seat.sid);
+    if (room.seats[seat.index] === seat) room.seats[seat.index] = null;
+    log('房间 %s 座位 %d(%s) 离开大厅', room.code, seat.index, seat.name);
+}
+
 function dropRoom(room, why) {
     clearTimeout(room.turnTimer);
     clearTimeout(room.ackTimer);
     clearTimeout(room.discardTimer);
+    clearTimeout(room.roundTimer);
+    // 锦标赛一轮有多桌，每桌两个定时器 —— 漏掉的话房间销毁后
+    // 回调还会对着已删除的房间跑 pushStateT
+    (room.battles || []).forEach(bt => {
+        clearTimeout(bt.turnTimer);
+        clearTimeout(bt.aiTimer);
+    });
     room.seats.forEach(s => {
         if (!s) return;
         clearTimeout(s.graceTimer);
@@ -447,12 +660,16 @@ function computeStats() {
     let playing = 0, waiting = 0, seated = 0;
 
     for (const room of rooms.values()) {
-        const live = room.seats.filter(s => s && s.connected);
+        const live = room.seats.filter(s => s && !s.left && s.connected);
         live.forEach(s => liveSids.add(s.sid));
         seated += live.length;
         if (room.phase === 'lobby') {
-            if (live.length > 0 && live.length < 2) waiting++;
-        } else {
+            // 「等人」= 还没开始、还没坐满。原来写死了 < 2（1v1 两座），
+            // 锦标赛是 8 座，得按房间自己的席数判。
+            if (live.length > 0 && live.length < room.seats.length) waiting++;
+        } else if (room.phase !== 'over') {
+            // 打完的房间不销毁（结算面板还要看），但那些人已经不在对局中了 ——
+            // 不排除会显示成「N 人对局中」而其实他们正在看排名
             playing += live.length;
         }
     }
@@ -484,16 +701,25 @@ function sendTo(seat, type, data) {
 }
 
 function pushRoom(room) {
+    // 锦标赛大厅：在座的真人数（掉线的人 10 秒内还占着席位，也算在座）
+    const taken = room.seats.filter(s => s && !s.left).length;
     room.seats.forEach(seat => {
         if (!seat) return;
         sendTo(seat, 'room', {
             room: room.code,
+            mode: room.mode,
             phase: room.phase,
             mySeat: seat.index,
             startHp: CFG.startHp,
-            turnSec: CFG.turnSec,
-            seats: room.seats.map(s => s ? {
-                name: s.name, connected: s.connected,
+            turnSec: turnSecOf(room),
+            seatN: room.seats.length,
+            takenN: taken,
+            // 「我点过准备没有」。界面靠它把按钮在准备/取消之间切。
+            myReady: !!seat.ready,
+            // 少于 2 人时点了准备也开不了赛，界面要明说在等人（否则像坏了）
+            needMore: room.mode === 'tourney' && room.phase === 'lobby' && taken < 2,
+            seats: room.seats.map(s => (s && !s.left) ? {
+                name: s.name, connected: s.connected, ready: !!s.ready,
             } : null),
         });
     });
@@ -536,6 +762,52 @@ function pushState(room, extra) {
 // 对手动作的文字提示：只发给「不是行动方」的那个人。
 // 单机里 pushMsg 收到的就是「对方抽牌」这类第三人称措辞，
 // 而自己的动作单机也不推消息（结果直接看盘面），所以这里行为一致。
+// 锦标赛推盘面：每个座位只拿自己那一桌 + 全场 8 人的公开信息。
+//
+// 【安全关键】A 桌的人绝不能从这份数据里看到 B 桌的任何牌面 ——
+// maskViewT 只接受 seat 自己那一桌的 bt，别图省事传整个 room.battles。
+function pushStateT(room, extra) {
+    room.seq++;
+    room.seats.forEach(seat => {
+        if (!seat || seat.left) return;
+        // 【不能加 !x.done】自己那桌打完了照样要发牌面 —— applyActionT 是先
+        // 置 bt.done 再推这份状态的，过滤掉 done 的话玩家永远收不到自己这场的
+        // 结算（揭牌演出、对战日志、弃牌界面全都没了，直接跳到下一轮）。
+        // 「在等本轮结束」由 bt.done 单独判，见下面的 waitingRound。
+        const bt = room.battles.find(x => x.pIdx.indexOf(seat.pIdx) >= 0);
+        const btDone = !!(bt && bt.done);
+        const v = maskViewT(room, bt, seat, bt ? bt.preFuncs : null);
+        const meSide = bt ? (bt.pIdx[0] === seat.pIdx ? 0 : 1) : -1;
+        // 本轮还有几桌在打（等待画面用）
+        const busy = room.battles.filter(x => !x.done).length;
+        sendTo(seat, 'state', Object.assign({
+            seq: room.seq,
+            mode: 'tourney',
+            resolveId: bt ? bt.resolveId : 0,
+            phase: room.phase,
+            round: room.game ? room.game.round : 1,
+            b: v.b,
+            players: v.players,
+            bye: v.bye,
+            // 我这桌打完了（或者本轮压根没我的桌）但本轮还没结束 ——
+            // 客户端据此停在轮次等待屏
+            waitingRound: (!bt || btDone) && !v.bye && busy > 0,
+            busyTables: busy,
+            log: bt ? maskLogT(bt, meSide) : null,
+            // 打完的桌 turnDeadline 是上一手留下的旧值，别让客户端拿它倒计时
+            turnLeft: (bt && !btDone && bt.turnDeadline)
+                ? Math.max(0, bt.turnDeadline - Date.now()) : 0,
+            discardLeft: (seat.owesDiscard && room.discardDeadline)
+                ? Math.max(0, room.discardDeadline - Date.now()) : 0,
+            owesDiscard: seat.owesDiscard,
+            // 对手是否在弃牌 / 掉线（只看同桌那个人）
+            peerOwes: !!(bt && room.seats.find(s => s && !s.left &&
+                s.pIdx === (bt.pIdx[0] === seat.pIdx ? bt.pIdx[1] : bt.pIdx[0]) &&
+                s.owesDiscard)),
+        }, extra || {}));
+    });
+}
+
 function pushEvent(room, actorIndex, msg) {
     if (!msg) return;
     room.seats.forEach(seat => {
@@ -547,6 +819,428 @@ function pushEvent(room, actorIndex, msg) {
 //=============================================================================
 // 对局流程
 //=============================================================================
+
+//=============================================================================
+// 锦标赛：8 人存活赛
+//=============================================================================
+//
+// 一轮的形状（和单机 checkGameEnd -> makeRound 一致）：
+//   makeRound() 给出 pairs + bye  ->  纯 AI 的桌当场用 simulateMatch 算完
+//   有真人的桌变成 room.battles 里的一条，交互着打
+//   所有桌都 done 且没人欠弃牌  ->  轮次屏障放开  ->  淘汰 -> 下一轮
+//
+// 轮次屏障是设计决定：打完的人要等最慢那一桌。平局也等（那一桌 newDeal
+// 重打，其他人跟着多等一局）。这样赛程语义最干净 —— 每轮所有人都打过一场。
+
+// 离开的人手上的功能牌全部回公共池（你定的）。
+//
+// 【为什么必须每轮都调一次，而不是转 left 时调一次就完】
+// 678core 的 grantFuncs 是「胜者摸 1、败者摸 2」，它不看 alive 也不看 left
+// （那份文件单机联机共用，不能为联机加判断）。而离开的人一路自动过牌，
+// 场场是败者 —— 于是他每轮白拿 2 张攒在手上永远不出，公共池会被慢慢抽干。
+//
+// 所以每次发完牌都把离开者的牌立刻退回去：净效果等于「不给他发」，
+// 而池子的收支始终是平的。顺序很重要 —— 必须在算 owesDiscard 之前退，
+// 否则他会因为「手上超过 MAX_FUNC 张」被挂上一个永远没人处理的弃牌债务，
+// 而轮次屏障正等着 owesDiscard 清零，全场 8 个人一起卡死。
+function returnFuncsOfLeft(room) {
+    if (!room.game) return;
+    room.seats.forEach(s => {
+        if (!s || !s.left || s.pIdx < 0) return;
+        const p = room.game.players[s.pIdx];
+        if (p && p.funcs.length > 0) room.game.returnAllFuncs(p);
+    });
+}
+
+// 「全员就绪就立刻开赛」的唯一判定点。
+//
+// 必须在这三个时机都调一次，漏掉任何一个房间都会卡住：
+//   · 有人点准备（/api/ready）
+//   · 有人进房（新人一来「全员就绪」就不成立了，他走了才可能重新成立）
+//   · 有人的座位被移除（大厅掉线满 10 秒）—— 少了这次调用，房间会一直
+//     等一个已经不存在的人
+//
+// 「≥2 人」是硬条件（你定的）：一个人点了准备也不开，界面靠 needMore 说明原因。
+function maybeStartTourney(room) {
+    if (!room || room.mode !== 'tourney' || room.phase !== 'lobby') return false;
+    const seated = room.seats.filter(s => s && !s.left);
+    if (seated.length < 2) return false;
+    if (!seated.every(s => s.ready && s.connected)) return false;
+    room.touched = Date.now();
+    startTourney(room);
+    return true;
+}
+
+function startTourney(room) {
+    const humans = room.seats.filter(s => s && !s.left);
+    const need = TOURNEY_SEATS - humans.length;
+    const aiNames = rollFillNames(need);
+
+    const savedHp = D678.START_HP;
+    D678.START_HP = CFG.startHp;
+    try {
+        const game = new D678.GameClass();
+        const players = [];
+        // 真人占前面，pIdx 就是入座顺序；AI 补后面
+        humans.forEach((s, i) => {
+            const p = new D678.Player(players.length, s.name, true);
+            s.pIdx = players.length;
+            s.player = p;
+            players.push(p);
+        });
+        aiNames.forEach(nm => {
+            // 第三个参数 isHuman=false；isGod 由 Player 构造函数按名字判
+            players.push(new D678.Player(players.length, nm, false));
+        });
+        game.players = players;
+        room.game = game;
+    } finally {
+        D678.START_HP = savedHp;
+    }
+
+    room.phase = 'battle';
+    log('房间 %s 锦标赛开始：%d 真人 + %d AI（超哥%s）',
+        room.code, humans.length, aiNames.length,
+        aiNames.indexOf(D678.GOD_NAME) >= 0 ? '在场' : '不在场');
+    pushRoom(room);
+    startRound(room);
+}
+
+// 摆好新一轮。纯 AI 的桌立刻算完，有真人的桌留着交互打。
+function startRound(room) {
+    const g = room.game;
+    let r;
+    withRoom(room, () => {
+        g.players.forEach(p => { if (p.alive) { p.prevLast = p.last; p.last = null; } });
+        r = g.makeRound();
+        if (r.bye) r.bye.last = { type: 'bye', dmg: 0 };
+    });
+
+    room.battles = [];
+    room.byePIdx = r.bye ? g.players.indexOf(r.bye) : -1;
+    room.phase = 'battle';
+    room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
+
+    r.pairs.forEach(pair => {
+        const [pa, pb] = pair;
+        const ia = g.players.indexOf(pa), ib = g.players.indexOf(pb);
+        const seatA = room.seats.find(s => s && !s.left && s.pIdx === ia);
+        const seatB = room.seats.find(s => s && !s.left && s.pIdx === ib);
+
+        // 两边都不是活人（AI，或者已经离开的人）-> 当场算完，没有等的理由。
+        // 离开的人交给 simulateMatch 等于让 AI 替他打完这一场 —— 不行，
+        // 他该是一路自动过牌。所以只有「双方都是 AI」才走这条快路。
+        if (!seatA && !seatB && !pa.isHuman && !pb.isHuman) {
+            withRoom(room, () => { D678.simulateMatch(pa, pb); });
+            return;
+        }
+
+        const bt = {
+            id: room.battles.length,
+            pIdx: [ia, ib],
+            b: null,
+            done: false,
+            resolveId: 0,
+            preFuncs: null,
+            isTie: false,
+            turnTimer: null,
+            turnDeadline: 0,
+            turnStartAt: 0,
+            turnGoneDeadline: 0,
+            aiTimer: null,
+        };
+        withRoom(room, () => { bt.b = new D678.Battle(pa, pb, false); });
+        room.battles.push(bt);
+    });
+
+    // 全是 AI 桌（真人都轮空 / 都离开了）-> 这一轮没有交互，直接收
+    if (room.battles.length === 0) { checkRoundBarrier(room); return; }
+
+    room.battles.forEach(bt => armTurnTimerT(room, bt));
+    pushStateT(room, { fresh: true });
+    room.battles.forEach(bt => stepAIIfNeeded(room, bt));
+}
+
+//--- 每桌各自的回合计时 ----------------------------------------------------
+// 和 1v1 的 armTurnTimer 同一套规矩（锚在回合起点、掉线只许缩短），
+// 差别是状态存在 bt 上而不是 room 上 —— 一轮有 4 桌同时在跑。
+
+function armTurnTimerT(room, bt) {
+    clearTimeout(bt.turnTimer);
+    bt.turnDeadline = 0;
+    const tsec = turnSecOf(room);
+    if (!tsec || room.phase !== 'battle' || !bt.b || bt.b.finished || bt.done) return;
+
+    const now = Date.now();
+    if (!bt.turnStartAt) bt.turnStartAt = now;
+
+    const pIdx = bt.pIdx[bt.b.turn];
+    const seat = room.seats.find(s => s && s.pIdx === pIdx);
+    const isAI = !room.game.players[pIdx].isHuman;
+    const left = !!(seat && seat.left);
+    const gone = !!(seat && !seat.left && !seat.connected);
+
+    // 离开的人：不等，立刻自动过牌（你定的）。AI 不用计时器，走 stepAIIfNeeded。
+    if (left) {
+        bt.turnDeadline = now;
+        bt.turnTimer = setTimeout(() => forceStand(room, bt, '离开'), 0);
+        return;
+    }
+    if (isAI) return;
+
+    const full = bt.turnStartAt + tsec * 1000;
+    let deadline;
+    if (!gone) {
+        deadline = full;
+        bt.turnGoneDeadline = 0;
+    } else {
+        deadline = Math.min(now + (CFG.goneTurnSec || tsec) * 1000, full);
+        if (bt.turnGoneDeadline && bt.turnGoneDeadline > now) {
+            deadline = Math.min(deadline, bt.turnGoneDeadline);
+        }
+        bt.turnGoneDeadline = deadline;
+    }
+
+    bt.turnDeadline = deadline;
+    bt.turnTimer = setTimeout(() => forceStand(room, bt, gone ? '掉线' : '超时'),
+        Math.max(0, deadline - now));
+}
+
+function forceStand(room, bt, why) {
+    if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
+    log('房间 %s 第 %d 桌 pIdx=%d %s -> 判过牌',
+        room.code, bt.id, bt.pIdx[bt.b.turn], why);
+    applyActionT(room, bt, bt.b.turn, { type: 'stand' }, true);
+}
+
+// 轮到 AI（或轮到已离开的人）就自己走。延迟一下让人看清对手做了什么。
+function stepAIIfNeeded(room, bt) {
+    clearTimeout(bt.aiTimer);
+    if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
+    const pIdx = bt.pIdx[bt.b.turn];
+    const p = room.game.players[pIdx];
+    const seat = room.seats.find(s => s && s.pIdx === pIdx);
+    if (seat && seat.left) {
+        // 离开的人一路自动过牌，且 losses 照常累加（你定的）
+        bt.aiTimer = setTimeout(() => forceStand(room, bt, '离开'), 0);
+        return;
+    }
+    if (p.isHuman) return;
+
+    bt.aiTimer = setTimeout(() => {
+        if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
+        const si = bt.b.turn;
+        let ev = null;
+        withRoom(room, () => { ev = D678.AI.step(bt.b, si); });
+        if (ev && ev.msg) pushEventT(room, bt, si, ev.msg);
+
+        if (bt.b.result && bt.b.result.tie) { resolveTable(room, bt, true); return; }
+        if (bt.b.finished) { resolveTable(room, bt, false); return; }
+
+        if (bt.b.turn !== si) { bt.turnStartAt = 0; bt.turnGoneDeadline = 0; }
+        armTurnTimerT(room, bt);
+        pushStateT(room);
+        stepAIIfNeeded(room, bt);
+    }, CFG.aiStepMs);
+}
+
+// 对手动作的文字提示：只发给同桌的另一个人
+function pushEventT(room, bt, actorSide, msg) {
+    if (!msg) return;
+    const otherPIdx = bt.pIdx[1 - actorSide];
+    const seat = room.seats.find(s => s && !s.left && s.pIdx === otherPIdx);
+    if (seat) sendTo(seat, 'event', { msg: msg });
+}
+
+//--- 锦标赛版的一个动作 ----------------------------------------------------
+
+function applyActionT(room, bt, side, action, forced) {
+    const b = bt.b;
+    if (!b || b.finished || bt.done || room.phase !== 'battle') {
+        return { ok: false, err: '当前不能行动' };
+    }
+    if (b.turn !== side) return { ok: false, err: '还没轮到你' };
+
+    const turnBefore = b.turn;
+    let msg = '', ok = true, err = '', failNote = '';
+
+    withRoom(room, () => {
+        if (action.type === 'hit') {
+            if (!b.canHit(side)) {
+                ok = false;
+                err = b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌';
+                return;
+            }
+            msg = b.act(side, 'hit').msg;
+        } else if (action.type === 'stand') {
+            msg = b.act(side, 'stand').msg;
+        } else if (action.type === 'func') {
+            const p = room.game.players[bt.pIdx[side]];
+            const id = action.id;
+            if (!id || p.funcs.indexOf(id) < 0) { ok = false; err = '你没有这张功能牌'; return; }
+            const r = b.useFunc(side, id);
+            if (!r.ok) { ok = false; err = r.err || '无法使用'; return; }
+            msg = r.msg;
+            if (r.fail) failNote = '此号牌已在场上';
+        } else {
+            ok = false; err = '未知动作';
+        }
+    });
+
+    if (!ok) return { ok: false, err: err };
+
+    if (forced) msg = (msg || '') + '（超时）';
+    pushEventT(room, bt, side, msg);
+
+    if (b.result && b.result.tie) { resolveTable(room, bt, true); return { ok: true, fail: failNote }; }
+    if (b.finished) { resolveTable(room, bt, false); return { ok: true, fail: failNote }; }
+
+    if (b.turn !== turnBefore) { bt.turnStartAt = 0; bt.turnGoneDeadline = 0; }
+    armTurnTimerT(room, bt);
+    pushStateT(room);
+    stepAIIfNeeded(room, bt);
+    return { ok: true, fail: failNote };
+}
+
+//--- 一桌打完 --------------------------------------------------------------
+
+function resolveTable(room, bt, isTie) {
+    clearTimeout(bt.turnTimer);
+    clearTimeout(bt.aiTimer);
+    bt.turnDeadline = 0;
+    bt.resolveId++;
+    bt.isTie = !!isTie;
+
+    if (isTie) {
+        // 平局：这一桌重发再打，其他桌跟着等（你定的）。
+        // 不要求任何人点确认 —— 一个人挂机不该卡住全场 8 个人。
+        pushStateT(room, { resolved: true, tie: true });
+        setTimeout(() => {
+            if (bt.done || room.phase !== 'battle') return;
+            withRoom(room, () => {
+                bt.b.pendingRedeal = false;
+                bt.b.result = null;
+                bt.b.redeals++;
+                bt.b.newDeal();
+            });
+            bt.turnStartAt = 0;
+            bt.turnGoneDeadline = 0;
+            armTurnTimerT(room, bt);
+            pushStateT(room, { fresh: true, redealt: true });
+            stepAIIfNeeded(room, bt);
+        }, CFG.advanceMs);
+        return;
+    }
+
+    // 发牌前拍一张手牌快照，客户端在揭牌演出期间显示这份
+    bt.preFuncs = {};
+    bt.pIdx.forEach(i => { bt.preFuncs[i] = room.game.players[i].funcs.slice(0); });
+
+    withRoom(room, () => {
+        const need = bt.b.grantFuncs();
+        // 先把离开者刚摸到的牌退回池子，再算谁欠弃牌 —— 顺序反了他会挂上
+        // 一个永远没人处理的弃牌债务，轮次屏障就永远等不到 owesDiscard 清零
+        returnFuncsOfLeft(room);
+        need.forEach(p => {
+            const pi = room.game.players.indexOf(p);
+            const seat = room.seats.find(s => s && s.pIdx === pi);
+            // 已离开的人牌刚被退光，不可能还超上限
+            if (seat && seat.left) return;
+            // 真人自己挑（掉线的也给他机会回来挑）；AI 立刻自动弃
+            if (seat) seat.owesDiscard = true;
+            else D678.autoDiscard(p);
+        });
+        room.game.players.forEach(p => {
+            if (!p.alive && p.funcs.length > 0) room.game.returnAllFuncs(p);
+        });
+    });
+
+    bt.done = true;
+    if (room.seats.some(s => s && !s.left && s.owesDiscard)) {
+        armDiscardTimer(room, CFG.discardSec * 1000 + 4000);
+    }
+    pushStateT(room, { resolved: true, tie: false });
+    checkRoundBarrier(room);
+}
+
+//--- 轮次屏障 --------------------------------------------------------------
+
+function checkRoundBarrier(room) {
+    if (room.phase !== 'battle' && room.phase !== 'resolved') return;
+    if (room.battles.some(x => !x.done)) return;                 // 还有桌在打
+    if (room.seats.some(s => s && !s.left && s.owesDiscard)) return;  // 还有人在挑牌
+
+    clearTimeout(room.discardTimer);
+    room.discardDeadline = 0;
+    room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
+
+    // 给一点时间看自己那桌的结果，再开下一轮
+    clearTimeout(room.roundTimer);
+    room.roundTimer = setTimeout(() => {
+        // 淘汰：血空的人踢回大厅，赛事继续（你定的）
+        const outSeats = [];
+        room.seats.forEach(s => {
+            if (!s || s.left) return;
+            const p = room.game.players[s.pIdx];
+            if (p && !p.alive) outSeats.push(s);
+        });
+        outSeats.forEach(s => {
+            const rank = rankOf(room, s.pIdx);
+            sendTo(s, 'eliminated', {
+                rank: rank, total: room.game.players.length,
+                name: room.game.players[s.pIdx].name,
+            });
+            log('房间 %s %s 被淘汰（第 %d 名），踢回大厅', room.code,
+                room.game.players[s.pIdx].name, rank);
+            s.left = true;   // 位置留着（规则层还要按 outAt 排名），但不再推盘面
+        });
+
+        const aliveN = room.game.players.filter(p => p.alive).length;
+        const humansLeft = room.seats.filter(s => s && !s.left && s.connected).length;
+        if (aliveN <= 1 || humansLeft === 0) { enterOverT(room); return; }
+        startRound(room);
+    }, CFG.advanceMs);
+}
+
+// 名次：已淘汰的按 outAt 倒数，存活的按血量。和 rankedPlayers 同一套语义。
+function rankOf(room, pIdx) {
+    const ranked = room.game.rankedPlayers();
+    const i = ranked.indexOf(room.game.players[pIdx]);
+    return (i >= 0) ? i + 1 : room.game.players.length;
+}
+
+function enterOverT(room) {
+    room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
+    clearTimeout(room.roundTimer);
+    clearTimeout(room.discardTimer);
+    room.phase = 'over';
+    const ranked = room.game.rankedPlayers();
+    room.overInfo = ranked.map((p, i) => {
+        const pi = room.game.players.indexOf(p);
+        const st = room.seats.find(s => s && s.pIdx === pi);
+        return {
+            rank: i + 1, name: p.name, hp: p.hp, alive: p.alive,
+            wins: p.wins, losses: p.losses, maxPoint: p.maxPoint,
+            games: p.wins + p.losses, funcUses: p.funcUses,
+            // 和 maskViewT 里的 status 同一套取值。AI 一律空串 ——
+            // 排名表里看不出谁是 AI（有座位才是真人）。
+            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone')) : '',
+        };
+    });
+    // 发给所有座位，包括已淘汰的（他们的 SSE 还连着）—— 淘汰的人回到大厅后
+    // 靠这份数据弹一次最终排名，否则他永远不知道最后谁赢了（你定的）
+    room.seats.forEach(seat => {
+        if (!seat) return;
+        const me = room.game.players[seat.pIdx];
+        sendTo(seat, 'over', {
+            mode: 'tourney',
+            win: ranked[0] === me,
+            myRank: ranked.indexOf(me) + 1,
+            ranks: room.overInfo,
+        });
+    });
+    log('房间 %s 锦标赛结束，冠军 %s', room.code, ranked[0] ? ranked[0].name : '?');
+}
 
 function startDuel(room) {
     // 起始 HP 要在造 Player 之前设好（构造函数里读 D678.START_HP）。
@@ -758,17 +1452,30 @@ function armDiscardTimer(room, ms) {
     if (!CFG.discardSec) return;
     room.discardDeadline = Date.now() + ms;
     room.discardTimer = setTimeout(() => {
-        if (room.phase !== 'resolved') return;
-        const owing = room.seats.filter(s => s && s.owesDiscard);
+        // 锦标赛整轮都停在 'battle'（每桌各自结算，房间不整体进 resolved），
+        // 所以这里不能只认 resolved —— 那样自动弃永远不触发，
+        // 而轮次屏障在等 owesDiscard 清零，全场 8 个人一起卡死。
+        if (room.mode === 'tourney') {
+            if (room.phase !== 'battle') return;
+        } else if (room.phase !== 'resolved') {
+            return;
+        }
+        const owing = room.seats.filter(s => s && !s.left && s.owesDiscard);
         if (!owing.length) return;
         withRoom(room, () => {
             owing.forEach(s => {
                 log('房间 %s 座位 %d 弃牌超时 -> 自动弃', room.code, s.index);
-                D678.autoDiscard(s.player);
+                D678.autoDiscard(room.mode === 'tourney'
+                    ? room.game.players[s.pIdx] : s.player);
                 s.owesDiscard = false;
             });
         });
         room.discardDeadline = 0;
+        if (room.mode === 'tourney') {
+            pushStateT(room, { resolved: true, autoDiscarded: true });
+            checkRoundBarrier(room);
+            return;
+        }
         pushState(room, { resolved: true, tie: !!room.isTie, autoDiscarded: true });
         advanceIfDiscardsDone(room);   // 自动弃完就直接开下一局
     }, ms);
@@ -891,6 +1598,33 @@ function onDisconnect(room, seat) {
     seat.sse = null;
     seat.disconnectAt = Date.now();
     log('房间 %s 座位 %d(%s) 掉线', room.code, seat.index, seat.name);
+
+    // 锦标赛【大厅】掉线：就绪标记立刻清掉，10 秒后座位彻底移除。
+    //
+    // 就绪必须马上清 —— 留着的话赛事可能在他人不在的情况下开打。清了之后
+    // 「全员就绪」自然不成立，这 10 秒里房间开不了赛，等于他有 10 秒回来的
+    // 窗口；真走了就移除席位，然后重算一次开赛条件（少了这次重算，
+    // 剩下的人会一直等一个已经不存在的人）。
+    //
+    // 放在下面那条 peer 消息之前是故意的：peer 是 1v1 的「对手掉线了」提示，
+    // 大厅里一屋子人收到它没有意义。
+    if (room.mode === 'tourney' && room.phase === 'lobby') {
+        seat.ready = false;
+        pushRoom(room);
+        clearTimeout(seat.graceTimer);
+        seat.graceTimer = setTimeout(() => {
+            if (seat.connected) return;      // 回来了
+            removeSeat(room, seat);
+            if (!room.seats.some(s => s)) {
+                dropRoom(room, '大厅里没人了');
+                return;
+            }
+            pushRoom(room);
+            maybeStartTourney(room);
+        }, CFG.lobbyGraceSec * 1000);
+        return;
+    }
+
     pushRoom(room);
 
     const other = room.seats.find(s => s && s !== seat);
@@ -904,6 +1638,48 @@ function onDisconnect(room, seat) {
     if (room.phase === 'battle' && room.battle && !room.battle.finished) {
         armTurnTimer(room);
         pushState(room);
+    }
+
+    // 锦标赛：一个人掉线不该毁掉整场赛事。缩短他那桌的回合、推一份新盘面，
+    // 别人照常打；宽限期烧完转成「离开」（一路自动过牌，不再等他）。
+    if (room.mode === 'tourney') {
+        const bt = room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
+        if (bt && room.phase === 'battle') {
+            armTurnTimerT(room, bt);
+            pushStateT(room);
+        } else {
+            pushStateT(room);
+        }
+        clearTimeout(seat.graceTimer);
+        seat.graceTimer = setTimeout(() => {
+            if (seat.connected) return;
+            seat.left = true;
+            log('房间 %s %s 宽限期满 -> 判为离开', room.code, seat.name);
+            // 手上的牌立刻回池，不等到下一轮发牌才退
+            withRoom(room, () => { returnFuncsOfLeft(room); });
+            // 他那桌若正等他行动，立刻自动过牌把牌局推下去
+            const b2 = room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
+            if (b2 && room.phase === 'battle') {
+                if (b2.b && b2.b.turn === (b2.pIdx[0] === seat.pIdx ? 0 : 1)) {
+                    forceStand(room, b2, '离开');
+                } else {
+                    armTurnTimerT(room, b2);
+                }
+            }
+            // 他欠的弃牌自动处理掉，否则轮次屏障等不到他
+            if (seat.owesDiscard) {
+                withRoom(room, () => { D678.autoDiscard(room.game.players[seat.pIdx]); });
+                seat.owesDiscard = false;
+            }
+            // 全部真人都走了就收房间
+            if (!room.seats.some(s => s && !s.left && s.connected)) {
+                dropRoom(room, '锦标赛里所有真人都离开了');
+                return;
+            }
+            pushStateT(room);
+            checkRoundBarrier(room);
+        }, CFG.graceSec * 1000);
+        return;
     }
 
     clearTimeout(seat.graceTimer);
@@ -925,6 +1701,27 @@ function onReconnect(room, seat) {
 
     const other = room.seats.find(s => s && s !== seat);
     if (other) sendTo(other, 'peer', { gone: false, name: seat.name });
+
+    // 锦标赛：恢复他那桌的时限，补一份房间信息 + 盘面
+    if (room.mode === 'tourney') {
+        pushRoom(room);
+        if (room.phase === 'over' && room.overInfo) {
+            const me = room.game.players[seat.pIdx];
+            const ranked = room.game.rankedPlayers();
+            sendTo(seat, 'over', {
+                mode: 'tourney', win: ranked[0] === me,
+                myRank: ranked.indexOf(me) + 1, ranks: room.overInfo,
+            });
+            return;
+        }
+        if (room.game) {
+            const bt = room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
+            if (bt && room.phase === 'battle') armTurnTimerT(room, bt);
+            pushStateT(room, { resync: true });
+            if (bt) stepAIIfNeeded(room, bt);
+        }
+        return;
+    }
 
     // 恢复回 turnSec。turnStartAt 不动 —— 锚点还是这个回合真正开始的时刻，
     // 所以他拿回的是「本回合剩下的时间」，不是重新给满 30 秒。
@@ -1023,11 +1820,16 @@ const server = http.createServer((req, res) => {
             if (seat.sse === res) onDisconnect(room, seat);
         });
 
-        // 两个人都连上了就开打
-        if (room.phase === 'lobby' &&
+        // 1v1：两个人都连上了就开打。
+        // 锦标赛不在这里开 —— 连上只是入座，要等各人点「准备」（/api/ready）。
+        // 否则第 2 个人一连上就把还没到的人关在门外了。
+        if (room.mode !== 'tourney' && room.phase === 'lobby' &&
             room.seats.every(s => s && s.connected)) {
             startDuel(room);
         }
+        // 重连回来的人如果正好补齐了「全员就绪」就直接开（掉线会清就绪标记，
+        // 所以正常不会在这儿触发；留着是防某条路忘了清）
+        maybeStartTourney(room);
         return;
     }
 
@@ -1038,6 +1840,52 @@ const server = http.createServer((req, res) => {
             const room = newRoom();
             const seat = addSeat(room, cleanName(body.name, '房主'));
             json(res, 200, { room: room.code, sid: seat.sid, mySeat: seat.index });
+        });
+        return;
+    }
+
+    //--- 锦标赛：匹配（有未满未开始的房就进，否则建一个）------------------
+    // 不做公开房间列表 —— 名字只对同房的人可见，不暴露给还没进房的访客。
+    if (u === '/api/match' && req.method === 'POST') {
+        readBody(req, body => {
+            if (!body) return json(res, 400, { err: '请求格式错误' });
+            const name = cleanName(body.name, '选手');
+            let room = null;
+            for (const r of rooms.values()) {
+                if (r.mode !== 'tourney' || r.phase !== 'lobby') continue;
+                const taken = r.seats.filter(s => s && !s.left).length;
+                if (taken < TOURNEY_MAX_HUMANS) { room = r; break; }
+            }
+            if (!room) room = newRoom('tourney');
+            const seat = addSeat(room, name);
+            if (!seat) return json(res, 409, { err: '房间刚好满了，再点一次' });
+            json(res, 200, {
+                room: room.code, sid: seat.sid, mySeat: seat.index, mode: 'tourney',
+            });
+        });
+        return;
+    }
+
+    //--- 锦标赛：准备 / 取消准备（全员就绪且 ≥2 人则立刻开赛）--------------
+    // 没有「开始」按钮 —— 谁没点准备在席位表里看得见，不需要兜底的手动开始
+    // （你定的）。挂机的人卡住房间是可接受的，朋友局互相喊一声就行。
+    if (u === '/api/ready' && req.method === 'POST') {
+        readBody(req, body => {
+            if (!body) return json(res, 400, { err: '请求格式错误' });
+            const found = seatOf(body.sid);
+            if (!found) return json(res, 404, { err: '会话失效' });
+            const { room, seat } = found;
+            if (!seat || seat.left) return json(res, 404, { err: '会话失效' });
+            if (room.mode !== 'tourney') return json(res, 400, { err: '不是锦标赛房间' });
+            if (room.phase !== 'lobby') return json(res, 409, { err: '已经开始了' });
+            // 不传 ready 就当切换，传了就照传的设
+            seat.ready = (body.ready === undefined) ? !seat.ready : !!body.ready;
+            room.touched = Date.now();
+            const taken = room.seats.filter(s => s && !s.left).length;
+            json(res, 200, { ok: true, ready: seat.ready, takenN: taken });
+            // 先回响应再判开赛：startTourney 会推一大堆 SSE，
+            // 别让 HTTP 响应吊在后面
+            if (!maybeStartTourney(room)) pushRoom(room);
         });
         return;
     }
@@ -1072,9 +1920,17 @@ const server = http.createServer((req, res) => {
             const found = seatOf(body.sid);
             if (!found) return json(res, 404, { err: '会话已失效' });
             const { room, seat } = found;
+            // 锦标赛还要回「我在哪一桌、哪个 side」—— 只回 phase 的话
+            // 刷新后不知道自己该看哪桌的牌面
+            const bt = (room.mode === 'tourney' && room.battles)
+                ? room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0)
+                : null;
             json(res, 200, {
                 ok: true, room: room.code, mySeat: seat.index,
-                phase: room.phase, name: seat.name,
+                mode: room.mode, phase: room.phase, name: seat.name,
+                pIdx: seat.pIdx,
+                pairId: bt ? bt.id : -1,
+                side: bt ? (bt.pIdx[0] === seat.pIdx ? 0 : 1) : -1,
             });
         });
         return;
@@ -1112,6 +1968,14 @@ const server = http.createServer((req, res) => {
             if (body.seq !== undefined && Number(body.seq) !== room.seq) {
                 return json(res, 200, { ok: false, stale: true });
             }
+            if (room.mode === 'tourney') {
+                // 由座位查到自己那一桌 —— 绝不能拿 seat.index 当 side 用
+                const bt = room.battles.find(x =>
+                    !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
+                if (!bt) return json(res, 200, { ok: false, err: '你本轮已经打完了' });
+                const side = (bt.pIdx[0] === seat.pIdx) ? 0 : 1;
+                return json(res, 200, applyActionT(room, bt, side, body.action || {}, false));
+            }
             const r = applyAction(room, seat.index, body.action || {}, false);
             json(res, 200, r);
         });
@@ -1148,9 +2012,15 @@ const server = http.createServer((req, res) => {
             });
             seat.owesDiscard = false;
             // 没人再欠弃牌就把弃牌计时收掉，免得它稍后误触发 autoDiscard
-            if (!room.seats.some(s => s && s.owesDiscard)) {
+            if (!room.seats.some(s => s && !s.left && s.owesDiscard)) {
                 clearTimeout(room.discardTimer);
                 room.discardDeadline = 0;
+            }
+            if (room.mode === 'tourney') {
+                pushStateT(room, { resolved: true });
+                checkRoundBarrier(room);
+                return json(res, 200, { ok: true,
+                    peerOwes: room.seats.some(s => s && !s.left && s.owesDiscard) });
             }
             pushState(room, { resolved: true, tie: !!room.isTie });
             // 都弃完了就直接开下一局，不要求任何人点确认
@@ -1193,6 +2063,48 @@ const server = http.createServer((req, res) => {
     if (u === '/api/leave' && req.method === 'POST') {
         readBody(req, body => {
             const found = body && seatOf(body.sid);
+            // 锦标赛：一个人退出不该毁掉整场赛事。标成离开、把他那桌推下去，
+            // 剩下的人照常打；真人全走了才收房间。
+            if (found && found.room.mode === 'tourney' &&
+                found.room.phase !== 'lobby') {
+                const { room, seat } = found;
+                seat.left = true;
+                log('房间 %s %s 主动退出锦标赛', room.code, seat.name);
+                withRoom(room, () => { returnFuncsOfLeft(room); });
+                const bt = room.battles.find(x =>
+                    !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
+                if (bt && room.phase === 'battle' && bt.b &&
+                    bt.b.turn === (bt.pIdx[0] === seat.pIdx ? 0 : 1)) {
+                    forceStand(room, bt, '离开');
+                } else if (bt && room.phase === 'battle') {
+                    armTurnTimerT(room, bt);
+                }
+                if (seat.owesDiscard) {
+                    withRoom(room, () => { D678.autoDiscard(room.game.players[seat.pIdx]); });
+                    seat.owesDiscard = false;
+                }
+                if (!room.seats.some(s => s && !s.left && s.connected)) {
+                    dropRoom(room, '锦标赛里所有真人都离开了');
+                } else {
+                    pushStateT(room);
+                    checkRoundBarrier(room);
+                }
+                return json(res, 200, { ok: true });
+            }
+            // 锦标赛大厅：只摘他的席位，房间留给还在等的人。
+            // 走 dropRoom 会把一屋子人一起赶回菜单 —— 8 人赛永远凑不起来。
+            if (found && found.room.mode === 'tourney' &&
+                found.room.phase === 'lobby') {
+                const { room, seat } = found;
+                removeSeat(room, seat);
+                if (!room.seats.some(s => s)) {
+                    dropRoom(room, '大厅里没人了');
+                } else {
+                    pushRoom(room);
+                    maybeStartTourney(room);   // 他一走可能正好凑成全员就绪
+                }
+                return json(res, 200, { ok: true });
+            }
             if (found) {
                 const other = found.room.seats.find(s => s && s !== found.seat);
                 if (other) sendTo(other, 'abort', { reason: found.seat.name + ' 离开了房间' });
