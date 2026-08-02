@@ -266,6 +266,9 @@ D678N.buildReplica = function (players, round, startHp) {
         // prevLast 是上一轮的、全场都打完了，8 个人的都发。
         p.last     = info.last || null;
         p.prevLast = info.prevLast || null;
+        // 锦标赛：这个人此刻是否还在打（服务器 maskViewT 算好发下来的）。
+        // 轮结果页靠它列出「还在对局的玩家」。
+        p.inBattle = !!info.inBattle;
         // 锦标赛的 8 人里可能有超哥；1v1 不发这个字段，两边都是真人
         p.isGod = !!info.isGod;
         // 真人的连线状态（''/'gone'/'left'）。AI 一律空串，所以排名表里
@@ -1124,21 +1127,33 @@ Scene_D678.prototype.netApply = function (m) {
     var g = D678N.buildReplica(plist, m.round, this._netStartHp);
     D678.Game = g;
 
-    // 锦标赛：轮空、或者我这桌打完了而本轮还没结束 —— 服务器不发牌面
-    // （m.b 为 null）。这时候没有 battle 可建，停在轮次等待屏。
+    this._netBusyTables = m.busyTables || 0;
+    // 服务器算好的「我这桌完了，本轮还没结束」。轮结果页靠它决定
+    // 提示语写「其他玩家还在对局」还是「点击任意位置继续」。
+    if (m.waitingRound !== undefined) this._netWaitRound = !!m.waitingRound;
+
+    // 锦标赛轮空：服务器不发牌面（m.b 为 null），没有 battle 可建。
+    // 直接落到轮结果页 —— 报表写「轮空」、对战记录写「（本轮轮空，无对战记录）」，
+    // 和单机轮空看到的是同一个页面（你定的，不另做页面）。
     if (tourney && !v) {
+        this._netBye = true;
+        // 轮空也要有 _roundInfo，否则 buildRoundReport 会拿上一轮的残留去画。
+        // 和单机 678.js:1324 同一套：pairs 空、bye 指向我。
+        var meP = g.human();
+        meP.last = { type: 'bye', dmg: 0 };
+        this._roundInfo = { pairs: [], bye: meP };
+        this._lastLog = null;
+        this._battleKeep = this._battle;
         this._battle = null;
-        this._netBye = !!m.bye;
-        this._netBusyTables = m.busyTables || 0;
-        this._phase = 'netwaitround';
+        this._phase = 'roundResult';
+        this._notice = '';
+        this._wait = 20;
+        this.buildRoundReport();
+        this.refreshCards();
         this.refresh();
         return;
     }
     this._netBye = false;
-    this._netBusyTables = m.busyTables || 0;
-    // 服务器算好的「我这桌完了，本轮还没结束」。它一直发，之前客户端没读，
-    // 于是打完的人卡在轮结果画面等一个永远不来的下一局。
-    if (m.waitingRound !== undefined) this._netWaitRound = !!m.waitingRound;
 
     var first = !this._battle;
     this._battle = D678N.buildBattle(v, g);
@@ -1186,6 +1201,26 @@ Scene_D678.prototype.netApply = function (m) {
     }
 
     if (m.log) this._netLog = m.log;
+
+    // 【别人桌的 fresh / resolved 一律不认】
+    //
+    // pushStateT 的 extra 是 Object.assign 合并进每一个座位的消息的，所以
+    // 某一桌平局重发时，那份 {fresh:true} 会广播给全场 8 个人。而下面 m.fresh
+    // 的分支无条件写 _phase='battle' 并清掉 _netWaitRound —— 我明明已经在
+    // 轮结果页等着，会被拽回对局画面，然后再也回不去（回轮结果页的两条路
+    // 都要求特定阶段）。一轮 4 桌，任意一桌平局就发生一次，所以很常见。
+    //
+    // 服务器现在在 extra 里带 btId（事件属于哪一桌），每份状态里带 myBtId
+    // （我那桌）。两者都有且不等，就是别人桌的事，只更新公共信息后返回。
+    //
+    // 注意 startRound 推的那份 fresh 是**全场**的（新一轮开始），它不带 btId ——
+    // 所以这里必须判 `m.btId !== undefined`，不能只看不等。
+    if (m.btId !== undefined && m.myBtId !== undefined && m.btId !== m.myBtId) {
+        // 排名、血量、还在打的人这些公共信息已经在上面更新过了（buildReplica），
+        // 刷新一下让轮结果页的「还有 N 桌」跟着变，别动阶段。
+        this.refresh();
+        return;
+    }
 
     // 新一局 / 平局重发：放发牌演出
     if (m.fresh) {
@@ -1237,20 +1272,13 @@ Scene_D678.prototype.netApply = function (m) {
     //
     // 已经落定的阶段一律不动，只有真在牌桌上（battle）或还没开局（netwait）
     // 才跟着服务器走。
-    if (this.netPhaseSettled()) {
-        // 唯一允许的越级：我已经收尾完（轮结果 / 等对方弃牌），服务器说本轮
-        // 还没结束 —— 切到轮次等待屏。放在守卫里面是因为守卫会提前 return，
-        // 而这个转换恰恰要靠「后来的那几份状态」触发（我弃完牌那一刻，
-        // 别人可能还在打）。
-        this.netToWaitRoundIfNeeded();
-        this.refresh();
-        return;
-    }
+    // 已经落定的阶段一律不动，只刷新（提示语里的「还有 N 人在对局」要跟着变）。
+    if (this.netPhaseSettled()) { this.refresh(); return; }
 
     if (first || m.resync) {
-        // 重连回来正好赶上「我这桌完了、别人还在打」：直接落到等待屏，
+        // 重连回来正好赶上「我这桌完了、别人还在打」：落到轮结果页，
         // 别把人塞回一个已经结束的牌桌
-        this._phase = this._netWaitRound ? 'netwaitround' : 'battle';
+        this._phase = this._netWaitRound ? 'roundResult' : 'battle';
         this._wait = 0;
         this.refresh();
         return;
@@ -1266,7 +1294,7 @@ Scene_D678.prototype.netApply = function (m) {
 Scene_D678.prototype.netPhaseSettled = function () {
     var ph = this._phase;
     return ph === 'roundResult' || ph === 'resolve' || ph === 'tie' ||
-           ph === 'netwaitround' || ph === 'netover' || ph === 'gameover';
+           ph === 'netover' || ph === 'gameover';
 };
 
 // 在发牌前 / 发牌后两份手牌之间切换（只影响显示）
@@ -1499,11 +1527,9 @@ Scene_D678.prototype.netFinish = function () {
     // 就是「刚摸了 2 张，手上还是 6 张」，以为奖励没发。
     // 放在 netUsePre(false) 之后是必须的：那一步刚把手牌切成发牌后的真实状态。
     this.netNoticeAutoDiscard();
+    // 锦标赛里打完了本轮没结束的话，就一直待在这个页面等服务器推下一轮
+    // （提示语会写「其他玩家还在对局」）—— 不另切页面，你定的。
     this.netToRoundResult();
-    // 锦标赛：我这桌打完了但本轮没结束 —— 停在「第 N 轮」等待屏，
-    // 等所有人打完（你定的）。先走完 netToRoundResult 是故意的：
-    // 它把 _lastLog / _battleKeep / _report 都备好了，点开排名和对战日志才有东西看。
-    this.netToWaitRoundIfNeeded();
 };
 
 // 报「超过 6 张，已随机弃掉 XX、YY」。只报一次，报完清掉。
@@ -1516,20 +1542,11 @@ Scene_D678.prototype.netNoticeAutoDiscard = function () {
     this.pushMsg('功能牌超过 ' + D678.MAX_FUNC + ' 张，已随机弃掉：' + names.join('、'));
 };
 
-// 切轮次等待屏。只从「自己这场已经收尾」的阶段切。
-Scene_D678.prototype.netToWaitRoundIfNeeded = function () {
-    if (!this._netWaitRound) return;
-    if (this._phase !== 'roundResult') return;
-    this._netBye = false;
-    // netDrawWaitRound 走的是「自己清屏自己画」那条路（refresh 里提前 return），
-    // 不会调 refreshCards —— 所以牌精灵得在这儿先收掉。
-    // 从 roundResult 过来时 _battle 已经是 null（netToRoundResult 清过）。
-    if (this._battle) { this._battleKeep = this._battle; this._battle = null; }
-    this.refreshCards();
-    this._phase = 'netwaitround';
-    this._notice = '';
-    this.refresh();
-};
+// 这里原来有 netToWaitRoundIfNeeded：切到一个自己画的「第 N 轮」等待屏。
+// 按你定的改成**复用轮结果页**（就是单机那个带对战记录的页面），
+// 只在上方多一行「其他玩家还在对局」并在报表里列出还在打的人 ——
+// 所以不再需要切阶段，roundResult 一直待着就行，等服务器推下一轮。
+// 那个独立页面和 netDrawWaitRound 一起删了。
 
 Scene_D678.prototype.netToRoundResult = function () {
     this._lastLog = this._netLog ? this._netLog.slice(0) : null;
@@ -1546,26 +1563,6 @@ Scene_D678.prototype.netToRoundResult = function () {
 // 这里原来包了 onDiscardConfirm（把手动挑好的牌 POST 给 /api/discard）。
 // 多人模式改成服务器随机弃之后，联机根本走不到弃牌界面，那个包装和
 // /api/discard 一起删了。单机的 onDiscardConfirm 原样保留，没被碰过。
-
-//--- 本日完局 / 冠军次数（只统计单机，你定的）------------------------------
-//
-// checkGameEnd 恰好只有两个出口：被淘汰（不 alive）和最后幸存者（alive）。
-// 两者都算「完局」，后者额外算「冠军」—— 和你说的「冠军同时也会在完局
-// 次数那里增加」一致。
-//
-// 联机不报：锦标赛和单人对决打完不计入完局（你定的）。
-var _cge = Scene_D678.prototype.checkGameEnd;
-Scene_D678.prototype.checkGameEnd = function () {
-    var ended = _cge.call(this);
-    if (!ended || this._net || this._dailyReported) return ended;
-    // checkGameEnd 一局里可能被调到两次（beginRound 和结算各一次），
-    // 而它是幂等的 —— 计数可不是，所以自己上一道锁
-    this._dailyReported = true;
-    var champ = !!(D678.Game && D678.Game.human().alive);
-    D678N.dailyBump('finish');
-    if (champ) D678N.dailyBump('champ');
-    return ended;
-};
 
 //--- 对手回合：等，不跑 AI -------------------------------------------------
 
@@ -1687,10 +1684,31 @@ Scene_D678.prototype.updateInput = function () {
     _ui.call(this);
 };
 
-// 联机下由服务器判定结束（over 消息），这里不本地判
+// 联机下由服务器判定结束（over 消息），这里不本地判。
+//
+// 单机分支里顺便记「本日完局 / 冠军次数」（只统计单机，你定的）——
+// checkGameEnd 恰好只有两个出口：被淘汰（不 alive）和最后幸存者（alive），
+// 两者都算完局，后者额外算冠军。
+//
+// 【别再给 checkGameEnd 单独包一层】这个 IIFE 里 var 是函数作用域的，
+// 再写一个 `var _cge` 就是同一个变量：后包的那层会把 _cge 覆盖成先包的那层，
+// 于是 _cge.call(this) 调回自己，无限递归。单机进对局就爆栈，
+// 而联机分支不走 _cge 所以一点症状都没有（烟测只构造联机场景，全绿）。
+// 要加东西就往这个函数里加。
 var _cge = Scene_D678.prototype.checkGameEnd;
 Scene_D678.prototype.checkGameEnd = function () {
-    if (!this._net) return _cge.call(this);
+    if (!this._net) {
+        var ended = _cge.call(this);
+        // 一局里会被调到两次（beginRound 和结算各一次），原函数是幂等的，
+        // 计数可不是 —— 所以自己上一道锁
+        if (ended && !this._dailyReported) {
+            this._dailyReported = true;
+            var champ = !!(D678.Game && D678.Game.human().alive);
+            D678N.dailyBump('finish');
+            if (champ) D678N.dailyBump('champ');
+        }
+        return ended;
+    }
     return this._phase === 'gameover' || this._phase === 'netover';
 };
 
@@ -1792,55 +1810,21 @@ Scene_D678.prototype.refresh = function () {
         return;
     }
 
-    // 锦标赛：本轮轮空、或者我这桌打完了在等最慢那一桌。678.js 的 refresh
-    // 按 _phase 分发，认不得这个阶段，所以自己画。
-    //
-    // 轮空时服务器压根不发牌面；我这桌打完那种情况牌面照发（pushStateT 故意
-    // 不过滤 done 的桌，弃牌界面和揭牌演出都要靠它），是 netToWaitRoundIfNeeded
-    // 把 _battle 收掉后切进来的。
-    if (this._phase === 'netwaitround') { this.netDrawWaitRound(); return; }
-
     _rf.call(this);
     this.netDrawOverlay();
 };
 
-// 轮次等待屏。轮次屏障是设计决定（每轮所有人都打过一场），代价就是打完的人
-// 要等最慢那一桌 —— 所以这里必须说清在等什么，不然像卡住了。
-Scene_D678.prototype.netDrawWaitRound = function () {
-    var bmp = this._uiBmp, W = NLY.SW;
-    bmp.clear();
-    if (this._ovBmp) this._ovBmp.clear();
-    this._hits = [];
-
-    if (this._showList) { this.drawRankList(); return; }
-
+// 还在对局的其他玩家（锦标赛，轮结果页用）。
+// 服务器每个玩家都带 inBattle，buildReplica 接了下来。
+// 排除自己 —— 我已经在看轮结果页了，把自己列进「还在对局」很怪。
+Scene_D678.prototype.netStillPlaying = function () {
     var g = D678.Game;
-    this.txt(bmp, '第 ' + (g ? g.round : 1) + ' 轮', 0, 200, W, 34, LC.gold, 'center');
-    this.txt(bmp, this._netBye ? '本轮轮空' : '你这桌打完了',
-        0, 260, W, 30, LC.text, 'center');
-
-    // 自己这一轮的胜负。切到这屏是跳过了轮结果画面的，不写这一行等于把
-    // 「我刚才赢没赢」吞掉了 —— 演出看完就只剩一句「你这桌打完了」。
-    // last 由 netSetLast 从结算结果反填；平局不设 last（和单机一致）。
-    var me = g ? g.human() : null;
-    if (!this._netBye && me && me.last) {
-        var won = (me.last.type === 'win');
-        this.txt(bmp, won ? '你赢了这一场' : '你输了这一场，-' + me.last.dmg + ' HP',
-            0, 296, W, 22, won ? LC.green : LC.red, 'center');
+    if (!g || !g.players) return [];
+    var out = [];
+    for (var i = 1; i < g.players.length; i++) {
+        if (g.players[i].inBattle) out.push(g.players[i].name);
     }
-
-    var n = this._netBusyTables || 0;
-    this.txt(bmp, n > 0
-        ? '其他玩家还在对局，还有 ' + n + ' 桌在打'
-        : '正在开下一轮…', 0, 336, W, 22, LC.gray, 'center');
-    if (g) {
-        this.txt(bmp, '场上还有 ' + g.alivePlayers().length + ' 人',
-            0, 372, W, 20, LC.gray, 'center');
-    }
-
-    this.txt(bmp, '点击任意处查看全场排名', 0, 440, W, 20, LC.gray, 'center');
-    this._hits.push({ x: 0, y: 0, w: W, h: NLY.SH,
-        cb: this.onToggleList.bind(this) });
+    return out;
 };
 
 Scene_D678.prototype.netDrawOverlay = function () {
@@ -1894,7 +1878,17 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 「对方已确认」，两边有区分。
     if (this._phase === 'roundResult' && !this._showList) {
         var msg, col;
-        if (this._netWaitAck) { msg = '正在开启下一局';   col = LC.gold; }
+        if (this._netWaitRound) {
+            // 锦标赛里我这桌打完了、本轮还没结束。
+            //
+            // 【这里绝不能写「点击继续」】锦标赛推进靠轮次屏障，/api/ack 只认
+            // room.phase==='resolved'，而锦标赛整轮停在 'battle' —— 点了是个
+            // 空响应，什么都不会发生。原来那行字是假的按钮。
+            var n = this._netBusyTables || 0;
+            msg = n > 0 ? '其他玩家还在对局（还有 ' + n + ' 桌）'
+                        : '本轮已结束，正在开下一轮…';
+            col = LC.gray;
+        } else if (this._netWaitAck) { msg = '正在开启下一局';   col = LC.gold; }
         else if (this._netAdvancing) { msg = '对方已确认'; col = LC.green; }
         else { msg = '点击任意位置继续';   col = LC.white; }
         // 不画背景框 —— 原来那个框（y=1070–1116）会压住 678.js:1492 那行
@@ -2024,8 +2018,12 @@ Scene_Title.prototype.start = function () {
 // 【为什么单独一个精灵】title.js 的 _btnBmp 有 _btnCache 这道「没变化就不重画」
 // 的优化，往里画会被它的缓存判断吃掉（按钮状态没变就整块不刷）。
 // 单独一层还能保证不挡按钮的点击区。
+var DAILY_X = 24;          // 靠左（你定的），留一点边距别贴着屏幕边
 var DAILY_Y = 26;          // 顶部留白里，封面图上方那条空带
 var DAILY_LH = 30;         // 行高
+// 「本日游玩次数：」7 个字 × 22 号字，量出来约 154，给到 168 留点余量。
+// 三行标签字数相同，所以数字会自然对齐成一列。
+var DAILY_LABEL_W = 168;
 
 var _stCreate = Scene_Title.prototype.create;
 Scene_Title.prototype.create = function () {
@@ -2072,15 +2070,18 @@ Scene_Title.prototype.drawDailyCounts = function () {
         ['本日完局次数', d.finishes, '#ffffff'],
         ['本日冠军次数', d.champs,   '#5cff9d'],
     ];
+    // 整块靠左（你定的）。标签左对齐顶着 DAILY_X，数字紧跟在标签之后 ——
+    // 标签都是 6 个字等宽，所以数字自然也对齐成一列，不用量宽度。
     for (var i = 0; i < rows.length; i++) {
         var y = DAILY_Y + i * DAILY_LH;
         bmp.fontSize = 22;
         bmp.outlineColor = 'rgba(0,0,0,0.85)';
         bmp.outlineWidth = 5;
         bmp.textColor = '#b9c8c0';
-        bmp.drawText(rows[i][0] + '：', 0, y, Graphics.width / 2 + 40, 26, 'right');
+        bmp.drawText(rows[i][0] + '：', DAILY_X, y, DAILY_LABEL_W, 26, 'left');
         bmp.textColor = rows[i][2];
-        bmp.drawText(String(rows[i][1]), Graphics.width / 2 + 46, y, 200, 26, 'left');
+        bmp.drawText(String(rows[i][1]),
+            DAILY_X + DAILY_LABEL_W, y, 120, 26, 'left');
     }
 };
 

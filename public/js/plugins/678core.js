@@ -673,6 +673,10 @@ D678_Battle.prototype.doResolve = function () {
 
     if (win < 0) {
         info.tie = true;
+        // 这是本次拼点的第几次平局。redeals 是「已经重发过几次」，
+        // 此刻还没为这次平局自增（自增发生在 newDeal 之前），所以 +1。
+        // 拼点画面显示「平局✖N」用这个，客户端不用自己去推该不该加一。
+        info.tieCount = (this.redeals || 0) + 1;
         this.result = info;
         this.pendingRedeal = true;
         return info;
@@ -685,14 +689,26 @@ D678_Battle.prototype.doResolve = function () {
     if (m0) this.players[0].maxPoint++;
     if (m1) this.players[1].maxPoint++;
 
-    // 伤害 = 1（底伤） + 累计败场数（不因胜利重置） + 败方爆牌 1 + 胜方满点 1
-    // 例：此前已败 5 次，本局对方满点、自己爆牌 -> 1 + 5 + 1 + 1 = 8
+    // 伤害 = 1（底伤） + 本次拼点的平局次数 + 累计败场数（不因胜利重置）
+    //        + 败方爆牌 1 + 胜方满点 1
+    // 例：此前已败 5 次，本局平过 2 次、对方满点、自己爆牌
+    //     -> 1 + 2 + 5 + 1 + 1 = 10
+    //
+    // 【平局加伤】每平一次，这一场的底伤 +1（你定的）：干净一局输是 -1，
+    // 平过一次再输就是 -2，以此类推。redeals 是本次拼点已经重发过几次，
+    // 也就是已经平了几次 —— 新 Battle 会归零，所以惩罚只在这一场里累积。
+    // 单机、1v1、锦标赛共用这一份规则，AI 的估值（AI.resolveUtil）也跟着加。
     var items = 1;
     if (info.busts[lose]) items++;
     if (info.maxes[win]) items++;
-    var dmg = items + L.losses;
+    var tieBonus = this.redeals || 0;
+    var dmg = items + L.losses + tieBonus;
     info.dmg = dmg;
     info.items = items;
+    info.tieBonus = tieBonus;
+    // 分出胜负这一帧也要显示平局次数（解释伤害是怎么来的）。
+    // 平局那一帧走上面的分支，两边都叫 tieCount，客户端一视同仁。
+    info.tieCount = tieBonus;
     info.prevLosses = L.losses;
 
     W.wins++;
@@ -857,16 +873,20 @@ D678.AI.resolveUtil = function (b, si, mt, ot) {
     }
     if (win === 0) return 0;                    // 平局重发，视为中性
     var meP = b.sides[si].p, opP = b.sides[1 - si].p;
+    // 平局加伤：本次拼点每平一次，底伤 +1（doResolve 里的 tieBonus）。
+    // 这里必须跟着加 —— 不加的话平过几次之后 AI 会低估赌注，
+    // 该保守的时候还在赌爆牌。
+    var tieBonus = b.redeals || 0;
     var items, dmg, v;
     if (win > 0) {
         items = 1 + (bo ? 1 : 0) + (mm ? 1 : 0);
-        dmg = items + (opP.losses || 0);         // 伤害吃对手的累计败场数
+        dmg = items + (opP.losses || 0) + tieBonus;   // 吃对手累计败场 + 平局加伤
         v = dmg;
         if ((opP.hp || 0) - dmg <= 0) v += this.HP_KILL;
         return v;
     }
     items = 1 + (bm ? 1 : 0) + (mo ? 1 : 0);
-    dmg = items + (meP.losses || 0);             // 我方败场越多，再输一次越痛
+    dmg = items + (meP.losses || 0) + tieBonus;  // 我方败场越多、平局越多，再输一次越痛
     // 败者摸 2 张、胜者摸 1 张，只补差额；必须远小于伤害，否则会“乐于输牌”
     v = -dmg + this.FUNC_VAL;
     if ((meP.hp || 0) - dmg <= 0) v -= this.HP_DIE;

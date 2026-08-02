@@ -40,6 +40,12 @@
  *  双方爆牌：平局，立即重新发牌（不比谁更接近目标点数）。
  *  双方未爆且同点：平局，立即重新发牌。
  *
+ *  伤害 = 1（底伤）+ 本场平局次数 + 败方累计败场数 + 败方爆牌 1 + 胜方满点 1
+ *
+ *  【平局加伤】每平一次，这一场的底伤 +1：干净一局输是 -1，平过一次再输 -2，
+ *  平两次 -3，以此类推。惩罚只在这一场（同一次拼点）里累积，新的一场归零。
+ *  拼点画面显示「平局✖N」。单机、1v1、锦标赛共用这一份规则。
+ *
  * ============================================================================
  * 功能牌的发放与弃牌
  * ============================================================================
@@ -537,7 +543,16 @@ Scene_D678.prototype.unseenForPlayer = function (b) {
 Scene_D678.prototype.drawFuncHand = function (b) {
     var bmp = this._uiBmp;
     var me = D678.Game.human();
-    this.txt(bmp, '功能牌 ' + me.funcs.length + '/' + D678.MAX_FUNC, 20, 846, 300, 20, COL.gray);
+    // 多人模式超过上限是服务器当场随机弃掉多余的（不像单机让玩家自己挑），
+    // 所以这条规则要写在界面上 —— 只在结算后弹一句「已随机弃掉 XX」的话，
+    // 玩家攒到 5、6 张时没有预期，突然少两张。
+    //
+    // 【必须按 _net 分】这个函数单机联机共用，而这条规则只对联机成立。
+    // 不分的话单机也会显示「自动丢弃」，那是假的（单机是手动挑）。
+    // 宽度从 300 放到 640 才装得下这一整行。
+    var cap = '功能牌 ' + me.funcs.length + '/' + D678.MAX_FUNC;
+    if (this._net) cap += '（超过 ' + D678.MAX_FUNC + ' 张自动随机丢弃）';
+    this.txt(bmp, cap, 20, 846, 640, 18, COL.gray);
     this.syncFuncSprites(me.funcs, 20, LY.FUNC_Y);
     var span = Math.min(LY.FCARD_W + 24, Math.floor(680 / Math.max(me.funcs.length, 1)));
     for (var i = 0; i < me.funcs.length; i++) {
@@ -664,9 +679,21 @@ Scene_D678.prototype.drawShowdown = function () {
     this.txt(bmp, '我', 60, 512, 600, 24, COL.gray, 'center');
     this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542);
 
-    // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）
+    // 平局次数（你定的）：第一次平局显示「平局✖1」，第二次「平局✖2」，以此类推。
+    //
+    // 平局那一帧和分出胜负那一帧都显示 —— 后者是为了解释伤害是怎么来的
+    // （平一次底伤就 +1，不写这行的话玩家只看到「-3」不知道多的两点从哪来）。
+    // tieCount 由 doResolve 算好（平局帧是 redeals+1，胜负帧是 redeals），
+    // 客户端不用自己判该不该加一。
+    var tc = r.tieCount || 0;
+    if (tc > 0) {
+        this.txt(bmp, '平局✖' + tc, 60, 592, 600, 26, COL.blue, 'center');
+    }
     if (r.tie) {
-        this.txt(bmp, '重新发牌', 60, 622, 600, 26, COL.gray, 'center');
+        // 平局重发时把「下一局起底伤变多少」直接写出来 —— 惩罚是累积的，
+        // 不说清楚玩家不会意识到再平下去越来越贵
+        this.txt(bmp, '重新发牌　本场失败生命值惩罚 -' + (tc + 1),
+            60, 622, 600, 26, COL.gray, 'center');
     }
 };
 
@@ -1603,9 +1630,34 @@ Scene_D678.prototype.refresh = function () {
         } else {
             this.drawReport(rows, 66, 340, 42);
         }
+        // 锦标赛：我这桌打完了、本轮还没结束时，在框上方点明在等什么，
+        // 并在报表下面列出还在打的人（你定的，复用这个页面不另做）。
+        // 只有联机锦标赛有这两行 —— 单机和 1v1 的 netStillPlaying 返回空。
+        if (this._net && this._netWaitRound && this.netStillPlaying) {
+            this.txt(bmp, '其他玩家还在对局', 0, 238, LY.SW, 24, COL.gold, 'center');
+            var still = this.netStillPlaying();
+            if (still.length) {
+                this.txt(bmp, '对局中：', 66, 400, 120, 20, COL.gray);
+                // 名字最长 16 显示宽度 × 最多 7 人，一行放不下，按两行折
+                var half = Math.ceil(still.length / 2);
+                this.txt(bmp, still.slice(0, half).join('、'),
+                    170, 400, 470, 20, COL.aqua);
+                if (still.length > half) {
+                    this.txt(bmp, still.slice(half).join('、'),
+                        170, 424, 470, 20, COL.aqua);
+                }
+            }
+        }
         this.drawBattleLog();
         var over = (this._phase === 'gameover');
-        this.txt(bmp, this._notice || (over ? '' : '点击继续'), 0, 1066, LY.SW, 24, COL.gold, 'center');
+        // 【联机的轮结果页整行让位】678net.js 的 netDrawOverlay 在 y=1070 画
+        // 自己那句（「点击任意位置继续」/「其他玩家还在对局（还有 N 桌）」…），
+        // 这行在 y=1066 —— 两行 24 号字差 4 像素、画在同一张 bitmap 上，
+        // 会叠成一团。单机和联机的其他阶段照旧。
+        if (!(this._net && this._phase === 'roundResult')) {
+            this.txt(bmp, this._notice || (over ? '' : '点击继续'),
+                0, 1066, LY.SW, 24, COL.gold, 'center');
+        }
         if (!over) {
             this.txt(bmp, '点击上方血条查看全体排名与统计', 0, 1100, LY.SW, 20, COL.gray, 'center');
         } else {

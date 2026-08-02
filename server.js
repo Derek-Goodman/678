@@ -423,6 +423,9 @@ function maskView(b, me, snapPre) {
             winner: r.tie ? -1 : (r.winner === me ? 0 : 1),
             tie: !!r.tie,
             dmg: r.dmg || 0, items: r.items || 0, target: r.target,
+            // 平局次数 / 平局加伤（拼点画面显示「平局✖N」，你定的）。
+            // 双方对称的公开信息，不需要镜像。
+            tieCount: r.tieCount || 0, tieBonus: r.tieBonus || 0,
             winnerName: r.winnerP ? r.winnerP.name : '',
             loserName:  r.loserP  ? r.loserP.name  : '',
         };
@@ -537,6 +540,8 @@ function maskViewT(room, bt, seat, snapPre) {
                 winner: r.tie ? -1 : (r.winner === meSide ? 0 : 1),
                 tie: !!r.tie,
                 dmg: r.dmg || 0, items: r.items || 0, target: r.target,
+                // 平局次数 / 平局加伤，和 1v1 那边同一份（拼点画面用）
+                tieCount: r.tieCount || 0, tieBonus: r.tieBonus || 0,
                 winnerName: r.winnerP ? r.winnerP.name : '',
                 loserName:  r.loserP  ? r.loserP.name  : '',
             };
@@ -887,6 +892,9 @@ function pushStateT(room, extra) {
         sendTo(seat, 'state', Object.assign({
             seq: room.seq,
             mode: 'tourney',
+            // 我那桌的编号。extra 里的 btId 是「这次事件属于哪一桌」，
+            // 两者不等就说明这份 fresh / resolved 是别人桌的，客户端要忽略。
+            myBtId: bt ? bt.id : -1,
             resolveId: bt ? bt.resolveId : 0,
             phase: room.phase,
             round: room.game ? room.game.round : 1,
@@ -1216,7 +1224,14 @@ function resolveTable(room, bt, isTie) {
     if (isTie) {
         // 平局：这一桌重发再打，其他桌跟着等（你定的）。
         // 不要求任何人点确认 —— 一个人挂机不该卡住全场 8 个人。
-        pushStateT(room, { resolved: true, tie: true });
+        //
+        // 【必须带 btId】pushStateT 的 extra 是 Object.assign 合并进**每一个**
+        // 座位的消息的，所以 fresh / resolved / tie 会广播给全场 8 个人。
+        // 不标明是哪一桌的话，别人桌平局重发会把我从轮结果页拽回对局画面
+        // （客户端 m.fresh 分支无条件写 _phase='battle'），而回轮结果页的两条
+        // 路都要求特定阶段 —— 于是一直钉在对局界面，直到本轮结束。
+        // 一轮 4 桌，任意一桌平局就会发生一次，所以这个很常见。
+        pushStateT(room, { resolved: true, tie: true, btId: bt.id });
         setTimeout(() => {
             if (bt.done || room.phase !== 'battle') return;
             withRoom(room, () => {
@@ -1228,7 +1243,7 @@ function resolveTable(room, bt, isTie) {
             bt.turnStartAt = 0;
             bt.turnGoneDeadline = 0;
             armTurnTimerT(room, bt);
-            pushStateT(room, { fresh: true, redealt: true });
+            pushStateT(room, { fresh: true, redealt: true, btId: bt.id });
             stepAIIfNeeded(room, bt);
         }, CFG.advanceMs);
         return;
@@ -1262,7 +1277,8 @@ function resolveTable(room, bt, isTie) {
 
     bt.done = true;
     // 不再有「欠弃牌」这回事：上面已经随机弃完了，轮次屏障也就不用等它。
-    pushStateT(room, { resolved: true, tie: false });
+    // btId 见上面平局分支的注释 —— 客户端靠它判掉别人桌的结算。
+    pushStateT(room, { resolved: true, tie: false, btId: bt.id });
     checkRoundBarrier(room);
 }
 
