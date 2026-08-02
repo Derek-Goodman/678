@@ -151,7 +151,13 @@ D678N.Net = {
 // 本来就是帧驱动的，这样最省心，也不会丢消息。
 D678N.inbox = {
     room:   null,    // 最新房间状态
-    state:  null,    // 最新盘面
+    // 【必须是队列，不能只留最新一份】盘面里带着 fresh / resolved 这类
+    // **一次性事件标记**，而服务器常常在几毫秒内连推好几份：
+    // 实测录到过 `fresh` 在 5888ms、后面两份普通状态在 5893ms —— 相差 5 毫秒，
+    // 落在同一帧（16.7ms）里。只留最新一份的话那个 fresh 在进 netApply 之前
+    // 就被覆盖掉了，客户端永远不知道新一轮开始了，于是**卡在上一轮的画面上**。
+    // 这就是「一桌还没打完、另一桌打完了却停在牌局界面」的根因。
+    states: [],      // 盘面队列，按到达顺序
     events: [],      // 对手动作文字，按顺序
     over:   null,    // 决斗结束 / 锦标赛结束
     abort:  null,    // 房间被终止
@@ -160,9 +166,13 @@ D678N.inbox = {
     netdown: false,  // 连接断了
 };
 
+// 队列上限。正常一帧最多来几份，堆到这个数说明场景没在消费
+// （切场景的空档），丢最老的那些普通状态 —— 但**带事件标记的一份都不丢**。
+D678N.INBOX_MAX = 120;
+
 D678N.clearInbox = function () {
     var b = D678N.inbox;
-    b.room = null; b.state = null; b.events = [];
+    b.room = null; b.states = []; b.events = [];
     b.over = null; b.abort = null; b.peer = null; b.elim = null;
     b.netdown = false;
 };
@@ -171,7 +181,17 @@ D678N.Net.emit = function (type, data) {
     var b = D678N.inbox;
     switch (type) {
     case 'room':    b.room = data; break;
-    case 'state':   b.state = data; break;
+    case 'state':
+        b.states.push(data);
+        if (b.states.length > D678N.INBOX_MAX) {
+            // 超限就丢最老的普通状态（不带 fresh / resolved 的那些）。
+            // 一个都没得丢才丢队首 —— 那种情况下已经积压严重，保新不保旧。
+            var k = b.states.findIndex(function (m) {
+                return !m.fresh && !m.resolved;
+            });
+            b.states.splice(k >= 0 ? k : 0, 1);
+        }
+        break;
     case 'event':   b.events.push(data.msg); if (b.events.length > 8) b.events.shift(); break;
     case 'over':    b.over = data; break;
     case 'abort':   b.abort = data; break;
@@ -913,10 +933,10 @@ Scene_D678Net.prototype.pollNet = function () {
         this.refresh();
     }
 
-    // 第一份盘面到了就进对局场景（盘面留在 inbox 里，由那边取用）。
+    // 第一份盘面到了就进对局场景（盘面**留在队列里**，由那边取用）。
     // 淘汰后不再进 —— 服务器本来就不给已淘汰的座位推盘面（pushStateT 跳过
     // left 的人），这里是第二道锁。
-    if (b.state && !this._leaving &&
+    if (b.states.length && !this._leaving &&
         this._page !== 'elim' && this._page !== 'ranks') {
         this._leaving = true;
         D678N.mode = 'duel';
@@ -1012,7 +1032,7 @@ Scene_D678Net.prototype.onMatch = function () {
 };
 
 // 准备 / 取消准备。全员就绪且 ≥2 人时服务器立刻开赛，这边不用判 ——
-// 开赛的信号是第一份盘面到达（pollNet 里那条 b.state）。
+// 开赛的信号是第一份盘面到达（pollNet 里那条 b.states）。
 Scene_D678Net.prototype.onReady = function () {
     if (!D678N.Net.sid) return;
     var self = this;
@@ -1558,10 +1578,21 @@ Scene_D678.prototype.netPoll = function () {
         this.refresh();
     }
 
-    if (b.state) {
-        var m = b.state;
-        b.state = null;
-        this.netApply(m);
+    // 【队列要一份一份排完，不能只取最新那份】
+    //
+    // 盘面里带着 fresh / resolved 这类一次性事件标记，而服务器常在同一帧内
+    // 连推好几份（实测 fresh 和后面两份普通状态只差 5 毫秒）。只取最新的话
+    // 那个标记就丢了，客户端不知道新一轮开始，卡在上一轮的画面上。
+    //
+    // 一帧里排完好几份是安全的：
+    //   · 结算 -> netApply 起展示保护期，后面那几份被压进 _netPending，不会
+    //     把演出打断
+    //   · 同一次结算重复推 -> resolveId 那道判断挡住，不重播演出
+    //   · 都是普通状态 -> 最后一份决定画面，中间几份只是白算一遍
+    if (b.states.length) {
+        var q = b.states;
+        b.states = [];
+        for (var si = 0; si < q.length; si++) this.netApply(q[si]);
     }
 
     // over 必须在 elim 之前判：服务器在同一个 tick 里先发 eliminated
