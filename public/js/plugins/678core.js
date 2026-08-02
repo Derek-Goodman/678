@@ -162,6 +162,11 @@ function D678_Player(id, name, isHuman) {
     this.last     = null;   // {type:'win'|'lose'|'bye'|'tie', dmg:n, vs:name}
     this.outAt    = 0;      // 淘汰顺序（0=存活，1=第一个被淘汰）
     this.isGod    = (name === D678.GOD_NAME);
+    // 对每个对手的战绩：{ 对手id: {name, wins, losses} }。
+    // 淘汰页要列「VS B 对局 3 场，胜率 33%」，而 game.pairedLog 只记
+    // 「这两个人打过没有」（配对用），不记胜负 —— 所以单独存一份。
+    // 平局不计入（重新发牌，和 wins/losses 的口径一致）。
+    this.vsLog    = {};
 }
 D678.Player = D678_Player;
 
@@ -713,6 +718,10 @@ D678_Battle.prototype.doResolve = function () {
 
     W.wins++;
     L.losses++;
+    // 对手战绩（淘汰页的「VS B 对局 N 场，胜率 X%」）。
+    // 单机联机共用这一份 —— 联机时服务器跑的就是这个函数。
+    D678.noteVs(W, L, true);
+    D678.noteVs(L, W, false);
     L.loseHp(dmg);
     W.last = { type: 'win',  dmg: 0,   vs: L.name };
     L.last = { type: 'lose', dmg: dmg, vs: W.name };
@@ -1571,6 +1580,17 @@ D678.simulateMatch = function (pA, pB) {
     // AI 超过 6 张自动弃掉价值最低的（对 AI 而言的暂停选择）
     need.forEach(function (p) { D678.autoDiscard(p); });
     return b.result;
+};
+
+// 记一场对手战绩。me 对 op 赢了没有 -> me.vsLog[op.id] 累加。
+// 名字一起存下来 —— 淘汰页只拿到这一份数据，没有 players 数组可查名字。
+D678.noteVs = function (me, op, won) {
+    if (!me || !op) return;
+    if (!me.vsLog) me.vsLog = {};
+    var e = me.vsLog[op.id];
+    if (!e) { e = me.vsLog[op.id] = { name: op.name, wins: 0, losses: 0 }; }
+    e.name = op.name;               // 改过名的话跟着更新
+    if (won) e.wins++; else e.losses++;
 };
 
 // 随机弃掉超出上限的功能牌，返回被弃掉的 id 数组（给界面报「弃了哪几张」用）。

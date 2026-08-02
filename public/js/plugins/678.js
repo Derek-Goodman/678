@@ -551,7 +551,9 @@ Scene_D678.prototype.drawFuncHand = function (b) {
     // 不分的话单机也会显示「自动丢弃」，那是假的（单机是手动挑）。
     // 宽度从 300 放到 640 才装得下这一整行。
     var cap = '功能牌 ' + me.funcs.length + '/' + D678.MAX_FUNC;
-    if (this._net) cap += '（超过 ' + D678.MAX_FUNC + ' 张自动随机丢弃）';
+    if (this._net) {
+        cap += '（多人模式下超过 ' + D678.MAX_FUNC + ' 张自动随机丢弃）';
+    }
     this.txt(bmp, cap, 20, 846, 640, 18, COL.gray);
     this.syncFuncSprites(me.funcs, 20, LY.FUNC_Y);
     var span = Math.min(LY.FCARD_W + 24, Math.floor(680 / Math.max(me.funcs.length, 1)));
@@ -668,9 +670,11 @@ Scene_D678.prototype.drawShowdown = function () {
     this.txt(bmp, opp.name, 60, 318, 600, 24, COL.gray, 'center');
     this.drawShowdownTotal(t1, r.busts[1], r.maxes[1], 348);
 
-    // 中间大字：以我方为准写“胜 / 负”，胜为红色、负为绿色
+    // 中间大字：以我方为准写“胜 / 负”，胜为红色、负为绿色。
+    // 平局把次数直接写进这个大字里（「平局✖1」「平局✖2」…，你定的）——
+    // 平一次这一场的底伤就 +1，次数本身已经把代价说清了，不另加说明文字。
     var mid, midCol;
-    if (r.tie)               { mid = '平　局'; midCol = COL.blue; }
+    if (r.tie)               { mid = '平局✖' + (r.tieCount || 1); midCol = COL.blue; }
     else if (r.winner === 0) { mid = '胜';     midCol = COL.red; }
     else                     { mid = '负';     midCol = COL.green; }
     this.txt(bmp, mid, 60, 434, 600, 54, midCol, 'center');
@@ -679,21 +683,10 @@ Scene_D678.prototype.drawShowdown = function () {
     this.txt(bmp, '我', 60, 512, 600, 24, COL.gray, 'center');
     this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542);
 
-    // 平局次数（你定的）：第一次平局显示「平局✖1」，第二次「平局✖2」，以此类推。
-    //
-    // 平局那一帧和分出胜负那一帧都显示 —— 后者是为了解释伤害是怎么来的
-    // （平一次底伤就 +1，不写这行的话玩家只看到「-3」不知道多的两点从哪来）。
-    // tieCount 由 doResolve 算好（平局帧是 redeals+1，胜负帧是 redeals），
-    // 客户端不用自己判该不该加一。
-    var tc = r.tieCount || 0;
-    if (tc > 0) {
-        this.txt(bmp, '平局✖' + tc, 60, 592, 600, 26, COL.blue, 'center');
-    }
+    // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）。
+    // 平局次数写在上面那个中间大字里，这里不重复。
     if (r.tie) {
-        // 平局重发时把「下一局起底伤变多少」直接写出来 —— 惩罚是累积的，
-        // 不说清楚玩家不会意识到再平下去越来越贵
-        this.txt(bmp, '重新发牌　本场失败生命值惩罚 -' + (tc + 1),
-            60, 622, 600, 26, COL.gray, 'center');
+        this.txt(bmp, '重新发牌', 60, 622, 600, 26, COL.gray, 'center');
     }
 };
 

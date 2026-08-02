@@ -704,6 +704,29 @@ function removeSeat(room, seat) {
     log('房间 %s 座位 %d(%s) 离开大厅', room.code, seat.index, seat.name);
 }
 
+// 收掉一个座位的 SSE，并让它的 sid 失效。
+//
+// 用在「这个人跟这场赛事再也没关系了」的时刻（被淘汰）——
+// 位置还得留着（规则层要按 pIdx 找他、按 outAt 排名），
+// 但那条长连接没有任何用处了，挂着白占服务器资源（你定的）。
+//
+// 【必须先发完消息再调】关掉之后 sendTo 就是空操作了。
+//
+// bySid 一起删掉是为了：客户端的 EventSource 自带重连，不删的话它拿这个
+// 还有效的 sid 敲回来又会建一条新连接（onReconnect 还会把他当掉线归来）。
+// 删了之后 /api/events 认不出这个 sid，客户端那边会清掉会话回菜单 ——
+// 而客户端收到 eliminated 时也会自己 Net.reset()，两边都关，谁先谁后都行。
+function releaseSeatConn(room, seat) {
+    if (!seat) return;
+    clearTimeout(seat.graceTimer);
+    if (seat.sse) {
+        try { seat.sse.end(); } catch (e) { /* 对端已经断了就无所谓 */ }
+        seat.sse = null;
+    }
+    seat.connected = false;
+    bySid.delete(seat.sid);
+}
+
 function dropRoom(room, why) {
     clearTimeout(room.turnTimer);
     clearTimeout(room.ackTimer);
@@ -1088,7 +1111,6 @@ function armTurnTimerT(room, bt) {
     const seat = room.seats.find(s => s && s.pIdx === pIdx);
     const isAI = !room.game.players[pIdx].isHuman;
     const left = !!(seat && seat.left);
-    const gone = !!(seat && !seat.left && !seat.connected);
 
     // 离开的人：不等，立刻自动过牌（你定的）。AI 不用计时器，走 stepAIIfNeeded。
     if (left) {
@@ -1098,22 +1120,15 @@ function armTurnTimerT(room, bt) {
     }
     if (isAI) return;
 
-    const full = bt.turnStartAt + tsec * 1000;
-    let deadline;
-    if (!gone) {
-        deadline = full;
-        bt.turnGoneDeadline = 0;
-    } else {
-        deadline = Math.min(now + (CFG.goneTurnSec || tsec) * 1000, full);
-        if (bt.turnGoneDeadline && bt.turnGoneDeadline > now) {
-            deadline = Math.min(deadline, bt.turnGoneDeadline);
-        }
-        bt.turnGoneDeadline = deadline;
-    }
+    // 挂机降速，和 1v1 的 armTurnTimer 同一套（详见那边的注释）：
+    // 判据是「上个回合被自动判过牌」，不是「此刻掉线」——
+    // 掉线那个回合仍然给满 tsec，烧完判过牌之后下一个回合才降到 10 秒。
+    const short = !!(seat && seat.idled);
+    const sec = short ? (CFG.goneTurnSec || tsec) : tsec;
 
-    bt.turnDeadline = deadline;
-    bt.turnTimer = setTimeout(() => forceStand(room, bt, gone ? '掉线' : '超时'),
-        Math.max(0, deadline - now));
+    bt.turnDeadline = bt.turnStartAt + sec * 1000;
+    bt.turnTimer = setTimeout(() => forceStand(room, bt, short ? '挂机' : '超时'),
+        Math.max(0, bt.turnDeadline - now));
 }
 
 function forceStand(room, bt, why) {
@@ -1170,6 +1185,11 @@ function applyActionT(room, bt, side, action, forced) {
         return { ok: false, err: '当前不能行动' };
     }
     if (b.turn !== side) return { ok: false, err: '还没轮到你' };
+
+    // 挂机标记，和 1v1 同一套（见 applyAction 里的注释）。
+    // 锦标赛里 side 是「这一桌的 0/1」，得先换成座位。
+    const actorT = room.seats.find(s => s && s.pIdx === bt.pIdx[side]);
+    if (actorT) actorT.idled = !!forced;
 
     const turnBefore = b.turn;
     let msg = '', ok = true, err = '', failNote = '';
@@ -1303,13 +1323,17 @@ function checkRoundBarrier(room) {
         });
         outSeats.forEach(s => {
             const rank = rankOf(room, s.pIdx);
-            sendTo(s, 'eliminated', {
+            sendTo(s, 'eliminated', Object.assign({
                 rank: rank, total: room.game.players.length,
                 name: room.game.players[s.pIdx].name,
-            });
+            }, eliminatedStats(room, s.pIdx)));
             log('房间 %s %s 被淘汰（第 %d 名），踢回大厅', room.code,
                 room.game.players[s.pIdx].name, rank);
             s.left = true;   // 位置留着（规则层还要按 outAt 排名），但不再推盘面
+            // 出局了就跟这场赛事没关系了 —— 主动收掉这条 SSE，别让它一直挂着
+            // （你定的，减服务器压力）。战绩已经在上面那条消息里发全了，
+            // 关掉不会丢东西。
+            releaseSeatConn(room, s);
         });
 
         const aliveN = room.game.players.filter(p => p.alive).length;
@@ -1317,6 +1341,33 @@ function checkRoundBarrier(room) {
         if (aliveN <= 1 || humansLeft === 0) { enterOverT(room); return; }
         startRound(room);
     }, CFG.advanceMs);
+}
+
+// 淘汰页的战绩。口径和单机 buildFinalReport 完全一致（你定的「跟单人模式
+// 下失败一致」），外加对每个对手的分项战绩。
+//
+// 只发给**被淘汰的那个人自己**，所以不需要遮蔽 —— 他已经出局了，
+// 知道全场谁跟谁打了多少场不影响任何还在进行的对局。
+function eliminatedStats(room, pIdx) {
+    const p = room.game.players[pIdx];
+    const games = p.wins + p.losses;
+    const rate = (a, n) => (n > 0 ? Math.round(a / n * 100) : null);
+    // 对手战绩：按对局数从多到少排，同数按名字稳定排序，
+    // 免得每次进页面顺序都在跳
+    const vs = Object.keys(p.vsLog || {}).map(k => {
+        const e = p.vsLog[k];
+        const n = e.wins + e.losses;
+        return { name: e.name, games: n, wins: e.wins, losses: e.losses,
+                 rate: rate(e.wins, n) };
+    }).sort((a, b) => (b.games - a.games) || a.name.localeCompare(b.name));
+    return {
+        hp: Math.max(0, p.hp),
+        games: games, wins: p.wins, losses: p.losses,
+        winRate: rate(p.wins, games),
+        maxPoint: p.maxPoint, maxRate: rate(p.maxPoint, games),
+        funcUses: p.funcUses || 0,
+        vs: vs,
+    };
 }
 
 // 名次：已淘汰的按 outAt 倒数，存活的按血量。和 rankedPlayers 同一套语义。
@@ -1410,12 +1461,23 @@ function nextBattle(room) {
 // 时限是在行动那一刻算好的，中途掉线不重排的话那一个回合仍然等满 turnSec。
 //
 // 截止时间一律从 room.turnStartAt 这个锚点算，不是从「现在」算：
-//   · 在线   -> 开始 + turnSec
-//   · 掉线   -> 开始 + goneTurnSec，且不允许比原截止时间更晚（取 min）
-// 锚定到回合起点是为了让重连能干净地恢复：直接重算成 开始+turnSec 就行，
-// 不用记「掉线时还剩多少」。取 min 是防一种钻空子 —— 回合过了 21 秒才掉线，
-// 若直接设成 开始+10s 那已经是过去时间、会当场判过牌，取 min 后他保住
-// 原本剩下的 9 秒。所以晚掉线不吃亏，10 秒只在回合早期掉线时才真正生效。
+//   · 正常     -> 回合起点 + turnSec
+//   · 挂机过    -> 回合起点 + goneTurnSec（10 秒），直到他正常操作一次为止
+//
+// 【判据是「上个回合被判过牌」，不是「此刻掉线」】（你定的规则）
+//
+// 规则：超时 30 秒被自动判过牌之后，下一个回合的时限降到 10 秒，直到他
+// 正常操作为止。掉线的人走同一条路 —— 掉线那个回合仍然是完整 30 秒
+// （他可能马上就回来），只有等这 30 秒烧完、被自动判了过牌，
+// 下一个回合才变成 10 秒；重连并真的操作一次就恢复 30 秒。
+//
+// 这样挂机和掉线是同一套语义：**代价发生在「已经浪费过一个回合」之后**，
+// 而不是「一检测到你不在就立刻缩短」。对在线那一方的好处是不用陪着
+// 挂机的人一轮一轮等满 30 秒。
+//
+// 锚定到回合起点（不是「现在」）是为了让重连能干净地恢复：直接重算就行，
+// 不用记「掉线时还剩多少」。因为切换只发生在回合之间、不在回合中途，
+// 所以不再需要原来那套「取 min 防算出过去时刻」的兜底。
 function armTurnTimer(room) {
     clearTimeout(room.turnTimer);
     room.turnDeadline = 0;
@@ -1427,40 +1489,19 @@ function armTurnTimer(room) {
 
     const si = room.battle.turn;
     const seat = room.seats[si];
-    const gone = !!(seat && !seat.connected);
+    // idled：上一次轮到他时是被自动判过牌的（超时或掉线烧完）。
+    // 他正常操作一次就清掉（见 applyAction）。
+    const short = !!(seat && seat.idled);
+    const sec = short ? (CFG.goneTurnSec || CFG.turnSec) : CFG.turnSec;
 
-    // 在线：回合起点 + turnSec。锚在起点上，所以重连时直接重算就恢复了，
-    // 不用记「掉线时还剩多少」，也不会因为掉线一次白拿满一个回合。
-    const full = room.turnStartAt + CFG.turnSec * 1000;
-
-    let deadline;
-    if (!gone) {
-        deadline = full;
-    } else {
-        // 掉线：从「现在」起 goneTurnSec，但不许超过原本的截止时间。
-        //
-        // 【别改回锚在 turnStartAt 上】那样写在回合末尾掉线会算出一个已经
-        // 过去的时刻（回合走了 27 秒时 起点+10s 是 17 秒前），于是当场判过牌 ——
-        // 恰好是「晚掉线不吃亏」想避免的事。取 min 也救不回来，因为 min
-        // 挑的就是那个更早的过去时刻。回归测试 D 段卡的就是这个。
-        deadline = Math.min(now + (CFG.goneTurnSec || CFG.turnSec) * 1000, full);
-        // 掉线期间若重复武装（onDisconnect 走了两次之类），别每次都从新的
-        // 「现在」再续 10 秒 —— 认第一次算出来的那个
-        if (room.turnGoneDeadline && room.turnGoneDeadline > now) {
-            deadline = Math.min(deadline, room.turnGoneDeadline);
-        }
-        room.turnGoneDeadline = deadline;
-    }
-    if (!gone) room.turnGoneDeadline = 0;   // 重连后作废，下次掉线重新算
-
-    room.turnDeadline = deadline;
+    room.turnDeadline = room.turnStartAt + sec * 1000;
     room.turnTimer = setTimeout(() => {
         const b = room.battle;
         if (!b || b.finished || room.phase !== 'battle') return;
-        log('房间 %s 座位 %d 回合超时 -> 判过牌%s',
-            room.code, b.turn, gone ? '（掉线，' + sec + ' 秒时限）' : '');
+        log('房间 %s 座位 %d 回合超时 -> 判过牌（%d 秒时限%s）',
+            room.code, b.turn, sec, short ? '，挂机中' : '');
         applyAction(room, b.turn, { type: 'stand' }, true);
-    }, Math.max(0, deadline - Date.now()));
+    }, Math.max(0, room.turnDeadline - Date.now()));
 }
 
 //--- 应用一个动作 ----------------------------------------------------------
@@ -1469,6 +1510,13 @@ function applyAction(room, si, action, forced) {
     const b = room.battle;
     if (!b || b.finished || room.phase !== 'battle') return { ok: false, err: '当前不能行动' };
     if (b.turn !== si) return { ok: false, err: '还没轮到你' };
+
+    // 挂机标记（你定的规则）：被自动判过牌就挂上，下一个回合只给
+    // goneTurnSec；真人自己操作一次就摘掉，恢复完整 turnSec。
+    // 掉线的人也走这一条 —— 掉线那个回合照旧 30 秒，烧完被判过牌之后
+    // 才降速，重连并操作一次就恢复。
+    const actor = room.seats[si];
+    if (actor) actor.idled = !!forced;
 
     // 只有抽牌类动作会结束回合（用功能牌通常不会），所以不能无条件重置锚点，
     // 否则每用一张功能牌都白送一个完整回合的时间

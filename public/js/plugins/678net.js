@@ -181,17 +181,30 @@ D678N.Net.emit = function (type, data) {
     }
 };
 
+// 【整个包在 try 里】联机是可选功能，一次请求发不出去绝不能把场景搞崩。
+//
+// exe（NW.js）和 MV 编辑器的「游戏测试」都是 file:// 起源，相对路径
+// '/api/daily' 会被解析成 file:///api/daily —— Chromium 对 file:// 的 POST
+// 直接在 xhr.send() 那一行**同步抛异常**（不是走 onerror）。
+// 而 Scene_D678.create 里有一次 dailyBump('play')，异常从那里冒出来的话
+// 整个场景创建失败，单机就再也进不去了。浏览器连着服务器时不会发生，
+// 所以这条只在 exe / 编辑器里现形，很容易漏。
 D678N.Net.post = function (path, body, cb) {
-    var xhr = new XMLHttpRequest();
-    xhr.open('POST', path, true);
-    xhr.setRequestHeader('Content-Type', 'application/json');
-    xhr.onload = function () {
-        var r = null;
-        try { r = JSON.parse(xhr.responseText); } catch (e) {}
-        if (cb) cb(r, xhr.status);
-    };
-    xhr.onerror = function () { if (cb) cb(null, 0); };
-    xhr.send(JSON.stringify(body || {}));
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', path, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onload = function () {
+            var r = null;
+            try { r = JSON.parse(xhr.responseText); } catch (e) {}
+            if (cb) cb(r, xhr.status);
+        };
+        xhr.onerror = function () { if (cb) cb(null, 0); };
+        xhr.send(JSON.stringify(body || {}));
+    } catch (e) {
+        // 发不出去就当没这回事：本日计数不显示，其余照常
+        if (cb) cb(null, 0);
+    }
 };
 
 D678N.Net.connect = function (sid) {
@@ -418,8 +431,11 @@ Scene_D678Net.prototype.start = function () {
     Scene_Base.prototype.start.call(this);
     this.startFadeIn(this.fadeSpeed(), false);
     this._guard = 10;
-    // 锦标赛里被淘汰、从牌桌 pop 回来的。SSE 不断（Net 没 reset），
-    // 所以赛事结束时那份 over 还会推过来，pollNet 收到就切到排名页。
+    // 锦标赛里被淘汰、从牌桌 pop 回来的。
+    //
+    // 【SSE 已经断了】收到 eliminated 那一刻客户端就 Net.reset()、服务器也
+    // 主动收掉了那条连接（你定的：出局的人不该再占着长连接）。所以赛事结束
+    // 那份 over **不会**再推过来 —— 淘汰页看完点返回就行，不等最终排名。
     if (D678N.elim) {
         this._page = 'elim';
         this.refresh();
@@ -760,17 +776,55 @@ Scene_D678Net.prototype.drawTourneyLobby = function (info) {
 //
 // 为什么不直接回主菜单：朋友局里「最后谁赢了」是必问的一句。连接留着，
 // 赛事结束时服务器会把 over 推给所有座位（含已淘汰的），这边收到就弹排名。
+// 淘汰页。口径和单机失败画面一致（你定的）：名次 + 战绩，再加上
+// 对每个对手的分项战绩。
+//
+// 【不再写「赛事仍在进行」】玩家出局了就跟这场赛事没关系了，等最终排名
+// 没有意义 —— 看完战绩点返回就行（你定的）。
 Scene_D678Net.prototype.drawElim = function () {
     var W = Graphics.width, e = D678N.elim || {};
-    this.panel(60, 320, W - 120, 260);
-    this.txt('你被淘汰了', 60, 356, W - 120, 34, LC.red, 'center');
+    var pct = function (v) { return (v === null || v === undefined) ? '—' : v + '%'; };
+
+    var vs = e.vs || [];
+    // 面板高度跟着对手条数长：头部 236 + 每条 26，留 16 底边
+    var vsH = vs.length ? (30 + vs.length * 26) : 0;
+    var panelH = 236 + vsH;
+    var top = 300;
+    this.panel(50, top, W - 100, panelH);
+
+    this.txt('你被淘汰了', 50, top + 22, W - 100, 32, LC.red, 'center');
     if (e.rank) {
         this.txt('第 ' + e.rank + ' 名' + (e.total ? ' / 共 ' + e.total + ' 人' : ''),
-            60, 404, W - 120, 28, LC.gold, 'center');
+            50, top + 66, W - 100, 26, LC.gold, 'center');
     }
-    this.txt('赛事仍在进行，最终排名出来会显示在这里',
-        60, 456, W - 120, 20, LC.gray, 'center');
-    this.txt('不想等就点下面的返回', 60, 492, W - 120, 18, LC.gray, 'center');
+
+    // 战绩四行，和单机 buildFinalReport 一样的内容
+    var y = top + 104;
+    var rows = [
+        '最终 HP：' + (e.hp === undefined ? '0' : e.hp) +
+            '　对局 ' + (e.games || 0) + ' 场',
+        '胜 ' + (e.wins || 0) + '　负 ' + (e.losses || 0) +
+            '　胜率 ' + pct(e.winRate),
+        '满点 ' + (e.maxPoint || 0) + ' 次　满点率 ' + pct(e.maxRate),
+        '共使用功能牌 ' + (e.funcUses || 0) + ' 次',
+    ];
+    for (var i = 0; i < rows.length; i++) {
+        this.txt(rows[i], 50, y + i * 28, W - 100, 20, LC.text, 'center');
+    }
+
+    // 对每个对手的战绩（你定的）：VS B 对局 3 场，胜率 33%
+    if (vs.length) {
+        var vy = y + rows.length * 28 + 8;
+        this.txt('对手战绩', 50, vy, W - 100, 20, LC.gold, 'center');
+        for (var k = 0; k < vs.length; k++) {
+            var v = vs[k], ry = vy + 26 + k * 26;
+            this.txt('VS ' + v.name, 96, ry, 220, 20, LC.text, 'left');
+            this.txt('对局 ' + v.games + ' 场', 316, ry, 140, 20, LC.gray, 'left');
+            // 胜率颜色：过半绿、其余灰，一眼看出打得过谁
+            var col = (v.rate !== null && v.rate >= 50) ? LC.green : LC.gray;
+            this.txt('胜率 ' + pct(v.rate), 456, ry, 160, 20, col, 'left');
+        }
+    }
 };
 
 // 赛事最终排名。行高 62 × 8 行放不进大厅这块地方，所以压成一行一条，
@@ -1002,6 +1056,16 @@ Scene_D678Net.prototype.onBack = function () {
     if (this._page === 'duel' || this._page === 'tourney') {
         this._page = 'menu'; this.refresh(); return;
     }
+    // 从主菜单退回标题：把 mode 清掉。
+    //
+    // 【为什么必须在这儿也清】mode 是「Scene_D678 认不认联机」的唯一开关
+    // （create 里 `D678N.mode === 'duel'`）。它在大厅收到第一份盘面时设成
+    // 'duel'，正常路径靠 Scene_D678Net.create 或 backToTitle 清掉。
+    // 但 RMMV 的场景切换有过渡帧 —— 大厅设完 mode 排上 push 之后还会再跑
+    // 几帧 update，这期间按返回就走到这里，pop 覆盖掉刚排上的 push，
+    // 人回到标题而 mode 还是 'duel'。下一次点「开始游戏」就被当成联机局，
+    // 卡在「等待服务器…」再也进不去。
+    D678N.mode = null;
     SceneManager.pop();
 };
 
@@ -1072,7 +1136,13 @@ Scene_D678Net.prototype.terminate = function () {
 var _cr = Scene_D678.prototype.create;
 Scene_D678.prototype.create = function () {
     _cr.call(this);
-    this._net = (D678N.mode === 'duel');
+    // 【双条件】mode 只是意图，sid 才是「真的连上了」的证据（SSE 连通后才有）。
+    //
+    // 光看 mode 的话，任何一条漏清 mode 的退出路径都会让下一次单机局被当成
+    // 联机 —— 进去就停在 'netwait' 等一份永远不来的盘面，也就是
+    // 「进完多人再进单人卡在等待服务器」。加上 sid 这道，即使以后又漏清了
+    // mode，单机也只会正常开局。
+    this._net = (D678N.mode === 'duel' && !!D678N.Net.sid);
     // 本日游玩次数：单机进牌桌算一次。
     //
     // 埋在这儿而不是标题按钮上 —— 点了「开始游戏」还要过地图事件才真的开局，
@@ -1156,7 +1226,31 @@ Scene_D678.prototype.netApply = function (m) {
     this._netBye = false;
 
     var first = !this._battle;
-    this._battle = D678N.buildBattle(v, g);
+
+    // 【落定阶段绝不能凭一份普通状态重建 _battle】
+    //
+    // 678.js 的补充绘制整块挂在 `if (!this._battle)` 上 —— 那一块画的是
+    // 「第 N 轮结果 + 报表 + 本局对战记录」。轮结果页靠 netToRoundResult 把
+    // _battle 收成 null 才画得出来。
+    //
+    // 这一行原来是无条件的，于是**任何后续状态都会把 _battle 重建**，下一次
+    // refresh 时那个条件不成立，整页连带对战日志一起消失，玩家看到的是牌桌。
+    // 1v1 里对手点「继续」推来的 advancing 就够触发一次（那份状态照旧带
+    // resolved:true），锦标赛里别人桌每动一下都触发。这就是「对局完成后
+    // 看不到对局日志」的根因。
+    //
+    // 但换局是合法的，必须放过去，否则新一局没有牌面可画：
+    //   · 我那桌的 fresh（新一局 / 平局重发）
+    //   · 我那桌一次**没播过**的 resolved（resolveId 变了）
+    // 别人桌的那两种（btId 不是我）以及重复推的同一次结算都不算。
+    var rid1 = m.resolveId || 0;
+    var foreign1 = (m.btId !== undefined && m.myBtId !== undefined &&
+                    m.btId !== m.myBtId);
+    var replayed1 = !!(rid1 && rid1 === this._netPlayedResolve);
+    var needBoard = !foreign1 && (m.fresh || (m.resolved && !replayed1));
+    if (!this.netPhaseSettled() || needBoard) {
+        this._battle = D678N.buildBattle(v, g);
+    }
 
     // 多人模式功能牌超过 MAX_FUNC 是服务器随机弃的（不再手动挑）。
     // 存下来等演出走完再报 —— 这会儿手牌还显示着发牌前那份，
@@ -1434,8 +1528,15 @@ Scene_D678.prototype.netPoll = function () {
     // 锦标赛：我被淘汰但赛事还在继续 —— 退回大厅等最终排名。
     // 连接不断（Net 不 reset），赛事结束时那份 over 会推到大厅去。
     if (b.elim) {
-        D678N.elim = { rank: b.elim.rank || 0, total: b.elim.total || 0 };
+        // 【整份留下】原来只挑了 rank / total，战绩那些字段全被丢掉，
+        // 淘汰页的「胜 x 负 x 胜率」和对手战绩就都画不出来。
+        D678N.elim = b.elim;
         b.elim = null;
+        // 出局了就跟这场赛事没关系了 —— 断开 SSE、清掉会话，别再占服务器
+        // 一条长连接（你定的）。服务器那边也会主动关，这里是客户端侧的一半：
+        // 不关的话 EventSource 会自动重连，拿一个已经失效的 sid 反复敲
+        // /api/events。
+        D678N.Net.reset();
         SceneManager.pop();
     }
 };
