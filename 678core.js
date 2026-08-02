@@ -1553,6 +1553,27 @@ D678.simulateMatch = function (pA, pB) {
     return b.result;
 };
 
+// 随机弃掉超出上限的功能牌，返回被弃掉的 id 数组（给界面报「弃了哪几张」用）。
+//
+// 【和 autoDiscard 的分工】autoDiscard 按价值弃最差的，那是 AI 的选择逻辑；
+// 这个纯随机，是**多人模式的规则**：超过 6 张不再让人手动挑，服务器直接随机弃。
+// 联机里必须随机 —— 按价值弃等于服务器替人做了一个更优的选择，
+// 而同桌的 AI 也用同一套价值表的话，等于 AI 白拿一个「弃牌总是弃对」的优势。
+// 随机对所有人一视同仁，规则也一句话说得清。
+//
+// 调用方要保证 D678.Game 指向正确的那局（服务器多房间共用这个模块级全局，
+// 必须包在 withRoom 里）—— 和 autoDiscard 同一个约束。
+D678.randomDiscard = function (p) {
+    var out = [];
+    while (p.funcs.length > D678.MAX_FUNC) {
+        var i = Math.floor(Math.random() * p.funcs.length);
+        var id = p.funcs.splice(i, 1)[0];
+        out.push(id);
+        D678.Game.returnFunc(id);
+    }
+    return out;
+};
+
 D678.autoDiscard = function (p) {
     // 价值排序：中间号码的 pick 最有用（更容易凑到目标），规则牌次之。
     // picksmall 只能拿到最小牌，适用面窄于任意指定抽牌，所以排在 pick 之下；

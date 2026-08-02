@@ -103,6 +103,34 @@ D678N.visitorToken = function () {
 D678N.stats = null;
 
 //=============================================================================
+// 本日计数（标题画面上方三行）
+//=============================================================================
+// 全服累计，所有人看到同一个数（你定的）。
+//
+//   游玩次数 = 进入对局。单机在这里报；多人由服务器在开赛时自己加
+//              （startTourney / startDuel），这边不能再报，会重复。
+//   完局次数 = 单机打到结算画面（拿第几名都算）
+//   冠军次数 = 单机最后幸存者。冠军同时也计入完局。
+//
+// 连不上服务器（单机 exe / 服务器没起）就整块不画 —— 留三个「0」或者
+// 「--」在标题上比不显示更难看，而且会让人以为功能坏了。
+D678N.daily = null;      // 最近一次拿到的计数。null = 还没问到 / 问不到
+
+D678N.dailyFetch = function (cb) {
+    D678N.Net.post('/api/daily', {}, function (r) {
+        if (r && r.ok) D678N.daily = r;
+        if (cb) cb(D678N.daily);
+    });
+};
+
+// 上报一次。服务器返回的新值顺手存下来，标题回去就是最新的。
+D678N.dailyBump = function (kind) {
+    D678N.Net.post('/api/daily', { bump: kind }, function (r) {
+        if (r && r.ok) D678N.daily = r;
+    });
+};
+
+//=============================================================================
 // 传输层：SSE 收 + POST 发
 //=============================================================================
 
@@ -232,6 +260,12 @@ D678N.buildReplica = function (players, round, startHp) {
         // 自己的功能牌是真 id；对手只知道张数，用占位补齐长度
         // （drawOppName 只读 .length，不会去看内容）
         p.funcs = info.funcs ? info.funcs.slice(0) : new Array(info.funcCount).fill(null);
+        // 排名列表的「胜/负」一栏靠这两个：lastText 先看 last，没有才退回
+        // prevLast 并标「上轮」。少了它们那一栏在联机下永远是「—」。
+        // last 服务器只发我这桌的两个人（别人桌本轮的结果不该提前知道），
+        // prevLast 是上一轮的、全场都打完了，8 个人的都发。
+        p.last     = info.last || null;
+        p.prevLast = info.prevLast || null;
         // 锦标赛的 8 人里可能有超哥；1v1 不发这个字段，两边都是真人
         p.isGod = !!info.isGod;
         // 真人的连线状态（''/'gone'/'left'）。AI 一律空串，所以排名表里
@@ -604,7 +638,7 @@ Scene_D678Net.prototype.drawTourney = function () {
         { label: '匹配模式', cb: this.onMatch.bind(this) },
         // 「暂未开启」并进标题：它是 dim 按钮，点了没反应，
         // 不说一句玩家会以为是坏的
-        { label: '天体模式（暂未开启）', dim: true, cb: function () {} },
+        { label: '天梯模式（暂未开启）', dim: true, cb: function () {} },
     ], 400);
 };
 
@@ -702,12 +736,9 @@ Scene_D678Net.prototype.drawTourneyLobby = function (info) {
         this.txt(st, cx + colW - 70, cy, 70, 20, cl, 'right');
     }
 
-    // AI 补位说明：8 个真人时不补，超哥也不在场（你定的）
-    var seatN = info.seatN || 8;
-    this.txt(taken >= seatN
-        ? '满员，本场没有 AI'
-        : '其余 ' + (seatN - taken) + ' 席开赛时由 AI 补齐（含超哥）',
-        0, 636, W, 18, LC.gray, 'center');
+    // 这里原来有一行「其余 N 席开赛时由 AI 补齐（含超哥）」，已删（你定的）。
+    // 补位本身照旧，只是不在界面上说 —— 排名表里也看不出谁是 AI
+    // （statusText 对 AI 返回空串），两处口径这样才一致。
 
     // 为什么还没开赛，一句话说清 —— 少了这句，一个人点了准备什么也没发生，
     // 看起来像按钮坏了
@@ -1039,9 +1070,15 @@ var _cr = Scene_D678.prototype.create;
 Scene_D678.prototype.create = function () {
     _cr.call(this);
     this._net = (D678N.mode === 'duel');
+    // 本日游玩次数：单机进牌桌算一次。
+    //
+    // 埋在这儿而不是标题按钮上 —— 点了「开始游戏」还要过地图事件才真的开局，
+    // 中途退出不该算。多人模式不在这里报：服务器开赛时自己加了，
+    // 这边再报一次就翻倍。
+    if (!this._net) D678N.dailyBump('play');
     if (!this._net) return;
     this._netWaitAck  = false;   // 已点继续，等对手
-    this._netOwes     = false;   // 还欠弃牌
+    this._netAutoDiscarded = null;  // 上次结算被随机弃掉的功能牌（提示用）
     this._netPeerGone = null;    // 对手掉线信息
     this._netDeadline = 0;       // 本回合截止时间戳
     this._netOver     = null;
@@ -1051,14 +1088,12 @@ Scene_D678.prototype.create = function () {
     this._netPreApplied = 0;     // 已套用过发牌前快照的结算编号（同一次不重套）
     this._netTurnLeft = 0;       // 回合剩余毫秒（收到时的快照）
     this._netTurnAt   = 0;
-    this._netDiscardLeft = 0;
-    this._netDiscardAt   = 0;
     this._netAckCool  = 0;       // 点「继续」后的冷却帧，防误触
     this._netAckSentAt = 0;      // 上次发 ack 的时刻（等太久时提示可重发）
     this._netPeerGoneMs = 0;     // 对手已掉线多久
     this._netPeerGoneAt = 0;
-    this._netPeerOwes = false;   // 对方还欠弃牌
     this._netAdvancing = false;  // 服务器已在倒数「开下一局」
+    this._netWaitRound = false;  // 锦标赛：我这桌完了，还在等别人打完本轮
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -1101,20 +1136,23 @@ Scene_D678.prototype.netApply = function (m) {
     }
     this._netBye = false;
     this._netBusyTables = m.busyTables || 0;
+    // 服务器算好的「我这桌完了，本轮还没结束」。它一直发，之前客户端没读，
+    // 于是打完的人卡在轮结果画面等一个永远不来的下一局。
+    if (m.waitingRound !== undefined) this._netWaitRound = !!m.waitingRound;
 
     var first = !this._battle;
     this._battle = D678N.buildBattle(v, g);
-    this._netOwes = !!m.owesDiscard;
+
+    // 多人模式功能牌超过 MAX_FUNC 是服务器随机弃的（不再手动挑）。
+    // 存下来等演出走完再报 —— 这会儿手牌还显示着发牌前那份，
+    // 立刻弹「已弃掉 XX」的话玩家看着 6 张牌被告知弃了 2 张，对不上。
+    if (m.autoDiscarded !== undefined) this._netAutoDiscarded = m.autoDiscarded;
 
     // 倒计时按「还剩多少毫秒」+ 收到的时刻算，不用服务器的绝对时间戳 ——
     // 两台设备的钟差几分钟很常见，用时间戳会算出离谱的秒数
     if (m.turnLeft !== undefined) {
         this._netTurnLeft = m.turnLeft;
         this._netTurnAt = Date.now();
-    }
-    if (m.discardLeft !== undefined) {
-        this._netDiscardLeft = m.discardLeft;
-        this._netDiscardAt = Date.now();
     }
 
     // 对手掉线状态由每份盘面带过来，比 peer 消息可靠（重连后也能对上）
@@ -1129,33 +1167,16 @@ Scene_D678.prototype.netApply = function (m) {
     // 对手是否已点继续，用来显示「等待对手」还是「对方已确认」
     this._netWaiting = !!(m.myAcked && !m.peerAcked);
     if (m.myAcked !== undefined) this._netWaitAck = !!m.myAcked || this._netWaitAck;
-    // 对方是否还欠弃牌（决定我这边显示轮结果还是等待屏）
-    if (m.peerOwes !== undefined) this._netPeerOwes = !!m.peerOwes;
     // 服务器已经在倒数「2 秒后开下一局」
     if (m.advancing) this._netAdvancing = true;
 
-    // 副本是新建的，_discardFor 还指着上一份副本里的旧 Player 对象。
-    // 不重新指过来的话，onDiscardConfirm 读的是旧 funcs，弃牌必然对不上。
-    if (this._discardFor) {
-        if (m.owesDiscard) this._discardFor = g.human();
-        else {
-            // 服务器已经替我自动弃了（超时），把界面收掉
-            this._discardFor = null;
-            this._discardSel = [];
-            this.clearDiscardSprites();
-            if (m.autoDiscarded) this.notice('弃牌超时，已自动弃牌');
-        }
-    }
-
     // 揭牌演出期间先显示发牌前的手牌，等 finishBattle 再切到发牌后的。
     //
-    // 只在「这次结算的第一份状态」上做这个替换。服务器每次推 resolved 都带
-    // preFuncs，包括对方弃完牌后的那次重推 —— 如果每次都替换，我正开着弃牌
-    // 界面（8 张）会被换成发牌前的快照（6 张），选中的下标随之错位，
-    // 看起来就是「对方弃的牌显示到我这边」。双方手牌都满时必然触发，
-    // 因为那时两边都欠弃牌，重推一定发生在我弃牌界面还开着的时候。
+    // 只在「这次结算的第一份状态」上做这个替换 —— 服务器每次推 resolved 都带
+    // preFuncs（锦标赛里别人桌一动就重推一份），每次都替换的话演出走完之后
+    // 手牌又会被打回发牌前那 6 张，玩家看不到刚摸的牌。
     var rid0 = m.resolveId || 0;
-    if (v.preFuncs && rid0 !== this._netPreApplied && !this._discardFor) {
+    if (v.preFuncs && rid0 !== this._netPreApplied) {
         this._netPreApplied = rid0;
         this._netPre = { funcs: v.preFuncs, counts: v.preFuncCounts };
         this.netUsePre(true);
@@ -1176,14 +1197,11 @@ Scene_D678.prototype.netApply = function (m) {
         this._netWaitAck = false;
         this._netWaiting = false;
         this._netAdvancing = false;
-        this._netPeerOwes = false;
         this._netFinished = false;
+        this._netWaitRound = false;
+        this._netAutoDiscarded = null;
         this._report = null;
         this._lastLog = null;
-        // 上一局可能停在弃牌 / 等待屏，这些残留必须清掉
-        this._discardFor = null;
-        this._discardSel = [];
-        this.clearDiscardSprites();
         this._phase = 'battle';
         this._wait = 40;
         this.dealFx();
@@ -1211,8 +1229,28 @@ Scene_D678.prototype.netApply = function (m) {
         return;
     }
 
+    // 【别再无条件写 _phase = 'battle'】锦标赛里别人桌每动一下，pushStateT 都会
+    // 给我推一份状态（8 个人共用一条广播）。这些状态既没有 fresh 也没有 resolved，
+    // 会一路落到下面 —— 原来那两行把我的 _phase 从 resolve / discard / roundResult
+    // 打回 battle，于是：揭牌演出半路被打断，netFinish 再也不会被调用，
+    // 功能牌满了也开不出弃牌界面。1v1 只有对手一个人推状态，撞不上这条路。
+    //
+    // 已经落定的阶段一律不动，只有真在牌桌上（battle）或还没开局（netwait）
+    // 才跟着服务器走。
+    if (this.netPhaseSettled()) {
+        // 唯一允许的越级：我已经收尾完（轮结果 / 等对方弃牌），服务器说本轮
+        // 还没结束 —— 切到轮次等待屏。放在守卫里面是因为守卫会提前 return，
+        // 而这个转换恰恰要靠「后来的那几份状态」触发（我弃完牌那一刻，
+        // 别人可能还在打）。
+        this.netToWaitRoundIfNeeded();
+        this.refresh();
+        return;
+    }
+
     if (first || m.resync) {
-        this._phase = 'battle';
+        // 重连回来正好赶上「我这桌完了、别人还在打」：直接落到等待屏，
+        // 别把人塞回一个已经结束的牌桌
+        this._phase = this._netWaitRound ? 'netwaitround' : 'battle';
         this._wait = 0;
         this.refresh();
         return;
@@ -1220,6 +1258,15 @@ Scene_D678.prototype.netApply = function (m) {
 
     this._phase = 'battle';
     this.refresh();
+};
+
+// 「这个阶段已经落定，别被别人桌的状态推翻」。
+// 锦标赛里 8 个人共用一条广播，别人桌每动一下我都会收到一份状态 ——
+// 不挡的话我的 resolve / roundResult 会被打回 battle，揭牌演出半路断掉。
+Scene_D678.prototype.netPhaseSettled = function () {
+    var ph = this._phase;
+    return ph === 'roundResult' || ph === 'resolve' || ph === 'tie' ||
+           ph === 'netwaitround' || ph === 'netover' || ph === 'gameover';
 };
 
 // 在发牌前 / 发牌后两份手牌之间切换（只影响显示）
@@ -1275,9 +1322,7 @@ Scene_D678.prototype.update = function () {
     this.updateInput();
     this.netTickClock();
 
-    if (this._discardFor || this._showList) return;
-    // 等待对方弃牌：这一屏纯等服务器，不做任何本地推进
-    if (this._phase === 'peerDiscard') return;
+    if (this._showList) return;
     if (this._wait > 0) { this._wait--; return; }
 
     // 联机下这两个分支不能本地推进（会改状态），改成发意图后等服务器
@@ -1373,16 +1418,10 @@ Scene_D678.prototype.netTurnSec = function () {
     if (!this._netTurnLeft || !this._netTurnAt) return -1;
     return Math.max(0, Math.ceil((this._netTurnLeft - (Date.now() - this._netTurnAt)) / 1000));
 };
-Scene_D678.prototype.netDiscardSec = function () {
-    if (!this._netDiscardLeft || !this._netDiscardAt) return -1;
-    return Math.max(0, Math.ceil((this._netDiscardLeft - (Date.now() - this._netDiscardAt)) / 1000));
-};
-
 // 每秒重画一次就够，不必每帧
 Scene_D678.prototype.netTickClock = function () {
     var show = -1;
-    if (this._discardFor) show = this.netDiscardSec();
-    else if (this._phase === 'battle') show = this.netTurnSec();
+    if (this._phase === 'battle') show = this.netTurnSec();
     // 掉线计时也要走，否则「已掉线 X 秒」不会自己往上跳
     if (this._netPeerGone) {
         var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
@@ -1455,28 +1494,40 @@ Scene_D678.prototype.netFinish = function () {
     // 演出走完了，切到发牌后的手牌
     this.netUsePre(false);
 
-    if (this._netOwes) {
-        var me = D678.Game.human();
-        if (me.funcs.length > D678.MAX_FUNC) {
-            this._discardFor = me;
-            this._discardSel = [];
-            this._phase = 'discard';
-            this.refresh();
-            return;
-        }
-    }
-    // 我不用弃、但对方要弃：不进轮结果，直接进等待屏。
-    // 弃完由服务器推下一局，全程不需要点确认。
-    if (this._netPeerOwes) { this.netToPeerDiscard(); return; }
+    // 【多人模式没有手动弃牌】超过 MAX_FUNC 由服务器随机弃掉多余的（你定的），
+    // 所以这里不再开弃牌界面，只把弃掉了哪几张报出来 —— 不报的话玩家看到的
+    // 就是「刚摸了 2 张，手上还是 6 张」，以为奖励没发。
+    // 放在 netUsePre(false) 之后是必须的：那一步刚把手牌切成发牌后的真实状态。
+    this.netNoticeAutoDiscard();
     this.netToRoundResult();
+    // 锦标赛：我这桌打完了但本轮没结束 —— 停在「第 N 轮」等待屏，
+    // 等所有人打完（你定的）。先走完 netToRoundResult 是故意的：
+    // 它把 _lastLog / _battleKeep / _report 都备好了，点开排名和对战日志才有东西看。
+    this.netToWaitRoundIfNeeded();
 };
 
-// 对方还在弃牌时的等待屏
-Scene_D678.prototype.netToPeerDiscard = function () {
-    this._lastLog = this._netLog ? this._netLog.slice(0) : null;
-    this._phase = 'peerDiscard';
+// 报「超过 6 张，已随机弃掉 XX、YY」。只报一次，报完清掉。
+Scene_D678.prototype.netNoticeAutoDiscard = function () {
+    var ids = this._netAutoDiscarded;
+    this._netAutoDiscarded = null;
+    if (!ids || !ids.length) return;
+    var names = [];
+    for (var i = 0; i < ids.length; i++) names.push(D678.funcName(ids[i]));
+    this.pushMsg('功能牌超过 ' + D678.MAX_FUNC + ' 张，已随机弃掉：' + names.join('、'));
+};
+
+// 切轮次等待屏。只从「自己这场已经收尾」的阶段切。
+Scene_D678.prototype.netToWaitRoundIfNeeded = function () {
+    if (!this._netWaitRound) return;
+    if (this._phase !== 'roundResult') return;
+    this._netBye = false;
+    // netDrawWaitRound 走的是「自己清屏自己画」那条路（refresh 里提前 return），
+    // 不会调 refreshCards —— 所以牌精灵得在这儿先收掉。
+    // 从 roundResult 过来时 _battle 已经是 null（netToRoundResult 清过）。
+    if (this._battle) { this._battleKeep = this._battle; this._battle = null; }
+    this.refreshCards();
+    this._phase = 'netwaitround';
     this._notice = '';
-    this._wait = 0;
     this.refresh();
 };
 
@@ -1492,34 +1543,28 @@ Scene_D678.prototype.netToRoundResult = function () {
     this.refresh();
 };
 
-// 弃牌确认：单机在这里改 p.funcs 并 returnFunc，联机发意图
-var _dc = Scene_D678.prototype.onDiscardConfirm;
-Scene_D678.prototype.onDiscardConfirm = function () {
-    if (!this._net) { _dc.call(this); return; }
-    var p = this._discardFor;
-    if (!p) return;
-    var need = Math.max(0, p.funcs.length - D678.MAX_FUNC);
-    if (this._discardSel.length !== need) return;
+// 这里原来包了 onDiscardConfirm（把手动挑好的牌 POST 给 /api/discard）。
+// 多人模式改成服务器随机弃之后，联机根本走不到弃牌界面，那个包装和
+// /api/discard 一起删了。单机的 onDiscardConfirm 原样保留，没被碰过。
 
-    var ids = this._discardSel.map(function (i) { return p.funcs[i]; });
-    var self = this;
-    this._discardBusy = true;
-    D678N.Net.post('/api/discard', { sid: D678N.Net.sid, ids: ids }, function (r) {
-        self._discardBusy = false;
-        if (!r || !r.ok) {
-            self.notice((r && r.err) || '弃牌失败');
-            self.refresh();
-            return;
-        }
-        self._discardFor = null;
-        self._discardSel = [];
-        self._netOwes = false;
-        self.clearDiscardSprites();
-        self._netAckCool = 20;   // 约 1/3 秒，够挡住同一下点击的余波
-        // 我弃完了但对方还在挑 -> 等待屏；都弃完了服务器会直接推下一局，
-        // 这里也进等待屏顶一下，免得空一帧闪出旧画面
-        self.netToPeerDiscard();
-    });
+//--- 本日完局 / 冠军次数（只统计单机，你定的）------------------------------
+//
+// checkGameEnd 恰好只有两个出口：被淘汰（不 alive）和最后幸存者（alive）。
+// 两者都算「完局」，后者额外算「冠军」—— 和你说的「冠军同时也会在完局
+// 次数那里增加」一致。
+//
+// 联机不报：锦标赛和单人对决打完不计入完局（你定的）。
+var _cge = Scene_D678.prototype.checkGameEnd;
+Scene_D678.prototype.checkGameEnd = function () {
+    var ended = _cge.call(this);
+    if (!ended || this._net || this._dailyReported) return ended;
+    // checkGameEnd 一局里可能被调到两次（beginRound 和结算各一次），
+    // 而它是幂等的 —— 计数可不是，所以自己上一道锁
+    this._dailyReported = true;
+    var champ = !!(D678.Game && D678.Game.human().alive);
+    D678N.dailyBump('finish');
+    if (champ) D678N.dailyBump('champ');
+    return ended;
 };
 
 //--- 对手回合：等，不跑 AI -------------------------------------------------
@@ -1747,9 +1792,12 @@ Scene_D678.prototype.refresh = function () {
         return;
     }
 
-    // 锦标赛：本轮轮空、或者我这桌打完了在等最慢那一桌。此时服务器不发牌面
-    // （m.b 为 null），交给 678.js 的 refresh 会按 _phase 分发到认不得的分支，
-    // 所以这个阶段自己画。
+    // 锦标赛：本轮轮空、或者我这桌打完了在等最慢那一桌。678.js 的 refresh
+    // 按 _phase 分发，认不得这个阶段，所以自己画。
+    //
+    // 轮空时服务器压根不发牌面；我这桌打完那种情况牌面照发（pushStateT 故意
+    // 不过滤 done 的桌，弃牌界面和揭牌演出都要靠它），是 netToWaitRoundIfNeeded
+    // 把 _battle 收掉后切进来的。
     if (this._phase === 'netwaitround') { this.netDrawWaitRound(); return; }
 
     _rf.call(this);
@@ -1771,13 +1819,23 @@ Scene_D678.prototype.netDrawWaitRound = function () {
     this.txt(bmp, this._netBye ? '本轮轮空' : '你这桌打完了',
         0, 260, W, 30, LC.text, 'center');
 
+    // 自己这一轮的胜负。切到这屏是跳过了轮结果画面的，不写这一行等于把
+    // 「我刚才赢没赢」吞掉了 —— 演出看完就只剩一句「你这桌打完了」。
+    // last 由 netSetLast 从结算结果反填；平局不设 last（和单机一致）。
+    var me = g ? g.human() : null;
+    if (!this._netBye && me && me.last) {
+        var won = (me.last.type === 'win');
+        this.txt(bmp, won ? '你赢了这一场' : '你输了这一场，-' + me.last.dmg + ' HP',
+            0, 296, W, 22, won ? LC.green : LC.red, 'center');
+    }
+
     var n = this._netBusyTables || 0;
     this.txt(bmp, n > 0
-        ? '还有 ' + n + ' 桌在打，等他们打完开下一轮'
-        : '正在开下一轮…', 0, 320, W, 22, LC.gray, 'center');
+        ? '其他玩家还在对局，还有 ' + n + ' 桌在打'
+        : '正在开下一轮…', 0, 336, W, 22, LC.gray, 'center');
     if (g) {
         this.txt(bmp, '场上还有 ' + g.alivePlayers().length + ' 人',
-            0, 360, W, 20, LC.gray, 'center');
+            0, 372, W, 20, LC.gray, 'center');
     }
 
     this.txt(bmp, '点击任意处查看全场排名', 0, 440, W, 20, LC.gray, 'center');
@@ -1791,19 +1849,8 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 回合倒计时已经在 drawHpBar 里画到第二行右侧（原来放名字的位置），
     // 这里不再重复画。
 
-    // 弃牌倒计时：画在覆盖层上（弃牌界面用的是 _ovBmp，画 _uiBmp 会被盖住）
-    //
-    // y=280 不是随便挑的：678.js 的 drawDiscard 在 y=240 画「需要弃掉 N 张」，
-    // 22 号字经 drawText 后实占 240–272（高度是 size + 10），卡片区从 320 起。
-    // 原来这行画在 252，和上面那行重叠 20 像素，两行几乎叠在一起。
-    // 280 起画占 280–312，离卡片还有 8 像素余量。
-    if (this._discardFor) {
-        var ds = this.netDiscardSec();
-        if (ds >= 0) {
-            this.txt(this._ovBmp, '剩 ' + ds + ' 秒，超时自动弃',
-                0, 280, NLY.SW, 22, ds <= 10 ? LC.red : LC.gray, 'center');
-        }
-    }
+    // 这里原来画弃牌倒计时（「剩 N 秒，超时自动弃」）。多人模式超过
+    // MAX_FUNC 现在是当场随机弃，没有挑牌这一步，也就没有倒计时可画。
 
     // 对手掉线：报「已掉线多久」而不是倒计时 —— 对方回不回来不是这边能
     // 控制的事，倒计时只是干等。同时给一个立刻返回主菜单的按钮。
@@ -1830,7 +1877,7 @@ Scene_D678.prototype.netDrawOverlay = function () {
         var bx = px + 10, by = py + 92, bw = pw - 20, bh = 40;
         this.box(bmp, bx, by, bw, bh, 'rgba(60,140,90,0.95)', LC.gold, 8);
         this.txt(bmp, '退出', bx, by + 9, bw, 20, LC.white, 'center');
-        if (!this._showList && !this._discardFor) {
+        if (!this._showList) {
             this._hits.push({ x: bx, y: by, w: bw, h: bh,
                               cb: this.backToTitle.bind(this) });
         }
@@ -1845,7 +1892,7 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 那个分支原来几乎轮不到显示（只在 ack 发出、advancing 状态还没回来的
     // 几十毫秒里出现）。现在点了的人看「正在开启下一局」，没点的人看
     // 「对方已确认」，两边有区分。
-    if (this._phase === 'roundResult' && !this._showList && !this._discardFor) {
+    if (this._phase === 'roundResult' && !this._showList) {
         var msg, col;
         if (this._netWaitAck) { msg = '正在开启下一局';   col = LC.gold; }
         else if (this._netAdvancing) { msg = '对方已确认'; col = LC.green; }
@@ -1855,18 +1902,8 @@ Scene_D678.prototype.netDrawOverlay = function () {
         this.txt(bmp, msg, 0, 1070, NLY.SW, 24, col, 'center');
     }
 
-    // 对方还在弃牌：整屏压暗只留一句话。画在 _ovBmp 上才能盖住卡牌层。
-    // 这一屏没有任何可点的东西 —— 弃完由服务器直接开下一局，不需要确认。
-    if (this._phase === 'peerDiscard') {
-        var ob = this._ovBmp;
-        this.box(ob, 0, 0, NLY.SW, NLY.SH, 'rgba(0,0,0,0.92)', null, 0);
-        this.txt(ob, '对方丢弃功能牌中……', 0, 600, NLY.SW, 28, LC.gold, 'center');
-        var ps = this.netDiscardSec();
-        if (ps >= 0) {
-            this.txt(ob, '剩 ' + ps + ' 秒', 0, 646, NLY.SW, 20, LC.gray, 'center');
-        }
-        this._hits = [];   // 这一屏不接受任何点击
-    }
+    // 这里原来是「对方丢弃功能牌中……」那一屏。多人模式超过 MAX_FUNC 当场
+    // 随机弃，没人需要等别人挑牌，peerDiscard 这个阶段整个不存在了。
 
     // 等服务器发牌 / 房间被终止
     if (this._phase === 'netwait') {
@@ -1972,6 +2009,78 @@ Scene_Title.prototype.start = function () {
         D678N._autoDone = true;
         D678N.resumeSid = sess.sid;
         SceneManager.push(Scene_D678Net);
+    }
+};
+
+//=============================================================================
+// 标题画面上方的本日计数
+//=============================================================================
+// 三行字：本日游玩次数 / 本日完局次数 / 本日冠军次数（全服累计，你定的）。
+//
+// 【为什么放在 678net.js 而不是 title.js】取数要联网，而 title.js 先加载、
+// 那会儿还没有 D678N.Net。这个文件本来就已经包了 Scene_Title 的
+// createCommandWindow / callTitleButton / start，顺路挂上最省事。
+//
+// 【为什么单独一个精灵】title.js 的 _btnBmp 有 _btnCache 这道「没变化就不重画」
+// 的优化，往里画会被它的缓存判断吃掉（按钮状态没变就整块不刷）。
+// 单独一层还能保证不挡按钮的点击区。
+var DAILY_Y = 26;          // 顶部留白里，封面图上方那条空带
+var DAILY_LH = 30;         // 行高
+
+var _stCreate = Scene_Title.prototype.create;
+Scene_Title.prototype.create = function () {
+    _stCreate.call(this);
+    this._dailyBmp = new Bitmap(Graphics.width, DAILY_Y + DAILY_LH * 3 + 10);
+    this._dailySprite = new Sprite(this._dailyBmp);
+    this._dailySprite.z = 101;      // 按钮层是 100，这层在它上面
+    this.addChild(this._dailySprite);
+    this._dailyShown = '';
+    this.drawDailyCounts();
+
+    // 每次回到标题都问一次（打完一局回来数字就是新的），
+    // 之后每 10 秒刷一次 —— 比大厅那个 5 秒的心跳松一档，标题不需要那么灵敏。
+    D678N.dailyFetch();
+    this._dailyTick = 0;
+};
+
+var _stUpdate2 = Scene_Title.prototype.update;
+Scene_Title.prototype.update = function () {
+    _stUpdate2.call(this);
+    if (this._dailyTick === undefined) return;
+    if (++this._dailyTick >= 600) {      // 约 10 秒（60fps）
+        this._dailyTick = 0;
+        D678N.dailyFetch();
+    }
+    this.drawDailyCounts();
+};
+
+Scene_Title.prototype.drawDailyCounts = function () {
+    if (!this._dailyBmp) return;
+    var d = D678N.daily;
+    // 问不到就整块不画（单机 exe / 服务器没起）—— 留三个 0 在标题上
+    // 比不显示更难看，还会让人以为功能坏了
+    var key = d ? (d.plays + '/' + d.finishes + '/' + d.champs) : '';
+    if (key === this._dailyShown) return;    // 没变化不重画
+    this._dailyShown = key;
+
+    var bmp = this._dailyBmp;
+    bmp.clear();
+    if (!d) return;
+
+    var rows = [
+        ['本日游玩次数', d.plays,    '#ffd766'],
+        ['本日完局次数', d.finishes, '#ffffff'],
+        ['本日冠军次数', d.champs,   '#5cff9d'],
+    ];
+    for (var i = 0; i < rows.length; i++) {
+        var y = DAILY_Y + i * DAILY_LH;
+        bmp.fontSize = 22;
+        bmp.outlineColor = 'rgba(0,0,0,0.85)';
+        bmp.outlineWidth = 5;
+        bmp.textColor = '#b9c8c0';
+        bmp.drawText(rows[i][0] + '：', 0, y, Graphics.width / 2 + 40, 26, 'right');
+        bmp.textColor = rows[i][2];
+        bmp.drawText(String(rows[i][1]), Graphics.width / 2 + 46, y, 200, 26, 'left');
     }
 };
 

@@ -124,10 +124,110 @@ const CFG = {
     // 给到 15 秒是留两次丢包的余量 —— 手机切后台会掉几次，
     // 卡太紧的话人数会一直跳。
     visitorSec: Number(argOf('--visitor-sec', 15)),
+
+    // 「本日」按哪个时区算（小时）。默认东八区。
+    //
+    // 【别用服务器本地时间】Railway 跑在 UTC，不校正的话「本日」会在
+    // 北京时间早上 8 点翻篇 —— 正好是有人在玩的时候，数字会当着人的面归零。
+    tzOffset: Number(argOf('--tz-offset', 8)),
 };
 
 // 时间戳要拼进格式串里，不能当第一个参数传 —— 那样 %s 不会被替换
 const log = (fmt, ...a) => console.log(new Date().toISOString().slice(11, 19) + ' ' + fmt, ...a);
+
+//=============================================================================
+// 本日计数：游玩 / 完局 / 冠军
+//=============================================================================
+// 标题画面上方那三行。**全服累计**，所有人看到同一个数（你定的）。
+//
+//   plays    进入对局的次数。单机点「开始游戏」真的进了牌桌算一次；
+//            多人任意模式开赛算一次 —— 按在场真人数加，2 真人的锦标赛 +2。
+//   finishes 单机打到结算画面的次数（拿到第几名都算）。
+//   champs   单机最后幸存者的次数。冠军同时也计入 finishes。
+//
+// 【故意不做去重】同一台设备反复开局照样一直加（你定的）。代价是这个接口
+// 谁都能拿脚本刷 —— 朋友之间玩不管，所以只做一道单请求上限防呆，
+// 不做频率限制（那会误伤真的连着打好几局的人）。
+//
+// 【为什么多人模式不信客户端】开赛这件事服务器自己知道，让客户端上报等于
+// 白开一个能刷的口子。单机没办法 —— 服务器看不见单机局，只能由客户端报。
+const DAILY_FILE = path.join(__dirname, '_daily.json');
+const DAILY_MAX_BUMP = 8;      // 单次请求最多加这么多（多人开赛按人数加，8 人赛顶格）
+
+const daily = { day: '', plays: 0, finishes: 0, champs: 0 };
+
+// 「今天」是哪天。按 CFG.tzOffset 校正后取 YYYY-MM-DD。
+function dayKey(t) {
+    const d = new Date((t || Date.now()) + CFG.tzOffset * 3600 * 1000);
+    return d.toISOString().slice(0, 10);
+}
+
+// 翻篇检查。每次读写都先过一遍 —— 用定时器在午夜触发的话，
+// 进程刚好那会儿在重启就漏掉了，而这个判断是幂等的。
+function dailyRoll() {
+    const k = dayKey();
+    if (daily.day !== k) {
+        if (daily.day) {
+            log('本日计数翻篇 %s -> %s（游玩 %d / 完局 %d / 冠军 %d）',
+                daily.day, k, daily.plays, daily.finishes, daily.champs);
+        }
+        daily.day = k;
+        daily.plays = 0; daily.finishes = 0; daily.champs = 0;
+        dailySave();
+    }
+}
+
+let dailyDirty = false, dailySaveTimer = null;
+
+// 落盘是防「进程崩了重启」，不是防重新部署 —— Railway 重新部署会把文件系统
+// 一起冲掉，那种情况下数字照样归零，这是纯内存方案本来就有的代价。
+// 写得很碎所以攒 2 秒一次，避免每次开局都同步写盘。
+function dailySave() {
+    dailyDirty = true;
+    if (dailySaveTimer) return;
+    dailySaveTimer = setTimeout(() => {
+        dailySaveTimer = null;
+        if (!dailyDirty) return;
+        dailyDirty = false;
+        try {
+            fs.writeFileSync(DAILY_FILE, JSON.stringify(daily), 'utf8');
+        } catch (e) {
+            // 只读文件系统之类的环境写不了，不该因此让服务跑不起来
+            log('本日计数写盘失败（忽略）: %s', e.message);
+        }
+    }, 2000);
+}
+
+function dailyLoad() {
+    try {
+        const raw = fs.readFileSync(DAILY_FILE, 'utf8');
+        const o = JSON.parse(raw);
+        if (o && typeof o.day === 'string') {
+            daily.day = o.day;
+            daily.plays    = Number(o.plays)    || 0;
+            daily.finishes = Number(o.finishes) || 0;
+            daily.champs   = Number(o.champs)   || 0;
+        }
+    } catch (e) { /* 没有文件是正常的（第一次跑） */ }
+    dailyRoll();   // 存的是昨天的就地归零
+}
+
+function dailyBump(kind, n) {
+    dailyRoll();
+    const k = Math.max(1, Math.min(DAILY_MAX_BUMP, Number(n) || 1));
+    if (kind === 'play')   daily.plays    += k;
+    else if (kind === 'finish') daily.finishes += k;
+    else if (kind === 'champ')   daily.champs   += k;
+    else return false;
+    dailySave();
+    return true;
+}
+
+function dailyView() {
+    dailyRoll();
+    return { day: daily.day, plays: daily.plays,
+             finishes: daily.finishes, champs: daily.champs };
+}
 
 // 锦标赛固定 8 个位置：真人占前面，其余由 AI 补齐（超哥必定在内）。
 // 和单机一致 —— 单机就是 1 真人 + 7 AI。
@@ -396,6 +496,12 @@ function maskViewT(room, bt, seat, snapPre) {
             funcCount: p.funcs.length,
             // 客户端要靠这两个还原 AI 行为（超哥按超哥打）
             isHuman: !!p.isHuman, isGod: !!p.isGod,
+            // 排名列表的「胜/负」一栏（drawRankList -> lastText）。
+            // prevLast 是上一轮的，那一轮全场都打完了，8 个人的都能发。
+            // last 是本轮的，只发我这桌的两个人 —— 别人桌本轮打完没打完、
+            // 谁赢了，在轮次屏障放开之前不该让我提前知道。
+            prevLast: p.prevLast || null,
+            last: (bt && bt.pIdx.indexOf(pIdx) >= 0) ? (p.last || null) : null,
             // 真人的连线状态。AI 一律不标注 —— 排名列表里看不出谁是 AI。
             status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone')) : '',
             // 这个人此刻是否还在打（等待画面里「谁在对局」用）
@@ -539,8 +645,6 @@ function newRoom(mode) {
         resolveId: 0,
         turnTimer: null,
         ackTimer: null,
-        discardTimer: null,
-        discardDeadline: 0,
         advanceTimer: null,      // 「2 秒后开下一局」的定时器
         advanceAt: 0,            // 那一刻的时间戳，用来给客户端显示
         createdAt: Date.now(),
@@ -568,7 +672,9 @@ function addSeat(room, name) {
         left: false,        // 永久离开（宽限期满 / 被淘汰踢回大厅）
         sse: null, connected: false,
         disconnectAt: 0,
-        owesDiscard: false,
+        // 上一次结算被随机弃掉的功能牌 id（多人模式超过 MAX_FUNC 自动弃）。
+        // 只用来给客户端报「弃了哪几张」，下一局发牌时清空。
+        autoDiscarded: null,
         acked: false,
         // 锦标赛大厅的「准备」。全员就绪且 ≥2 人就自动开赛（你定的）。
         // 掉线立刻清掉 —— 否则赛事可能在他人不在的情况下开打。
@@ -596,7 +702,6 @@ function removeSeat(room, seat) {
 function dropRoom(room, why) {
     clearTimeout(room.turnTimer);
     clearTimeout(room.ackTimer);
-    clearTimeout(room.discardTimer);
     clearTimeout(room.roundTimer);
     // 锦标赛一轮有多桌，每桌两个定时器 —— 漏掉的话房间销毁后
     // 回调还会对着已删除的房间跑 pushStateT
@@ -744,13 +849,12 @@ function pushState(room, extra) {
             // 发「还剩多少毫秒」而不是绝对时间戳：两台设备的钟差几分钟很常见，
             // 客户端拿时间戳减本地 Date.now() 会算出离谱的倒计时。
             turnLeft: room.turnDeadline ? Math.max(0, room.turnDeadline - Date.now()) : 0,
-            discardLeft: (seat.owesDiscard && room.discardDeadline)
-                ? Math.max(0, room.discardDeadline - Date.now()) : 0,
-            owesDiscard: seat.owesDiscard,
+            // 多人模式超过 MAX_FUNC 是随机自动弃的（不再手动挑），
+            // 这里把弃掉的 id 发给他，界面提示「已随机弃掉 XX、YY」。
+            autoDiscarded: seat.autoDiscarded,
             myAcked: !!seat.acked,
-            // 对手状态：是否已点继续 / 是否还在弃牌 / 掉线了多久（毫秒）
+            // 对手状态：是否已点继续 / 掉线了多久（毫秒）
             peerAcked: !!(other && other.acked),
-            peerOwes: !!(other && other.owesDiscard),
             peerGone: !!(other && !other.connected),
             peerGoneMs: (other && !other.connected && other.disconnectAt)
                 ? Date.now() - other.disconnectAt : 0,
@@ -797,13 +901,8 @@ function pushStateT(room, extra) {
             // 打完的桌 turnDeadline 是上一手留下的旧值，别让客户端拿它倒计时
             turnLeft: (bt && !btDone && bt.turnDeadline)
                 ? Math.max(0, bt.turnDeadline - Date.now()) : 0,
-            discardLeft: (seat.owesDiscard && room.discardDeadline)
-                ? Math.max(0, room.discardDeadline - Date.now()) : 0,
-            owesDiscard: seat.owesDiscard,
-            // 对手是否在弃牌 / 掉线（只看同桌那个人）
-            peerOwes: !!(bt && room.seats.find(s => s && !s.left &&
-                s.pIdx === (bt.pIdx[0] === seat.pIdx ? bt.pIdx[1] : bt.pIdx[0]) &&
-                s.owesDiscard)),
+            // 超过 MAX_FUNC 被随机弃掉的那几张（多人模式不再手动挑牌）
+            autoDiscarded: seat.autoDiscarded,
         }, extra || {}));
     });
 }
@@ -840,9 +939,9 @@ function pushEvent(room, actorIndex, msg) {
 // 场场是败者 —— 于是他每轮白拿 2 张攒在手上永远不出，公共池会被慢慢抽干。
 //
 // 所以每次发完牌都把离开者的牌立刻退回去：净效果等于「不给他发」，
-// 而池子的收支始终是平的。顺序很重要 —— 必须在算 owesDiscard 之前退，
-// 否则他会因为「手上超过 MAX_FUNC 张」被挂上一个永远没人处理的弃牌债务，
-// 而轮次屏障正等着 owesDiscard 清零，全场 8 个人一起卡死。
+// 而池子的收支始终是平的。顺序很重要 —— 必须在随机弃牌之前退，否则会先
+// 把他手上那几张随机弃掉一部分、再整手退回，日志和「弃了哪几张」的提示
+// 都会带上一个已经离开的人。
 function returnFuncsOfLeft(room) {
     if (!room.game) return;
     room.seats.forEach(s => {
@@ -899,6 +998,9 @@ function startTourney(room) {
     }
 
     room.phase = 'battle';
+    // 本日游玩次数：按在场真人数加（2 真人的锦标赛 +2）。服务器自己知道
+    // 开赛这件事，不用客户端上报 —— 少一个能刷的口子。
+    dailyBump('play', humans.length);
     log('房间 %s 锦标赛开始：%d 真人 + %d AI（超哥%s）',
         room.code, humans.length, aiNames.length,
         aiNames.indexOf(D678.GOD_NAME) >= 0 ? '在场' : '不在场');
@@ -919,7 +1021,7 @@ function startRound(room) {
     room.battles = [];
     room.byePIdx = r.bye ? g.players.indexOf(r.bye) : -1;
     room.phase = 'battle';
-    room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
+    room.seats.forEach(s => { if (s) { s.acked = false; s.autoDiscarded = null; } });
 
     r.pairs.forEach(pair => {
         const [pa, pb] = pair;
@@ -1138,17 +1240,20 @@ function resolveTable(room, bt, isTie) {
 
     withRoom(room, () => {
         const need = bt.b.grantFuncs();
-        // 先把离开者刚摸到的牌退回池子，再算谁欠弃牌 —— 顺序反了他会挂上
-        // 一个永远没人处理的弃牌债务，轮次屏障就永远等不到 owesDiscard 清零
+        // 先把离开者刚摸到的牌退回池子，再随机弃 —— 见 returnFuncsOfLeft 的注释
         returnFuncsOfLeft(room);
         need.forEach(p => {
             const pi = room.game.players.indexOf(p);
             const seat = room.seats.find(s => s && s.pIdx === pi);
             // 已离开的人牌刚被退光，不可能还超上限
             if (seat && seat.left) return;
-            // 真人自己挑（掉线的也给他机会回来挑）；AI 立刻自动弃
-            if (seat) seat.owesDiscard = true;
-            else D678.autoDiscard(p);
+            // 【多人模式不再手动挑牌】超过 MAX_FUNC 一律随机弃掉多余的（你定的）。
+            // 真人和 AI 走同一条路 —— AI 若用 autoDiscard（按价值弃最差的），
+            // 等于白拿一个「弃牌总是弃对」的优势。
+            // 弃掉哪几张记在座位上，下一份状态带给客户端提示，
+            // 否则玩家只会看到手牌莫名少了几张。
+            const gone = D678.randomDiscard(p);
+            if (seat) seat.autoDiscarded = gone;
         });
         room.game.players.forEach(p => {
             if (!p.alive && p.funcs.length > 0) room.game.returnAllFuncs(p);
@@ -1156,9 +1261,7 @@ function resolveTable(room, bt, isTie) {
     });
 
     bt.done = true;
-    if (room.seats.some(s => s && !s.left && s.owesDiscard)) {
-        armDiscardTimer(room, CFG.discardSec * 1000 + 4000);
-    }
+    // 不再有「欠弃牌」这回事：上面已经随机弃完了，轮次屏障也就不用等它。
     pushStateT(room, { resolved: true, tie: false });
     checkRoundBarrier(room);
 }
@@ -1168,10 +1271,8 @@ function resolveTable(room, bt, isTie) {
 function checkRoundBarrier(room) {
     if (room.phase !== 'battle' && room.phase !== 'resolved') return;
     if (room.battles.some(x => !x.done)) return;                 // 还有桌在打
-    if (room.seats.some(s => s && !s.left && s.owesDiscard)) return;  // 还有人在挑牌
-
-    clearTimeout(room.discardTimer);
-    room.discardDeadline = 0;
+    // 原来这里还要等「没人欠弃牌」。多人模式改成随机自动弃之后，
+    // 结算那一刻牌就已经弃完了，屏障只需要看桌打完没有。
     room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
 
     // 给一点时间看自己那桌的结果，再开下一轮
@@ -1212,7 +1313,6 @@ function rankOf(room, pIdx) {
 function enterOverT(room) {
     room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
     clearTimeout(room.roundTimer);
-    clearTimeout(room.discardTimer);
     room.phase = 'over';
     const ranked = room.game.rankedPlayers();
     room.overInfo = ranked.map((p, i) => {
@@ -1262,6 +1362,8 @@ function startDuel(room) {
     }
 
     room.phase = 'battle';
+    // 本日游玩次数：1v1 两个座位都是真人，开打就是 +2
+    dailyBump('play', room.seats.filter(s => s).length);
     pushRoom(room);
     nextBattle(room);
 }
@@ -1275,7 +1377,7 @@ function nextBattle(room) {
     });
     room.phase = 'battle';
     room.preFuncs = null;
-    room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
+    room.seats.forEach(s => { if (s) { s.acked = false; s.autoDiscarded = null; } });
     room.turnStartAt = 0;
     room.turnGoneDeadline = 0;
     // 计时器必须在 pushState 之前武装 —— 否则这一份状态里的 turnLeft 是 0，
@@ -1414,7 +1516,7 @@ function enterResolved(room, isTie) {
     room.phase = 'resolved';
     room.isTie = !!isTie;
     room.resolveId++;    // 客户端靠它判断「这次结算我播过没有」
-    room.seats.forEach(s => { if (s) { s.acked = false; s.owesDiscard = false; } });
+    room.seats.forEach(s => { if (s) { s.acked = false; s.autoDiscarded = null; } });
 
     // 发牌前先拍一张手牌快照，客户端在揭牌演出期间显示这份，
     // 演出走完才切到发牌后的 —— 对齐单机「演出结束才看到奖励」的节奏
@@ -1423,9 +1525,12 @@ function enterResolved(room, isTie) {
     if (!isTie) {
         withRoom(room, () => {
             const need = room.battle.grantFuncs();   // 胜者摸 1、败者摸 2
+            // 【多人模式不再手动挑牌】和锦标赛同一条规矩：超过 MAX_FUNC
+            // 随机弃掉多余的（你定的）。弃了哪几张记在座位上给界面提示。
             need.forEach(p => {
                 const seat = room.seats.find(s => s && s.player === p);
-                if (seat) seat.owesDiscard = true;
+                const gone = D678.randomDiscard(p);
+                if (seat) seat.autoDiscarded = gone;
             });
             // 淘汰者的功能牌回公共池
             room.game.players.forEach(p => {
@@ -1434,72 +1539,27 @@ function enterResolved(room, isTie) {
         });
     }
 
-    // 弃牌计时从「客户端演出走完、弃牌界面真正打开」那一刻算起才公平。
-    // 服务器不知道各人的演出进度，所以给一个够宽的窗口：
-    // 演出最长 200 帧（约 3.3 秒），discardSec 是净挑牌时间。
-    if (room.seats.some(s => s && s.owesDiscard)) {
-        armDiscardTimer(room, CFG.discardSec * 1000 + 4000);
-    }
-
     pushState(room, { resolved: true, tie: !!isTie });
     armAckTimer(room);
 }
 
-// 弃牌超时：只替还欠弃牌的人自动弃，不动别人的 acked
-function armDiscardTimer(room, ms) {
-    clearTimeout(room.discardTimer);
-    room.discardDeadline = 0;
-    if (!CFG.discardSec) return;
-    room.discardDeadline = Date.now() + ms;
-    room.discardTimer = setTimeout(() => {
-        // 锦标赛整轮都停在 'battle'（每桌各自结算，房间不整体进 resolved），
-        // 所以这里不能只认 resolved —— 那样自动弃永远不触发，
-        // 而轮次屏障在等 owesDiscard 清零，全场 8 个人一起卡死。
-        if (room.mode === 'tourney') {
-            if (room.phase !== 'battle') return;
-        } else if (room.phase !== 'resolved') {
-            return;
-        }
-        const owing = room.seats.filter(s => s && !s.left && s.owesDiscard);
-        if (!owing.length) return;
-        withRoom(room, () => {
-            owing.forEach(s => {
-                log('房间 %s 座位 %d 弃牌超时 -> 自动弃', room.code, s.index);
-                D678.autoDiscard(room.mode === 'tourney'
-                    ? room.game.players[s.pIdx] : s.player);
-                s.owesDiscard = false;
-            });
-        });
-        room.discardDeadline = 0;
-        if (room.mode === 'tourney') {
-            pushStateT(room, { resolved: true, autoDiscarded: true });
-            checkRoundBarrier(room);
-            return;
-        }
-        pushState(room, { resolved: true, tie: !!room.isTie, autoDiscarded: true });
-        advanceIfDiscardsDone(room);   // 自动弃完就直接开下一局
-    }, ms);
-}
+// 这里原来有 armDiscardTimer（弃牌超时替人自动弃）。多人模式改成
+// 「超过 MAX_FUNC 当场随机弃」之后，没有任何时刻会存在「欠弃牌」的人，
+// 那个定时器、room.discardTimer / discardDeadline、/api/discard 一并删了。
+// --discard-sec 还认（老命令行和测试脚本会传），但不再有作用。
 
 // 有人挂机不点「继续」时替他确认，免得另一个人无限等
 function armAckTimer(room) {
     clearTimeout(room.ackTimer);
     if (!CFG.ackSec) return;
-    // 还要挑牌的话，「继续」的窗口得把挑牌时间也算进去
-    const extra = room.seats.some(s => s && s.owesDiscard)
-        ? CFG.discardSec * 1000 + 4000 : 0;
     room.ackTimer = setTimeout(() => {
         if (room.phase !== 'resolved') return;
         withRoom(room, () => {
-            room.seats.forEach(s => {
-                if (!s) return;
-                if (s.owesDiscard) { D678.autoDiscard(s.player); s.owesDiscard = false; }
-                s.acked = true;
-            });
+            room.seats.forEach(s => { if (s) s.acked = true; });
         });
         log('房间 %s 继续确认超时 -> 自动推进', room.code);
-        doAdvance(room);   // 兜底：无条件推进，不再看 acked / owesDiscard
-    }, CFG.ackSec * 1000 + extra);
+        doAdvance(room);   // 兜底：无条件推进，不再看 acked
+    }, CFG.ackSec * 1000);
 }
 
 // 排一次「延后推进」。谁先点继续谁触发，双方一起走 ——
@@ -1528,23 +1588,11 @@ function clearAdvance(room) {
     room.advanceAt = 0;
 }
 
-// 弃牌路径专用：所有人都弃完了就立刻开下一局，不需要任何人点确认。
-// 名字写清楚是为了和「点继续 + 2 秒延迟」那条路区分开 ——
-// 之前两条路共用一个函数，而它里面有「必须有人 acked」的守卫，
-// 于是弃牌走完永远推进不了（表现就是弃完卡住）。
-function advanceIfDiscardsDone(room) {
-    if (room.phase !== 'resolved') return;
-    if (room.seats.some(s => s && s.owesDiscard)) return;   // 还有人在挑牌
-    doAdvance(room);
-}
-
 // 真正开下一局 / 平局重发
 function doAdvance(room) {
     if (room.phase !== 'resolved') return;
     clearAdvance(room);
     clearTimeout(room.ackTimer);
-    clearTimeout(room.discardTimer);
-    room.discardDeadline = 0;
 
     if (room.isTie) {
         // 平局重新发牌：沿用同一个 Battle，只 newDeal（和单机 doRedeal 一致）
@@ -1627,10 +1675,22 @@ function onDisconnect(room, seat) {
 
     pushRoom(room);
 
-    const other = room.seats.find(s => s && s !== seat);
-    // 不发倒计时 —— 界面上改成「已掉线 X 秒」+ 随时可点返回主菜单。
-    // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
-    if (other) sendTo(other, 'peer', { gone: true, name: seat.name });
+    // 【只在 1v1 发】peer 是「你的对手掉线了」，客户端收到会弹一个红框 +「退出」
+    // 按钮。这条 find 取的是「座位数组里第一个不是他的人」—— 1v1 里那就是对手，
+    // 8 人赛里只是碰巧排在最前面的那个座位，跟掉线的人多半不同桌。结果是：
+    // 随便谁掉线，某个毫不相干的玩家屏上冒出「对方掉线」，而他的对手好好地
+    // 坐在对面；真正同桌那个人反而什么都收不到。而且 peer{gone:false} 在
+    // onReconnect 里同样是 find 第一个，挑中别人的话最初那个框就永久留在屏上。
+    //
+    // 锦标赛不需要它：同桌掉线由 maskViewT 的 status 标注（对手名字后缀
+    // 「（掉线）」、排名列表显示「掉线」），是标注而不是挡路的框 —— 他那桌
+    // goneTurnSec 自动过牌，赛事照走，玩家没有理由退出。
+    if (room.mode !== 'tourney') {
+        const other = room.seats.find(s => s && s !== seat);
+        // 不发倒计时 —— 界面上改成「已掉线 X 秒」+ 随时可点返回主菜单。
+        // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
+        if (other) sendTo(other, 'peer', { gone: true, name: seat.name });
+    }
 
     // 正好轮到掉线这个人时，把他的回合缩到 goneTurnSec。必须重排 + 推一次状态：
     // 时限是行动那一刻算好的，不重排的话这一个回合仍然等满 turnSec；
@@ -1666,11 +1726,6 @@ function onDisconnect(room, seat) {
                     armTurnTimerT(room, b2);
                 }
             }
-            // 他欠的弃牌自动处理掉，否则轮次屏障等不到他
-            if (seat.owesDiscard) {
-                withRoom(room, () => { D678.autoDiscard(room.game.players[seat.pIdx]); });
-                seat.owesDiscard = false;
-            }
             // 全部真人都走了就收房间
             if (!room.seats.some(s => s && !s.left && s.connected)) {
                 dropRoom(room, '锦标赛里所有真人都离开了');
@@ -1699,8 +1754,12 @@ function onReconnect(room, seat) {
     seat.disconnectAt = 0;
     log('房间 %s 座位 %d(%s) 重连', room.code, seat.index, seat.name);
 
-    const other = room.seats.find(s => s && s !== seat);
-    if (other) sendTo(other, 'peer', { gone: false, name: seat.name });
+    // 和 onDisconnect 里那条一样，只在 1v1 发 —— 锦标赛里 find 挑中的多半
+    // 不是同桌那个人，清框会清到别人头上，而该清的那个永远清不掉。
+    if (room.mode !== 'tourney') {
+        const other = room.seats.find(s => s && s !== seat);
+        if (other) sendTo(other, 'peer', { gone: false, name: seat.name });
+    }
 
     // 锦标赛：恢复他那桌的时限，补一份房间信息 + 盘面
     if (room.mode === 'tourney') {
@@ -1954,6 +2013,28 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    //--- 本日计数（标题画面上方三行）--------------------------------------
+    // 不带 bump 就是纯读；带了就加一次再返回新值。
+    //
+    // 【只接受单机的上报】多人模式的 play 由服务器在开赛时自己加
+    // （startTourney / startDuel），这个接口再收一次就重复了。
+    // finish / champ 服务器看不见单机局，只能由客户端报。
+    if (u === '/api/daily' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const bump = String(body.bump == null ? '' : body.bump);
+            if (bump) {
+                if (bump !== 'play' && bump !== 'finish' && bump !== 'champ') {
+                    return json(res, 200, Object.assign({ ok: false, err: '未知计数' },
+                        dailyView()));
+                }
+                dailyBump(bump, body.n);
+            }
+            json(res, 200, Object.assign({ ok: true }, dailyView()));
+        });
+        return;
+    }
+
     //--- 动作 --------------------------------------------------------------
     if (u === '/api/act' && req.method === 'POST') {
         readBody(req, body => {
@@ -1982,53 +2063,9 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    //--- 弃牌 --------------------------------------------------------------
-    if (u === '/api/discard' && req.method === 'POST') {
-        readBody(req, body => {
-            if (!body) return json(res, 400, { err: '请求格式错误' });
-            const found = seatOf(body.sid);
-            if (!found) return json(res, 404, { err: '会话失效' });
-            const { room, seat } = found;
-            room.touched = Date.now();
-            if (!seat.owesDiscard) return json(res, 200, { ok: false, err: '现在不需要弃牌' });
-
-            const ids = Array.isArray(body.ids) ? body.ids : [];
-            const p = seat.player;
-            const need = p.funcs.length - D678.MAX_FUNC;
-            // 只能弃到刚好剩 MAX_FUNC 张 —— 和单机 onDiscardTouch 的限制一致
-            if (ids.length !== need) return json(res, 200, { ok: false, err: '要弃 ' + need + ' 张' });
-
-            const pool = p.funcs.slice(0);
-            for (const id of ids) {
-                const k = pool.indexOf(id);
-                if (k < 0) return json(res, 200, { ok: false, err: '你没有这张牌' });
-                pool.splice(k, 1);
-            }
-            withRoom(room, () => {
-                ids.forEach(id => {
-                    const k = p.funcs.indexOf(id);
-                    if (k >= 0) { p.funcs.splice(k, 1); room.game.returnFunc(id); }
-                });
-            });
-            seat.owesDiscard = false;
-            // 没人再欠弃牌就把弃牌计时收掉，免得它稍后误触发 autoDiscard
-            if (!room.seats.some(s => s && !s.left && s.owesDiscard)) {
-                clearTimeout(room.discardTimer);
-                room.discardDeadline = 0;
-            }
-            if (room.mode === 'tourney') {
-                pushStateT(room, { resolved: true });
-                checkRoundBarrier(room);
-                return json(res, 200, { ok: true,
-                    peerOwes: room.seats.some(s => s && !s.left && s.owesDiscard) });
-            }
-            pushState(room, { resolved: true, tie: !!room.isTie });
-            // 都弃完了就直接开下一局，不要求任何人点确认
-            advanceIfDiscardsDone(room);
-            json(res, 200, { ok: true, peerOwes: room.seats.some(s => s && s.owesDiscard) });
-        });
-        return;
-    }
+    // 这里原来是 /api/discard（客户端把手动挑好的牌发上来）。多人模式改成
+    // 「超过 MAX_FUNC 当场随机弃」之后没有手动挑牌这一步，接口整个删了。
+    // 客户端对应的 onDiscardConfirm 联机分支也删了，不会再有人调它。
 
     //--- 继续 --------------------------------------------------------------
     if (u === '/api/ack' && req.method === 'POST') {
@@ -2045,11 +2082,6 @@ const server = http.createServer((req, res) => {
                 return json(res, 200, { ok: true, ignored: true, phase: room.phase });
             }
             seat.acked = true;
-            // 还有人在挑牌就先不排推进 —— 弃牌那条路走完会自己开下一局
-            if (room.seats.some(s => s && s.owesDiscard)) {
-                pushState(room, { resolved: true, tie: !!room.isTie });
-                return json(res, 200, { ok: true, waiting: true });
-            }
             // 谁先点谁触发：排一个统一的 2 秒延迟，双方一起进下一局。
             // 这里必须是 scheduleAdvance 而不是立刻推进 —— 否则对方刚看到
             // 结算就被拽走（这正是「另一方只有 2 秒」的直接原因）。
@@ -2078,10 +2110,6 @@ const server = http.createServer((req, res) => {
                     forceStand(room, bt, '离开');
                 } else if (bt && room.phase === 'battle') {
                     armTurnTimerT(room, bt);
-                }
-                if (seat.owesDiscard) {
-                    withRoom(room, () => { D678.autoDiscard(room.game.players[seat.pIdx]); });
-                    seat.owesDiscard = false;
                 }
                 if (!room.seats.some(s => s && !s.left && s.connected)) {
                     dropRoom(room, '锦标赛里所有真人都离开了');
@@ -2145,10 +2173,12 @@ if (!fs.existsSync(path.join(CFG.dir, 'index.html'))) {
     process.exit(1);
 }
 
+dailyLoad();
+
 // 给测试用：房间状态是模块内私有的，而 D678.Game 只在 withRoom 期间有效，
-// 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出弃牌）。
-// 只导出引用，不导出任何操作函数。
-module.exports = { rooms, CFG, withRoom, visitors };
+// 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出随机弃牌）。
+// 只导出引用，不导出任何操作函数。daily 也导出，回归要断言计数。
+module.exports = { rooms, CFG, withRoom, visitors, daily };
 
 server.listen(CFG.port, '0.0.0.0', () => {
     console.log('');
