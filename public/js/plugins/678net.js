@@ -1167,9 +1167,15 @@ Scene_D678.prototype.create = function () {
     this._netPeerGoneAt = 0;
     this._netAdvancing = false;  // 服务器已在倒数「开下一局」
     this._netWaitRound = false;  // 锦标赛：我这桌完了，还在等别人打完本轮
+    this._netTourney = false;    // 这一场是锦标赛（底部提示语要用，见 netDrawOverlay）
     // 展示保护期：>0 时压住新状态，先把轮结果页看完（见 netApply 里的注释）
     this._netHoldFrames = 0;
     this._netPending = null;     // 保护期内收到的最新那份带牌面的状态
+    // 【一次性事件标记要单独记】fresh 只在某一份状态上出现一次，而 _netPending
+    // 会被后来的普通状态覆盖 —— 混在一起存就会把 fresh 丢掉，保护期结束后
+    // 永远出不了轮结果页。详见 netReleaseHold。
+    this._netPendFresh = false;
+    this._netPendRedealt = false;
 };
 
 // 原 start 会先弹「知道规则吗」的询问（教程那一节改的），联机跳过
@@ -1188,6 +1194,8 @@ Scene_D678.prototype.start = function () {
 
 Scene_D678.prototype.netApply = function (m) {
     var tourney = (m.mode === 'tourney');
+    // 底部提示语要靠它区分：锦标赛推进靠轮次屏障，任何「点击继续」都是假的
+    this._netTourney = tourney;
     var v = m.b;
 
     // 【两种模式的盘面形状不一样】1v1 的 maskView 把 players 嵌在 m.b 里；
@@ -1264,7 +1272,17 @@ Scene_D678.prototype.netApply = function (m) {
     // 把最新那份带牌面的状态存进 _netPending，等保护期结束再应用。
     // 存最新的而不是第一份 —— 中间对手可能已经动过了，应用旧的会闪一下。
     if (this._netHoldFrames > 0) {
+        // 【牌面存最新的，事件标记单独粘住】
+        //
+        // 新一轮开始后别人桌马上就动，服务器又给全场推普通状态 —— 那些不带
+        // fresh。只存「最新那份状态」的话 fresh 就被覆盖丢了，保护期结束时
+        // 走不到「进下一局」的分支，于是永远卡在上一轮的轮结果页，
+        // 而服务器已经在下一轮了。这就是「卡在某个奇怪画面」的根因。
+        //
+        // 牌面要最新的（应用旧的会闪一下），标记要累积的 —— 两者分开存。
         if (v) this._netPending = m;
+        if (m.fresh) this._netPendFresh = true;
+        if (m.redealt) this._netPendRedealt = true;
         this.refresh();
         return;
     }
@@ -1352,8 +1370,11 @@ Scene_D678.prototype.netApply = function (m) {
         this._netAutoDiscarded = null;
         this._report = null;
         this._lastLog = null;
-        // 新一局真的开始了，压住的那份（如果还有）已经过时，丢掉免得回头又应用
+        // 新一局真的开始了，压住的那份（如果还有）已经过时，
+        // 连累积的标记一起丢掉，免得回头又应用一次
         this._netPending = null;
+        this._netPendFresh = false;
+        this._netPendRedealt = false;
         this._phase = 'battle';
         this._wait = 40;
         this.dealFx();
@@ -1378,11 +1399,20 @@ Scene_D678.prototype.netApply = function (m) {
         this._netFinished = false;
         this._phase = 'battle';
         this.onBattleEnd();
-        // 【保护期要从这儿就起】演出**期间**来的 fresh 同样会把日志吞掉，
-        // 而那会儿还没走到 netToRoundResult。onBattleEnd 刚把 _wait 设成
-        // 演出长度（普通 150 帧 / 满点 200 帧 / 平局 100 帧），
-        // 加上轮结果的停留时间一起压住。
-        this.netHold((this._wait || 0) + 90);
+        // 【保护期只盖住演出，一帧不多】演出期间来的 fresh 会把演出打断
+        // （m.fresh 分支在落定守卫之前，无条件把 _phase 打回 battle），
+        // 所以必须压住。onBattleEnd 刚把 _wait 设成演出长度
+        // （普通 150 帧 / 满点 200 帧 / 平局 100 帧）。
+        //
+        // 【为什么不再多留 90 帧】你定的规则：早结束的人停在日志页等最慢那桌，
+        // 最后一桌不停、直接进下一轮，大家一起开始。
+        //   · 早结束 -> fresh 还没来，保护期烧完 netFinish 正常跑，进日志页；
+        //     之后靠落定守卫一直停在那儿，等 fresh 到了立刻进下一轮。
+        //   · 最后一桌 -> 屏障当场放开，fresh 在演出期间就到并被压住；
+        //     保护期和 _wait 同一帧归零，先释放 fresh 把阶段切成 battle，
+        //     netFinish 那一支就轮不到了 —— 日志页自然被跳过，不拖别人。
+        // 多留那 90 帧的话最后一桌会白等，正是你要避免的。
+        this.netHold(this._wait || 0);
         return;
     }
 
@@ -1694,14 +1724,9 @@ Scene_D678.prototype.netToRoundResult = function () {
     this._wait = 20;
     this.buildRoundReport();
     this._battle = null;
-    // 起展示保护期：这段时间里新到的状态会被压住（见 netApply）。
-    // 锦标赛里服务器只等 2 秒就推下一轮，而演出本身要 2.5~3.3 秒 ——
-    // 不压的话轮结果页和对战日志会被直接跳过。
-    //
-    // 90 帧（1.5 秒）是折中：足够看清结果，又不会让我比服务器落后太多。
-    // 落后的代价是真的 —— 下一轮开局时我的回合计时已经在跑了，
-    // 停留越久我这一回合可用的时间越少。
-    this.netHold(90);
+    // 【这里不再起保护期】停留多久由「最慢那一桌打完没有」决定，不是定时的：
+    // 走到这儿说明我早结束，落定守卫会一直把我留在这一页，直到服务器推 fresh
+    // （最后一桌打完、屏障放开）那一刻立刻进下一轮 —— 你定的规则。
     this.refresh();
 };
 
@@ -1710,13 +1735,26 @@ Scene_D678.prototype.netHold = function (frames) {
     this._netHoldFrames = Math.max(this._netHoldFrames || 0, frames);
 };
 
-// 保护期结束：把压住的那份状态应用掉。
+// 保护期结束：把压住的那份状态应用掉，并把累积到的一次性标记贴回去。
 Scene_D678.prototype.netReleaseHold = function () {
     var m = this._netPending;
+    var fresh = this._netPendFresh, redealt = this._netPendRedealt;
     this._netPending = null;
+    this._netPendFresh = false;
+    this._netPendRedealt = false;
     if (!m) return;
     // 已经走到终局画面了就别再把人拽回牌桌 —— 保护期内可能来过 over
     if (this._phase === 'netover' || this._phase === 'gameover') return;
+    // 把粘住的 fresh 贴回最新那份牌面上。
+    //
+    // 只在这份状态本身不是结算时才贴 —— 万一保护期里又来了一次**新的**结算
+    // （resolveId 变了），那份该按结算走演出，贴上 fresh 会让它去放发牌动画，
+    // 结算就丢了。实际上这种时序几乎不可能（保护期比一整回合短得多），
+    // 但判一下不花钱。
+    if (fresh && !m.resolved) {
+        m.fresh = true;
+        if (redealt) m.redealt = true;
+    }
     this.netApply(m);
 };
 
@@ -1826,6 +1864,9 @@ Scene_D678.prototype.netSendAck = function () {
 var _nr = Scene_D678.prototype.nextRound;
 Scene_D678.prototype.nextRound = function () {
     if (!this._net) { _nr.call(this); return; }
+    // 锦标赛不发 ack：推进靠轮次屏障，/api/ack 只认 room.phase==='resolved'，
+    // 而锦标赛整轮停在 'battle'。发过去就是个空响应，白跑一趟。
+    if (this._netTourney) return;
     if (this._netAckCool > 0) return;   // 刚点过弃牌确认，别把那一下也算成「继续」
     this._netFinished = false;
     this.netAckOnce();
@@ -2038,18 +2079,23 @@ Scene_D678.prototype.netDrawOverlay = function () {
     // 「对方已确认」，两边有区分。
     if (this._phase === 'roundResult' && !this._showList) {
         var msg, col;
-        if (this._netWaitRound) {
-            // 锦标赛里我这桌打完了、本轮还没结束。
-            //
-            // 【这里绝不能写「点击继续」】锦标赛推进靠轮次屏障，/api/ack 只认
+        if (this._netTourney) {
+            // 【锦标赛任何情况都不写「点击」】推进靠轮次屏障，/api/ack 只认
             // room.phase==='resolved'，而锦标赛整轮停在 'battle' —— 点了是个
-            // 空响应，什么都不会发生。原来那行字是假的按钮。
+            // 空响应，什么都不会发生，那行字是个假按钮。
+            //
+            // 判据是「这一场是锦标赛」，不是 _netWaitRound —— 我是最慢那一桌时
+            // 本轮当场就结束了，waitingRound 是 false，原来那个条件会漏到下面
+            // 1v1 那套 ack 文案上去。
             var n = this._netBusyTables || 0;
             msg = n > 0 ? '其他玩家还在对局（还有 ' + n + ' 桌）'
                         : '本轮已结束，正在开下一轮…';
             col = LC.gray;
         } else if (this._netWaitAck) { msg = '正在开启下一局';   col = LC.gold; }
-        else if (this._netAdvancing) { msg = '对方已确认'; col = LC.green; }
+        // 对方点了继续：服务器排了 advanceMs（2 秒）的延迟，这段时间双方都
+        // 停在日志页上。写「对方已开启下一局」而不是「对方已确认」——
+        // 后者只说了他点过，没说接下来要发生什么（你定的措辞）。
+        else if (this._netAdvancing) { msg = '对方已开启下一局'; col = LC.green; }
         else { msg = '点击任意位置继续';   col = LC.white; }
         // 不画背景框 —— 原来那个框（y=1070–1116）会压住 678.js:1492 那行
         // 「点击上方血条查看全体排名与统计」（y=1100）。框删掉，字留着。
