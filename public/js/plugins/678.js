@@ -471,30 +471,47 @@ Scene_D678.prototype.refresh = function () {
 
 // 界面上怎么称呼一个玩家。
 //
-// 【自己一律显示成「你」，单机联机同一个口径】（你定的）界面本来就在用
-// 第二人称跟玩家说话（「你被淘汰了」「你是本届冠军」），名字那儿再冒出
-// 昵称就成了第三人称。自己是谁不需要靠昵称认。
-// 对手照旧显示昵称 —— 联机同桌是真人，那才是要分辨的对象。
+// 【单机：自己一律「你」】单机是一个人打 7 个 AI，界面本来就在用第二人称
+// 跟玩家说话（「你被淘汰了」「你是本届冠军」），名字那儿再冒出昵称就成了
+// 第三人称。那 7 个 AI 的名字是随机排的，自己是谁不需要靠昵称认。
+//
+// 【多人：自己显示昵称】（2026-08-05 你定的）同桌是真人，排名表 / 拼点 /
+// 结算这些地方我和别人是并排列出来的 —— 别人那几行是昵称，我这行写「你」
+// 就成了两套口径，看排名时得先在心里做一次换算。血条那个「你」是例外，
+// 由 hpSelfLabel() 单独管：那一行只有我自己，标的是「这条命是谁的」，
+// 不是在一堆人里指认我。
 //
 // 【只改显示，不改数据】`p.name` / `vsLog` 里的名字 / 服务器下发的名字
 // 全都不动 —— 那些是数据，改了会连累 AI 避重名（rollAINames）、
 // 联机的座位识别、以及日志里存的历史记录。
 Scene_D678.prototype.dispName = function (p) {
     if (!p) return '';
-    return p.isHuman ? '你' : p.name;
+    if (!p.isHuman) return p.name;
+    // 多人下昵称理论上一定有（大厅不让空名进房），但盘面异常时别画成空白
+    return this._net ? (p.name || '你') : '你';
 };
 // 日志行用的那份：log 里只有 name 字符串和 side，没有玩家对象。
 // side 0 恒是自己 —— 联机下服务器按人做过镜像，客户端永远把自己当 side 0
 // （见 _test_leak.js 的「自己永远 side 0」那条）。
+// 多人下这一栏和对手的动作行交替出现，所以同样用昵称，口径跟 dispName 一致。
 Scene_D678.prototype.dispLogName = function (e) {
     if (!e) return '';
-    return (e.side === 0) ? '你' : e.name;
+    if (e.side !== 0) return e.name;
+    return this._net ? (e.name || '你') : '你';
+};
+
+// 血条左侧那个标签。这一行只有我自己，所以单机多人都写「你」——
+// 多人下别处（排名 / 拼点 / 结算）都改成昵称了，这里是有意留的例外。
+// 多人返空串：678net.js 的 drawHpBar 包装要在同一个位置画自己那份
+// （灰色 + 让位给回合倒计时），两边都画会叠字。
+Scene_D678.prototype.hpSelfLabel = function () {
+    return this._net ? '' : '你';
 };
 
 Scene_D678.prototype.drawHpBar = function () {
     var bmp = this._uiBmp, me = D678.Game.human();
     this.box(bmp, 12, 10, 696, 56, 'rgba(0,0,0,0.45)', COL.line, 10);
-    this.txt(bmp, this.dispName(me), 26, 22, 120, 24, COL.white);
+    this.txt(bmp, this.hpSelfLabel(), 26, 22, 120, 24, COL.white);
     var w = 300, x = 110, y = 30;
     var ratio = Math.max(0, Math.min(1, me.hp / D678.START_HP));
     this.box(bmp, x, y, w, 18, 'rgba(255,255,255,0.15)', null, 6);
@@ -958,8 +975,9 @@ Scene_D678.prototype.drawShowdown = function () {
     else                     { mid = '负';     midCol = COL.green; }
     this.txt(bmp, mid, 60, 434, 600, 54, midCol, 'center');
 
-    // 我方一律「你」（单机联机同一个口径，和 dispName 一致）
-    this.txt(bmp, '你', 60, 512, 600, 24, COL.gray, 'center');
+    // 我方：单机「你」、多人昵称（走 dispName，和排名表 / 结算报表同一个口径）。
+    // 上面那行画的是对手昵称，两行并排 —— 多人下这里写「你」就是两套称呼。
+    this.txt(bmp, this.dispName(b.players[0]), 60, 512, 600, 24, COL.gray, 'center');
     this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542, r, 0);
 
     // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）。

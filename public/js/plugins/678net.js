@@ -660,22 +660,32 @@ Scene_D678Net.prototype.refresh = function () {
 
     var mw = 96, mh = 56;
     var mx = px + BTN_W - 20 - mw, my = py + (ph - mh) / 2;
-    this.txt(nm || '未设置', px + 24, py + 40, mx - px - 40, 32,
+    // 【赛事结束后不给改名】（2026-08-05 你定的）淘汰页 / 最终排名页上那些
+    // 名次和战绩是服务器按**当时那个名字**算好发下来的，就摆在这块名字条
+    // 下面。这时候改名，界面上就成了「叫 B 的人拿了第 3 名，而排名表里
+    // 第 3 名写着 A」—— 两个名字指同一个人，看着像是排错了。
+    // 名字本身照旧显示：那是「这一局我是谁」的说明，去掉反而少了信息。
+    // 看完点返回回到子页，那时候按钮就回来了（改的是下一局的名字）。
+    var canRename = (this._page !== 'elim' && this._page !== 'ranks');
+    this.txt(nm || '未设置', px + 24, py + 40,
+             (canRename ? mx - px - 40 : BTN_W - 48), 32,
              nm ? LC.text : LC.gray, 'left');
 
-    // 按下反馈沿用 i: -2（改名一直占着这个号），和菜单按钮同一套观感
-    var mpress = (this._press === -2);
-    drawBtn(this._bmp, mx, my, mw, mh, mpress, mpress);
-    this._bmp.fontSize = 24;
-    this._bmp.textColor = mpress ? LC.edge : LC.text;
-    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
-    this._bmp.outlineWidth = 4;
-    this._bmp.drawText(nm ? '修改' : '设置', mx,
-        my + (mh - 34) / 2 + (mpress ? 2 : 0), mw, 34, 'center');
-    // 没存过名字时也要能点 —— 原来 if (nm) 为假整行都不画，
-    // 第一次进来看不到「我是谁」，也没法主动设名字
-    this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
-                      cb: this.onChangeName.bind(this) });
+    if (canRename) {
+        // 按下反馈沿用 i: -2（改名一直占着这个号），和菜单按钮同一套观感
+        var mpress = (this._press === -2);
+        drawBtn(this._bmp, mx, my, mw, mh, mpress, mpress);
+        this._bmp.fontSize = 24;
+        this._bmp.textColor = mpress ? LC.edge : LC.text;
+        this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+        this._bmp.outlineWidth = 4;
+        this._bmp.drawText(nm ? '修改' : '设置', mx,
+            my + (mh - 34) / 2 + (mpress ? 2 : 0), mw, 34, 'center');
+        // 没存过名字时也要能点 —— 原来 if (nm) 为假整行都不画，
+        // 第一次进来看不到「我是谁」，也没法主动设名字
+        this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
+                          cb: this.onChangeName.bind(this) });
+    }
 
     if (this._page === 'menu' || this._page === 'duel' ||
         this._page === 'tourney') this.drawOnline();
@@ -894,7 +904,12 @@ Scene_D678Net.prototype.drawFinalRanks = function () {
     this.txt(o.win ? '你是本届冠军！' : '赛事结束', 0, 300, W, 32,
         o.win ? LC.gold : LC.text, 'center');
     if (list[0]) {
-        this.txt('冠军：' + list[0].name + (myRank ? '　　你：第 ' + myRank + ' 名' : ''),
+        // 名次那半句用昵称 —— 这一行左半是「冠军：某某」，右半写「你」就是
+        // 两套人称（多人一律昵称，见 678.js 的 dispName）。上面那句大字
+        // 「你是本届冠军！」是对我说的话，不是名字栏，照旧留第二人称。
+        var myName = (myRank && list[myRank - 1]) ? list[myRank - 1].name : '';
+        this.txt('冠军：' + list[0].name +
+                 (myRank ? ('　　' + (myName || '你') + '：第 ' + myRank + ' 名') : ''),
             0, 340, W, 20, LC.gray, 'center');
     }
 
@@ -1729,7 +1744,9 @@ Scene_D678.prototype.netFinalReport = function () {
         return g > 0 ? Math.round(a / g * 100) + '%' : '—';
     };
     return [
-        (o.win ? '胜者：你' : '胜者：' + op.name),
+        // 胜者一律写昵称（多人口径，见 678.js 的 dispName）：负的时候这里写的是
+        // 对手昵称，赢的时候写「你」就成了两套称呼
+        ('胜者：' + (o.win ? (me.name || '你') : op.name)),
         '最终 HP：' + Math.max(0, me.hp) + '　对局 ' + me.games + ' 场',
         '胜 ' + me.wins + '　负 ' + me.losses + '　胜率 ' + rate(me.wins, me.losses),
         '满点 ' + me.maxPoint + ' 次',
@@ -1750,7 +1767,8 @@ Scene_D678.prototype.netTourneyReport = function () {
     };
     return [
         '冠军：' + (champ ? champ.name : '?'),
-        '我的名次：第 ' + (o.myRank || 0) + ' 名 / 共 ' + o.ranks.length + ' 人',
+        // 名次行也写昵称：紧贴上面那行「冠军：某某」，写「我的名次」是两套人称
+        (me.name || '我') + '：第 ' + (o.myRank || 0) + ' 名 / 共 ' + o.ranks.length + ' 人',
         '最终 HP：' + Math.max(0, me.hp) + '　对局 ' + (me.games || 0) + ' 场',
         '胜 ' + me.wins + '　负 ' + me.losses + '　胜率 ' + rate(me.wins, me.losses),
         '满点 ' + me.maxPoint + ' 次　共使用功能牌 ' + (me.funcUses || 0) + ' 次',
@@ -2048,20 +2066,17 @@ Scene_D678.prototype.backToTitle = function () {
     _bt.call(this);
 };
 
-//--- 自己的名字不显示，那个位置改放回合倒计时 ------------------------------
-// 单机里玩家永远叫「我」，名字和血条挤同一行没问题。联机下自己的名字
-// 对自己毫无信息量（对手名字在上方已经有了），所以整个不画，
-// 腾出来的第二行右侧放回合倒计时。
+//--- 血条那一行：只标「你」，右侧放回合倒计时 --------------------------------
+// 自己的昵称不画在血条上 —— 这一行只有我自己，昵称对自己没有信息量，
+// 而且要留出第二行右侧给回合倒计时。别处（排名 / 拼点 / 结算）多人下
+// 一律显示昵称，只有这一处是「你」，见 678.js 的 hpSelfLabel。
 
 var _hp = Scene_D678.prototype.drawHpBar;
 Scene_D678.prototype.drawHpBar = function () {
     if (!this._net) { _hp.call(this); return; }
 
-    var me = D678.Game.human();
-    var real = me.name;
-    me.name = '';                // 让原逻辑不画名字
+    // 原逻辑在多人下不画这个标签（hpSelfLabel 返回空串），位置留给下面这行
     _hp.call(this);
-    me.name = real;
 
     var bmp = this._uiBmp;
 
