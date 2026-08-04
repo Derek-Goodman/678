@@ -40,6 +40,7 @@ const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
+const zlib = require('zlib');
 
 // 规则层的位置有两种：开发时这个文件在 server/ 下，678core.js 在上一层；
 // 装配到上线包后两者同级。两个都试，省得为部署单独改一行。
@@ -89,6 +90,8 @@ const CFG = {
     // hit 会把它归零，所以在线方每要一张牌都要多买一个完整回合的等待。
     // 重连回来立刻恢复成 turnSec（见 armTurnTimer）。
     goneTurnSec: Number(argOf('--gone-turn-sec', 10)),
+    // 二选一的选牌时限（秒）。实际窗口是 min(这个值, 回合剩余时间)。
+    pick2Sec: Number(argOf('--pick2-sec', 10)),
 
     // 掉线后多久强制结束房间（秒）。界面上不再显示这个倒计时 ——
     // 玩家看到的是「对方已掉线 X 秒」并且随时可以自己点返回主菜单，
@@ -290,6 +293,47 @@ const MIME = {
     '.ico':  'image/x-icon',
 };
 
+// gzip：只压文本类。png/ogg/ttf 本身已经是压缩格式，再压一遍省不到几个
+// 百分点，白烧 CPU。
+//
+// 【为什么值得做】js + json + html 一共 3.2MB，gzip 后 0.57MB ——
+// 新设备首屏白省 2.6MB，而且这部分是**阻塞**的（rpg_core 没下完游戏起不来），
+// 省下来的时间比省同样体积的图片更值钱。
+const GZIP_EXT = /^\.(js|json|html|css|svg)$/;
+
+// 压完的结果按「路径 + mtime + size」缓存在内存里。
+//
+// 不缓存的话每个新访客都要把 rpg_core.js（1MB）重新压一遍 —— 那是同步 CPU
+// 密集活，会卡住事件循环，而这个进程同时还在跑对局的定时器和 SSE 推送。
+// 键里带 mtime/size 是为了本地开发：改了插件刷新就能看到新的，
+// 不用重启服务器（js 本来就是 no-cache，缓存键跟着文件变才对得上）。
+//
+// 上限是防「以后往 public/ 塞进几百个大 json」把内存吃光。文本资源现在
+// 一共 3.2MB，压完 0.57MB，离上限还很远。
+const gzCache = new Map();
+const GZ_CACHE_MAX = 16 * 1024 * 1024;
+let gzCacheBytes = 0;
+
+function gzipCached(full, st, cb) {
+    const key = full + '|' + st.mtimeMs + '|' + st.size;
+    const hit = gzCache.get(key);
+    if (hit) { cb(null, hit); return; }
+
+    fs.readFile(full, (err, raw) => {
+        if (err) { cb(err); return; }
+        // level 9 而不是默认的 6：这些文件压完就一直躺在缓存里复用，
+        // 多花的那点 CPU 只付一次，省下的字节每个访客都受益。
+        zlib.gzip(raw, { level: 9 }, (e, buf) => {
+            if (e) { cb(e); return; }
+            if (gzCacheBytes + buf.length <= GZ_CACHE_MAX) {
+                gzCache.set(key, buf);
+                gzCacheBytes += buf.length;
+            }
+            cb(null, buf);
+        });
+    });
+}
+
 function serveStatic(req, res, urlPath) {
     let rel = decodeURIComponent(urlPath.split('?')[0]);
     if (rel === '/' || rel === '') rel = '/index.html';
@@ -308,15 +352,43 @@ function serveStatic(req, res, urlPath) {
             return;
         }
         const ext = path.extname(full).toLowerCase();
-        res.writeHead(200, {
-            'Content-Type': MIME[ext] || 'application/octet-stream',
-            'Content-Length': st.size,
-            // 图片音频给长缓存（首屏 60MB，回访不该再下一遍）；
-            // js/json 不缓存，改了插件刷新就能看到
-            'Cache-Control': /\.(png|jpe?g|gif|webp|ogg|m4a|mp3|wav|ttf|woff2?)$/.test(ext)
-                ? 'public, max-age=604800' : 'no-cache',
+        const type = MIME[ext] || 'application/octet-stream';
+        // 图片音频字体给长缓存（回访不该再下一遍）；js/json 不缓存，
+        // 改了插件刷新就能看到。
+        //
+        // 【为什么是 30 天而不是一年】文件名里没有内容哈希（cardback.png 换了图
+        // 还叫 cardback.png），缓存期就是「改了图之后老玩家最久看到旧图多久」。
+        // 一年太长 —— 想安全地缓存一年，得先给资源名加哈希。
+        const cache = /^\.(png|jpe?g|gif|webp|ogg|m4a|mp3|wav|ttf|woff2?|ico)$/.test(ext)
+            ? 'public, max-age=2592000' : 'no-cache';
+
+        const sendRaw = () => {
+            res.writeHead(200, {
+                'Content-Type': type,
+                'Content-Length': st.size,
+                'Cache-Control': cache,
+            });
+            fs.createReadStream(full).pipe(res);
+        };
+
+        const accepts = String(req.headers['accept-encoding'] || '');
+        if (!GZIP_EXT.test(ext) || !/\bgzip\b/.test(accepts)) { sendRaw(); return; }
+
+        gzipCached(full, st, (err, buf) => {
+            // 压不动就照原样发，别因为压缩失败把游戏文件变成 500
+            if (err || !buf) { sendRaw(); return; }
+            res.writeHead(200, {
+                'Content-Type': type,
+                // 发压缩后的准确长度，浏览器才有下载进度；不发就退化成 chunked
+                'Content-Length': buf.length,
+                'Content-Encoding': 'gzip',
+                // 中间缓存（CDN / 代理）必须按 Accept-Encoding 分开存，
+                // 否则会把 gzip 的那份发给不支持的客户端
+                'Vary': 'Accept-Encoding',
+                'Cache-Control': cache,
+            });
+            res.end(buf);
         });
-        fs.createReadStream(full).pipe(res);
     });
 }
 
@@ -411,6 +483,11 @@ function maskView(b, me, snapPre) {
                 // 自己的牌全给；对方的暗牌在揭牌前不给数值
                 v: (mine || b.revealed || !c.hidden) ? c.v : null,
                 hidden: c.hidden,
+                // 假牌标记 + 卡图名（+1/-1/复制品）。
+                // 【不算泄漏】假牌一律正面打出，双方本来就看得见；
+                // 不发的话对方那一排的复制品不染色、+1/-1 会显示成 1 号牌。
+                fake: c.fake || undefined,
+                face: c.face || undefined,
                 // 稳定身份，客户端的精灵靠它认牌（见 678.js 的 cardKey）。
                 // 【不算泄漏】uid 只是个自增序号，不带任何牌面信息 ——
                 // 从它只能看出「这张牌是第几张被造出来的」，而出牌顺序本来就
@@ -468,6 +545,19 @@ function maskView(b, me, snapPre) {
 
     const ord = (f) => (me === 0 ? [f(0), f(1)] : [f(1), f(0)]);
 
+    // 二选一的待选状态。
+    // 【两张候选的点数只发给选的那个人】对手只该知道「他正在二选一」——
+    // 知道候选是什么就等于知道了牌库顶两张，那是查看牌库才有的情报。
+    // 没选的那张会压到牌库底，所以泄漏出去连「牌库最后一张是什么」都送了。
+    let pick2 = null;
+    if (b.pending2) {
+        const mine = (b.pending2.side === me);
+        pick2 = {
+            mine: mine,
+            vals: mine ? b.pending2.vals.slice(0) : null,
+        };
+    }
+
     return {
         deck: deck,
         rule: b.rule,
@@ -479,6 +569,7 @@ function maskView(b, me, snapPre) {
         sides: ord(maskSide),
         players: ord(P),
         result: result,
+        pick2: pick2,
         // 见 preOf 的注释：只有结算那一帧会带上
         preFuncs: snapPre ? ord(preOf) : null,
         preFuncCounts: snapPre ? ord(preCount) : null,
@@ -539,6 +630,9 @@ function maskViewT(room, bt, seat, snapPre) {
                     v: (mine || b.revealed || !c.hidden) ? c.v : null,
                     hidden: c.hidden,
                     uid: c.uid,      // 见 maskSide（1v1 那份）里的注释
+                    // 假牌标记 / 卡图名，同上：正面打出的牌，不涉及遮蔽
+                    fake: c.fake || undefined,
+                    face: c.face || undefined,
                 })),
                 stood: s.stood,
                 checkN: mine ? s.checkN : 0,
@@ -1141,6 +1235,26 @@ function armTurnTimerT(room, bt) {
     const sec = short ? (CFG.goneTurnSec || tsec) : tsec;
 
     bt.turnDeadline = bt.turnStartAt + sec * 1000;
+
+    // 二选一的待选：窗口 = min(pick2Sec, 回合剩余)，超时随机选。
+    // 跟 1v1 的 armTurnTimer 同一套语义，详见那边的注释。
+    if (bt.b.pending2) {
+        const leftMs = bt.turnDeadline - now;
+        const wait = Math.max(0, Math.min(CFG.pick2Sec * 1000, leftMs));
+        bt.pick2Deadline = now + wait;
+        bt.turnTimer = setTimeout(() => {
+            if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
+            if (!bt.b.pending2) return;              // 已经选过了
+            const who = bt.b.pending2.side;
+            log('房间 %s 第 %d 桌 pIdx=%d 二选一超时 -> 随机选',
+                room.code, bt.id, bt.pIdx[who]);
+            applyActionT(room, bt, who,
+                { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
+        }, wait);
+        return;
+    }
+    bt.pick2Deadline = 0;
+
     bt.turnTimer = setTimeout(() => forceStand(room, bt, short ? '挂机' : '超时'),
         Math.max(0, bt.turnDeadline - now));
 }
@@ -1202,8 +1316,9 @@ function applyActionT(room, bt, side, action, forced) {
 
     // 挂机标记，和 1v1 同一套（见 applyAction 里的注释）。
     // 锦标赛里 side 是「这一桌的 0/1」，得先换成座位。
+    // 二选一超时同样不算挂机 —— 他有操作，只是慢了。
     const actorT = room.seats.find(s => s && s.pIdx === bt.pIdx[side]);
-    if (actorT) actorT.idled = !!forced;
+    if (actorT && !(forced && action.type === 'pick2')) actorT.idled = !!forced;
 
     const turnBefore = b.turn;
     let msg = '', ok = true, err = '', failNote = '';
@@ -1213,7 +1328,7 @@ function applyActionT(room, bt, side, action, forced) {
         if (action.type === 'hit') {
             if (!b.canHit(side)) {
                 ok = false;
-                err = b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌';
+                err = b.noHitReason(side);
                 return;
             }
             msg = b.act(side, 'hit').msg;
@@ -1226,11 +1341,19 @@ function applyActionT(room, bt, side, action, forced) {
             const r = b.useFunc(side, id);
             if (!r.ok) { ok = false; err = r.err || '无法使用'; return; }
             msg = r.msg;
-            if (r.fail) failNote = '此号牌已在场上';
+            // 失败原因照抄 useFunc 给的，别写死抽号牌那一种
+            // （复制失败是「我方没有明牌可以复制」）
+            if (r.fail) failNote = r.err || '无法使用';
             if (r.kind === 'repick') {
                 const nc = b.sides[side].cards[b.sides[side].cards.length - 1];
                 repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
             }
+        } else if (action.type === 'pick2') {
+            // 二选一的选择。只有待选那一方能选，idx 只接受 0/1 ——
+            // 客户端发来的一律不可信，越界或不是他的回合都拒掉。
+            const rp = b.pick2Resolve(side, action.idx);
+            if (!rp) { ok = false; err = '现在不能选牌'; return; }
+            msg = '对方选了 1 张牌';
         } else {
             ok = false; err = '未知动作';
         }
@@ -1520,6 +1643,29 @@ function armTurnTimer(room) {
     const sec = short ? (CFG.goneTurnSec || CFG.turnSec) : CFG.turnSec;
 
     room.turnDeadline = room.turnStartAt + sec * 1000;
+
+    // 【二选一的待选另起一个更短的时限】选牌窗口 = min(pick2Sec, 回合剩余)。
+    // 你定的：回合只剩 3 秒时用这张牌，选牌也只有 3 秒；超时随机选，
+    // 且因为「他有操作、只是慢了」不挂 idled（见 applyAction）。
+    // 取 min 而不是另开一个完整窗口，是为了不让这张牌变成偷时间的手段。
+    const p2 = room.battle.pending2;
+    if (p2) {
+        const left = room.turnDeadline - Date.now();
+        const wait = Math.max(0, Math.min(CFG.pick2Sec * 1000, left));
+        room.pick2Deadline = Date.now() + wait;
+        room.turnTimer = setTimeout(() => {
+            const b = room.battle;
+            if (!b || b.finished || room.phase !== 'battle') return;
+            if (!b.pending2) return;                 // 这期间已经选过了
+            const who = b.pending2.side;
+            log('房间 %s 座位 %d 二选一超时 -> 随机选（%d 秒）',
+                room.code, who, Math.round(wait / 1000));
+            applyAction(room, who, { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
+        }, wait);
+        return;
+    }
+    room.pick2Deadline = 0;
+
     room.turnTimer = setTimeout(() => {
         const b = room.battle;
         if (!b || b.finished || room.phase !== 'battle') return;
@@ -1540,8 +1686,12 @@ function applyAction(room, si, action, forced) {
     // goneTurnSec；真人自己操作一次就摘掉，恢复完整 turnSec。
     // 掉线的人也走这一条 —— 掉线那个回合照旧 30 秒，烧完被判过牌之后
     // 才降速，重连并操作一次就恢复。
+    //
+    // 【二选一超时不算挂机】（你定的）超时随机选那次是 forced，但他确实
+    // 操作过 —— 牌已经打出去了，只是选得慢。挂上 idled 会让他下一个回合
+    // 无端降到 10 秒，那是给挂机的人的惩罚，不该落到他头上。
     const actor = room.seats[si];
-    if (actor) actor.idled = !!forced;
+    if (actor && !(forced && action.type === 'pick2')) actor.idled = !!forced;
 
     // 只有抽牌类动作会结束回合（用功能牌通常不会），所以不能无条件重置锚点，
     // 否则每用一张功能牌都白送一个完整回合的时间
@@ -1559,7 +1709,7 @@ function applyAction(room, si, action, forced) {
         if (action.type === 'hit') {
             if (!b.canHit(si)) {
                 ok = false;
-                err = b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌';
+                err = b.noHitReason(si);
                 return;
             }
             const ev = b.act(si, 'hit');
@@ -1575,7 +1725,8 @@ function applyAction(room, si, action, forced) {
             const r = b.useFunc(si, id);
             if (!r.ok) { ok = false; err = r.err || '无法使用'; return; }
             msg = r.msg;
-            if (r.fail) failNote = '此号牌已在场上';
+            // 失败原因照抄 useFunc 给的，别写死抽号牌那一种
+            if (r.fail) failNote = r.err || '无法使用';
             if (r.kind === 'repick') {
                 // 【发新牌的 uid，不发 side】extra 对所有座位是同一份，
                 // 没法按人镜像；而客户端恒把自己当 side 0。发 uid 的话它在
@@ -1583,6 +1734,11 @@ function applyAction(room, si, action, forced) {
                 const nc = b.sides[si].cards[b.sides[si].cards.length - 1];
                 repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
             }
+        } else if (action.type === 'pick2') {
+            // 二选一的选择。只有待选那一方能选，idx 只接受 0/1
+            const rp = b.pick2Resolve(si, action.idx);
+            if (!rp) { ok = false; err = '现在不能选牌'; return; }
+            msg = '对方选了 1 张牌';
         } else {
             ok = false; err = '未知动作';
         }

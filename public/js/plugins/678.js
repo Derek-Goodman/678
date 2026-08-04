@@ -24,7 +24,7 @@
  * ============================================================================
  * 回合规则
  * ============================================================================
- *  只有抽牌类动作会结束回合：要牌、过牌、指定抽牌成功、抽底牌、重抽、抽小。
+ *  只有抽牌类动作会结束回合：要牌、过牌、指定抽牌成功、抽暗牌、重抽、抽小。
  *  其余功能牌（互换/强夺/退回/规则牌/查看牌库/干扰）不消耗回合，可以连续使用。
  *  指定抽牌失败（该号牌已在场上）只消耗该功能牌，回合仍在自己手上。
  *
@@ -39,6 +39,14 @@
  *  单方爆牌：爆牌方直接判负（伤害多算一份）。
  *  双方爆牌：平局，立即重新发牌（不比谁更接近目标点数）。
  *  双方未爆且同点：平局，立即重新发牌。
+ *
+ *  【三张改判定方式的规则牌】胜负一律走 Battle.scoreOf + D678.cmpScore
+ *  这一对函数（678core.js），不要在别处另写一份比较逻辑：
+ *    · 规则牛牛   任意几张凑成 10 的倍数，余下的和的个位即成绩，越大越好
+ *                （10 点为牛牛=满点；凑不出算无牛，成绩 0）。本规则下没有爆牌。
+ *    · 规则比多   先比张数，多者胜；超过 21 点仍算爆牌；张数相同才比接近 21。
+ *                注意这条打破了「满点必胜」——恰好 21 点也可能因张数少而输。
+ *    · 规则暗牌   只有暗牌计入判定，明牌一律不算；仍以接近 21 点为目标。
  *
  *  伤害 = 1（底伤）+ 本场平局次数 + 败方累计败场数 + 败方爆牌 1 + 胜方满点 1
  *
@@ -63,6 +71,8 @@
  *  或者离新目标点数不超过 D678.AI.RULE_NEAR 点且不爆，才会出手。
  *  否则把牌留着 —— 避免 1+2 就甩规则18 这种离目标还差十几点的出牌。
  *  唯一例外是对手已经停牌/抽不动、而新规则能直接把他打爆且自己没爆。
+ *  改判定方式的那三张没有「目标点数」，闸门换成「改完之后我的成绩是否真的
+ *  压过对手」（直接用 cmpScore 比），见 D678.AI.ruleTimingOK。
  *
  *  超哥必定登场，他知道牌库的完整顺序（每次抽到什么牌都算得到），
  *  也看得见对方的底牌，因此他的要牌/过牌是确定性最优的。
@@ -120,6 +130,70 @@ var LY = {
     RULE_W: 62, RULE_X: 24, RULE_Y: 416
 };
 D678.LY = LY;
+
+//=============================================================================
+// 图片改用 JPEG（首屏体积）
+//=============================================================================
+//
+// 卡牌图原本是 720x1020 的 32 位 PNG，一张 600KB~1.3MB，36 张共 32MB ——
+// 而它们在屏幕上最大只画到 118px 宽（drawDiscardPanel 那个 118），
+// 手牌更小（LY.CARD_W=100）。等于下载了 37 倍于实际需要的像素。
+//
+// 改成 360x510 JPEG q90 之后 36 张一共 1.1MB，对最大显示尺寸仍有 3 倍超采样。
+// 能用 JPEG 是因为**这些图全部不透明**（连圆角都是实心的，抽样 14790 点
+// 无一个 alpha<255），所以 PNG 的无损压缩和 alpha 通道都是纯浪费。
+//
+// 【为什么只重写 loadPicture / loadTitle1，不改 loadBitmap】
+// loadBitmap 是所有图片目录共用的。img/system 下 Window.png、IconSet.png、
+// Balloon.png 真的需要 alpha，一起转成 JPEG 会让窗口边框和图标糊掉、
+// 透明处变成黑块。所以按目录逐个放行，改哪个目录心里有数。
+//
+// 【加 JPG_EXT 常量而不是各处写死 '.jpg'】以后要回退成 PNG 或换 WebP，
+// 只改这一行。三处 loader 必须一致，分散写死迟早漏一个。
+//
+// 【D678.CARD_W/CARD_H 要跟着改】见 678core.js 里那两个常量的注释 ——
+// 所有绘制代码都是「目标宽 / D678.CARD_W」算缩放比，源图尺寸变了
+// 那两个常量不跟着变，卡牌会画成原来的两倍大。
+var JPG_EXT = '.jpg';
+
+// img/pictures/：36 张卡牌图，全部已转 JPEG
+ImageManager.loadPicture = function (filename, hue) {
+    if (!filename) return this.loadEmptyBitmap();
+    var path = 'img/pictures/' + encodeURIComponent(filename) + JPG_EXT;
+    var bitmap = this.loadNormalBitmap(path, hue || 0);
+    bitmap.smooth = true;      // 原 loadPicture 传的 smooth 就是 true
+    return bitmap;
+};
+
+// img/titles1/：标题背景 fm，720x1280 全不透明，1702KB -> 240KB
+ImageManager.loadTitle1 = function (filename, hue) {
+    if (!filename) return this.loadEmptyBitmap();
+    var path = 'img/titles1/' + encodeURIComponent(filename) + JPG_EXT;
+    var bitmap = this.loadNormalBitmap(path, hue || 0);
+    bitmap.smooth = true;
+    return bitmap;
+};
+
+// img/system/ 只放行启动 logo 这一张。
+//
+// CustomLogo 插件用 loadSystem 加载它（不是 loadPicture），而它是
+// 720x1281 的全屏插画、全不透明、644KB，走 Scene_Boot.loadSystemImages ——
+// 在首屏阻塞路径上，转完只要 27KB。
+//
+// 【白名单而不是黑名单】同目录下那十几张系统图必须留 PNG。写成
+// 「除了这几个都转」的话，以后 MV 加一张新系统图就会被误转。
+var SYSTEM_JPG = { 'Derek': true };
+
+var _IM_loadSystem = ImageManager.loadSystem;
+ImageManager.loadSystem = function (filename, hue) {
+    if (filename && SYSTEM_JPG[filename]) {
+        var path = 'img/system/' + encodeURIComponent(filename) + JPG_EXT;
+        var bitmap = this.loadNormalBitmap(path, hue || 0);
+        bitmap.smooth = false;   // 原 loadSystem 传的 smooth 是 false
+        return bitmap;
+    }
+    return _IM_loadSystem.call(this, filename, hue);
+};
 
 var COL = {
     bg1: '#0b2b1c', bg2: '#04140d',
@@ -261,7 +335,12 @@ Scene_D678.prototype.totalString = function (b, si, revealAll) {
     var parts = [], base = 0, visible = 0;
     for (var i = 0; i < cards.length; i++) {
         if (cards[i].hidden && !revealAll) { parts.push('?'); }
-        else { parts.push(String(cards[i].v)); base += cards[i].v; visible++; }
+        else {
+            // 虚空数字写成 (+1) / (-1) / (7)，见 D678.cardFaceStr ——
+            // 直接拼数值会得到「7+-1」和看着像 bug 的「7+7」。
+            parts.push(D678.cardFaceStr(cards[i]));
+            base += cards[i].v; visible++;
+        }
     }
     if (visible === 0) return parts.join('+') + '=?';
     // 规则+1/-1 时显示成 “1+2+3=6+3”：等号后是牌面合计，再挂上修正总量，
@@ -283,8 +362,8 @@ Scene_D678.prototype.totalString = function (b, si, revealAll) {
 //
 // 【用 uid 不用下标】原来是 si_idx_值_正反，而「删掉中间那张牌」会让后面所有
 // 牌的下标往前挪、key 全变 —— refreshCards 把它们当新牌一起重新入场。
-// 实际症状：用过「抽底牌」之后再「重抽」，暗牌和新抽的明牌一起飞进来
-// （抽底牌把暗牌 push 到末尾，于是明牌在中间，repick 删的就是中间那张）。
+// 实际症状：用过「抽暗牌」之后再「重抽」，暗牌和新抽的明牌一起飞进来
+// （抽暗牌把暗牌 push 到末尾，于是明牌在中间，repick 删的就是中间那张）。
 // rob / return 删的也是 newestUp，同样可能是中间那张。
 //
 // uid 由 D678.mkCard 发，整局唯一、只增不减，删谁都不影响别人。
@@ -294,7 +373,11 @@ Scene_D678.prototype.cardKey = function (si, idx, c, revealAll) {
     var shown = (si === 0 || revealAll || !c.hidden);
     // uid 缺失时退回下标（AI 推演盘面、以及万一有没走 mkCard 的旧路径）
     var id = (c.uid === undefined || c.uid === null) ? ('i' + idx) : c.uid;
-    return si + '_u' + id + '_' + c.v + '_' + (shown ? 'f' : 'b');
+    // face / fake 也进 key：互换明牌会把「假」连同数值一起换走（见 useFunc 的
+    // swap 分支），此时 uid 和正反都没变，只有这两个字段变了 —— 不进 key
+    // 的话精灵会留着旧卡图和旧染色，画面上那张牌还是原来的样子。
+    return si + '_u' + id + '_' + c.v + '_' + (shown ? 'f' : 'b') +
+        (c.face ? '_' + c.face : '') + (c.fake ? '_k' : '');
 };
 
 Scene_D678.prototype.refreshCards = function () {
@@ -315,7 +398,10 @@ Scene_D678.prototype.refreshCards = function () {
                 var sp = this._cardSprites[key];
                 var shown = (si === 0 || b.revealed || !c.hidden);
                 if (!sp) {
-                    sp = new Sprite(ImageManager.loadPicture(shown ? String(c.v) : 'cardback'));
+                    // face 优先于数值：+1/-1 是 v=1/-1 的假牌，但要显示自己的
+                    // 卡图而不是「1」号牌。复制品没有 face，显示成数值 + 染色。
+                    sp = new Sprite(ImageManager.loadPicture(
+                        shown ? (c.face || String(c.v)) : 'cardback'));
                     sp.scale.x = sp.scale.y = LY.CARD_W / D678.CARD_W;
                     sp.opacity = 0;
                     sp.x = LY.SW / 2 - LY.CARD_W / 2;
@@ -331,7 +417,15 @@ Scene_D678.prototype.refreshCards = function () {
                 // setColorTone 内部会比对数值，重复设同一个值不会有额外开销，
                 // 且图片异步加载完成后会自动重新套用，所以每次刷新都直接设。
                 var masked = (si === 0 && c.hidden && !b.revealed);
-                sp.setColorTone(masked ? D678.HOLE_TONE : [0, 0, 0, 0]);
+                // 【虚空数字一律染色，+1/-1 也染】原来只染没有专属卡图的那种
+                // （复制品），理由是「+1/-1 有自己的卡图，不会被误认成真牌」。
+                // 但染色的意义是标出「这张牌不来自牌库」这个共同属性 ——
+                // 三张虚空数字应该一眼看出是同一类，所以条件只看 fake。
+                // 虚空数字不可能是暗牌（一律正面打出），两种色调互斥，不用叠加。
+                var tone = [0, 0, 0, 0];
+                if (masked) tone = D678.HOLE_TONE;
+                else if (c.fake && shown) tone = D678.FAKE_TONE;
+                sp.setColorTone(tone);
             }
         }
     }
@@ -375,16 +469,41 @@ Scene_D678.prototype.refresh = function () {
     this.drawOverlay();
 };
 
+// 界面上怎么称呼一个玩家。
+//
+// 【自己一律显示成「你」，单机联机同一个口径】（你定的）界面本来就在用
+// 第二人称跟玩家说话（「你被淘汰了」「你是本届冠军」），名字那儿再冒出
+// 昵称就成了第三人称。自己是谁不需要靠昵称认。
+// 对手照旧显示昵称 —— 联机同桌是真人，那才是要分辨的对象。
+//
+// 【只改显示，不改数据】`p.name` / `vsLog` 里的名字 / 服务器下发的名字
+// 全都不动 —— 那些是数据，改了会连累 AI 避重名（rollAINames）、
+// 联机的座位识别、以及日志里存的历史记录。
+Scene_D678.prototype.dispName = function (p) {
+    if (!p) return '';
+    return p.isHuman ? '你' : p.name;
+};
+// 日志行用的那份：log 里只有 name 字符串和 side，没有玩家对象。
+// side 0 恒是自己 —— 联机下服务器按人做过镜像，客户端永远把自己当 side 0
+// （见 _test_leak.js 的「自己永远 side 0」那条）。
+Scene_D678.prototype.dispLogName = function (e) {
+    if (!e) return '';
+    return (e.side === 0) ? '你' : e.name;
+};
+
 Scene_D678.prototype.drawHpBar = function () {
     var bmp = this._uiBmp, me = D678.Game.human();
     this.box(bmp, 12, 10, 696, 56, 'rgba(0,0,0,0.45)', COL.line, 10);
-    this.txt(bmp, me.name, 26, 22, 120, 24, COL.white);
+    this.txt(bmp, this.dispName(me), 26, 22, 120, 24, COL.white);
     var w = 300, x = 110, y = 30;
     var ratio = Math.max(0, Math.min(1, me.hp / D678.START_HP));
     this.box(bmp, x, y, w, 18, 'rgba(255,255,255,0.15)', null, 6);
     if (ratio > 0) this.box(bmp, x, y, Math.floor(w * ratio), 18,
         ratio > 0.4 ? '#4be08a' : '#ff6b6b', null, 6);
-    this.txt(bmp, 'HP ' + me.showHp(), x + w + 12, 20, 120, 24, COL.gold);
+    // HP 后面挂上「此刻输一局至少掉多少血」（底伤 + 累计败场）——
+    // 败场越多这个数越大，玩家该知道自己现在输一局有多贵
+    this.txt(bmp, 'HP ' + me.showHp() + '（-' + me.lossPenalty() + '）',
+        x + w + 12, 20, 180, 24, COL.gold);
     this.txt(bmp, this._showList ? '▲ 收起' : '▼ 排名', 590, 22, 110, 22, COL.blue);
     this._hits.push({ x: 12, y: 10, w: 696, h: 56, cb: this.onToggleList.bind(this) });
     this.txt(bmp, '第 ' + D678.Game.round + ' 轮   存活 ' + D678.Game.alivePlayers().length + ' 人',
@@ -395,7 +514,8 @@ Scene_D678.prototype.drawBattle = function (b) {
     var bmp = this._uiBmp;
     var opp = b.players[1];
     this.drawOppName(opp);
-    this.txt(bmp, 'HP ' + opp.showHp(), 0, 130, LY.SW, 20, COL.gray, 'center');
+    this.txt(bmp, 'HP ' + opp.showHp() + '（-' + opp.lossPenalty() + '）',
+        0, 130, LY.SW, 20, COL.gray, 'center');
 
     // 对方点数
     this.txt(bmp, this.totalString(b, 1, b.revealed), 0, 350, LY.SW, 30,
@@ -491,12 +611,31 @@ Scene_D678.prototype.drawRuleInfo = function () {
     this.box(bmp, x, y, w, h, 'rgba(0,0,0,0.92)', COL.purple, 12);
     this.txt(bmp, '当前规则', x, y + 16, w, 20, COL.gray, 'center');
     this.txt(bmp, f ? f.name : b.rule, x, y + 46, w, 30, COL.purple, 'center');
-    this.txt(bmp, '目标 ' + b.target() + ' 点', x, y + 88, w, 22, COL.gold, 'center');
+    this.txt(bmp, this.ruleGoalString(b), x, y + 88, w, 22, COL.gold, 'center');
     for (var i = 0; i < lines.length; i++) {
         this.txt(bmp, lines[i], x + 28, y + 126 + i * 26, w - 56, 18, COL.white, 'left');
     }
     this.txt(bmp, '点击任意处关闭', 0, y + h + 12, LY.SW, 18, COL.gray, 'center');
     this._hits.push({ x: 0, y: 0, w: LY.SW, h: LY.SH, cb: this.onToggleRuleInfo.bind(this) });
+};
+
+// 规则说明面板上那行金字。
+// 【不能一律写「目标 N 点」】改判定方式的三张没有目标点数这回事，
+// 照着写会直接骗玩家（牛牛下会写成「目标 21 点」）。
+Scene_D678.prototype.ruleGoalString = function (b) {
+    if (b.isCowRule()) {
+        return '凑十取余，点数越大越好（10 点为牛牛）；每人最多 ' +
+               D678.COW_MAX_CARDS + ' 张牌';
+    }
+    // 牛牛占着规则位但已失效（有人超张数）—— 不能只写「目标 21 点」，
+    // 那样玩家看不出自己那张规则牌为什么不起作用了。
+    if (b.rule === 'rulecow') {
+        return '牛牛已失效（有一方超过 ' + D678.COW_MAX_CARDS +
+               ' 张牌），目标 ' + b.target() + ' 点';
+    }
+    if (b.isMoreRule())   return '张数多者胜，超过 21 点仍算爆牌';
+    if (b.isHiddenRule()) return '只算暗牌，目标 21 点';
+    return '目标 ' + b.target() + ' 点';
 };
 
 // 规则牌精灵：常驻一个，随 b.rule 换图 / 隐藏
@@ -519,6 +658,25 @@ Scene_D678.prototype.syncRuleSprite = function (id, x, y, w) {
 //   能凑成满点的那张 -> 红色
 //   抽到后不会爆牌   -> 金色
 //   抽到后会爆牌     -> 灰色
+// 抽到这张牌之后是「满点 / 好 / 坏」。
+//
+// 【为什么不能只看爆不爆】牛牛下没有爆牌，按老逻辑每张都是「安全」=> 全部金色，
+// 这一行就不再传递任何信息了。规则暗牌下抽明牌对成绩分毫不差，
+// 每张都该是灰的（抽了白抽）。所以统一改成「抽了之后成绩是变好还是变坏」，
+// 判定口径跟 AI 的 canImprove 一致，都走 cmpScore。
+Scene_D678.prototype.unseenTone = function (b, v) {
+    var curS = b.scoreOf(0);
+    var dv = b.scoreDelta(v, false);                 // 抽到的是明牌
+    var t = curS.total + dv;
+    if (b.isBustVal(t)) return 'bad';
+    var rc = b.isCowRule()
+        ? D678.cowReachAdd(D678.cowReach(b.scoreVals(0)), dv) : null;
+    var s = D678.AI.scoreFromTotal(b, 0, t, b.countCards(0, false) + 1,
+        rc ? rc[0] : undefined);
+    if (s.max) return 'max';
+    return D678.cmpScore(s, curS) > 0 ? 'good' : 'bad';
+};
+
 Scene_D678.prototype.drawUnseen = function (b, x, y) {
     var bmp = this._uiBmp;
     var uns = this.unseenForPlayer(b);
@@ -527,35 +685,139 @@ Scene_D678.prototype.drawUnseen = function (b, x, y) {
     bmp.fontSize = 20;
     var cx = x + bmp.measureTextWidth(label) + 6;
     if (!uns.length) { this.txt(bmp, '无', cx, y, 100, 20, COL.gray, 'left'); return; }
-    var myTotal = b.total(0);
     for (var i = 0; i < uns.length; i++) {
         var v = uns[i];
-        var t = myTotal + b.adj(v);
-        var hit = b.isMaxVal(t);                 // 抽到它正好满点
-        var safe = !b.isBustVal(t);
+        var tone = this.unseenTone(b, v);
         var s = String(v);
         bmp.fontSize = 20;
         var tw = bmp.measureTextWidth(s);
-        // 满点牌用红色，安全牌金色，会爆的灰色
-        this.txt(bmp, s, cx, y, 60, 20, hit ? COL.red : (safe ? COL.gold : COL.gray), 'left');
+        // 满点牌用红色，能变好的金色，变坏/会爆的灰色
+        this.txt(bmp, s, cx, y, 60, 20,
+            tone === 'max' ? COL.red : (tone === 'good' ? COL.gold : COL.gray), 'left');
         bmp.fontSize = 20;
         cx += tw + 14;
     }
 };
 
+// 假牌（+1/-1/复制品）不算 —— 它不占牌库里的名额，把它记成「这个号出现过」
+// 会让这一行少列一张真牌。和 678core.js 里 D678.AI.unseen 同一个道理。
 Scene_D678.prototype.unseenForPlayer = function (b) {
     var known = {}, i;
     var mine = b.sides[0].cards, opp = b.sides[1].cards;
-    for (i = 0; i < mine.length; i++) known[mine[i].v] = true;
-    for (i = 0; i < opp.length; i++) { if (!opp[i].hidden || b.revealed) known[opp[i].v] = true; }
+    for (i = 0; i < mine.length; i++) { if (!mine[i].fake) known[mine[i].v] = true; }
+    for (i = 0; i < opp.length; i++) {
+        if (opp[i].fake) continue;
+        if (!opp[i].hidden || b.revealed) known[opp[i].v] = true;
+    }
     var out = [];
     for (var v = 1; v <= 11; v++) { if (!known[v]) out.push(v); }
     return out;
 };
 
+// 二选一的选择面板：占掉功能牌区，其余画面照旧。
+//
+// 【只占功能牌区，不盖场面】（你定的）玩家要看着双方点数、未见的牌、
+// 当前规则才能决定选哪张 —— 面板铺满屏幕的话等于让人闭着眼选。
+// 所以只占 y=830 往下那一条，牌桌和点数全程可见。
+//
+// 【2026-08-05 改掉了半透明蒙版，换成不透明面板 + 直接藏掉功能牌】（你定的）
+// 原来那版有两个毛病，根子都是**层级**：
+//   1. 蒙版画在 `_uiBmp`（= `_uiSprite`），而功能牌精灵在 `_cardLayer`，
+//      建的时候 `_cardLayer` 在前、`_uiSprite` 在后 —— 位图在精灵之上，
+//      所以 0.78 的黑压不掉功能牌，只把它压暗成 22% 透出来，
+//      正好糊在两张候选牌周围，候选牌反而看不清。
+//   2. 更糟的是候选牌精灵也在 `_cardLayer`，等于**连要看的那两张一起压暗**。
+// 现在：功能牌精灵直接 `visible = false`（不靠蒙版遮），面板用不透明底，
+// 候选牌精灵挪到 `_topLayer`（在 `_uiSprite` 之上，弃牌面板早就这么干了，
+// 见 syncDiscardSprites）—— 谁也压不到它。
+Scene_D678.prototype.drawPick2 = function (b) {
+    var bmp = this._uiBmp;
+    var vals = b.pending2.vals;
+    // 【先把功能牌藏掉】不是靠蒙版遮，是真的不画 —— 传空数组让所有
+    // 功能牌精灵 visible = false。不做这一步的话上一帧的手牌会一直留在屏幕上。
+    this.syncFuncSprites([], 20, LY.FUNC_Y);
+    // 不透明面板（原来是 0.78 半透明蒙版）。候选牌在 _topLayer，不受它影响。
+    this.box(bmp, 20, 830, LY.SW - 40, 340, 'rgba(6,20,14,0.97)', COL.gold, 12);
+    this.txt(bmp, '二选一：选择要留下的牌', 0, 842, LY.SW, 24, COL.gold, 'center');
+    this.txt(bmp, '另一张会被塞入牌库底部', 0, 872, LY.SW, 18, COL.gray, 'center');
+
+    // 两张候选并排画在面板中间。
+    // 【y 从 FUNC_Y+20=900 挪到 906，并且副标题收到 872】原来副标题底边 894、
+    // 金框顶边 895，只差 1px，而 txt 的描边（outlineWidth 4）还会再往外溢 ——
+    // 看上去就是字压在卡图上。现在副标题底边 890、金框顶边 901，留 11px。
+    var cw = LY.FCARD_W, gap = 60;
+    var totalW = cw * 2 + gap;
+    var x0 = (LY.SW - totalW) / 2;
+    var y = 906;
+    this.syncPick2Sprites(vals, x0, y, gap);
+    for (var i = 0; i < 2; i++) {
+        var x = x0 + (cw + gap) * i;
+        this.box(bmp, x - 5, y - 5, cw + 10, LY.FCARD_H + 10, null, COL.gold, 8);
+        // 点数写在卡图下方，卡图底边 y+125=1031，这行 1040 起，留 9px
+        this.txt(bmp, String(vals[i]) + ' 点', x - 6, y + LY.FCARD_H + 9,
+            cw + 12, 20, COL.white, 'center');
+        this._hits.push({ x: x - 5, y: y - 5, w: cw + 10, h: LY.FCARD_H + 34,
+            cb: this.onPick2.bind(this, i) });
+    }
+};
+
+// 候选牌的精灵。跟功能牌区那套分开管（key 带 'p2' 前缀），
+// 免得选完之后残留的精灵被当成功能牌复用。
+//
+// 【放 _topLayer 不放 _cardLayer】`_cardLayer` 在 `_uiSprite` 之下，
+// 面板底色会把候选牌压暗（原来就是这个毛病）。`_topLayer` 是最上层，
+// 弃牌面板的卡图也放那儿（syncDiscardSprites）—— 同一个道理，同一个做法。
+Scene_D678.prototype.syncPick2Sprites = function (vals, x0, y, gap) {
+    if (!this._p2Sprites) this._p2Sprites = {};
+    var used = {};
+    for (var i = 0; i < vals.length; i++) {
+        var key = 'p2-' + i + '-' + vals[i];
+        used[key] = true;
+        var sp = this._p2Sprites[key];
+        if (!sp) {
+            sp = new Sprite(ImageManager.loadPicture(String(vals[i])));
+            sp.scale.x = sp.scale.y = LY.FCARD_W / D678.CARD_W;
+            this._topLayer.addChild(sp);
+            this._p2Sprites[key] = sp;
+        }
+        sp.x = x0 + (LY.FCARD_W + gap) * i;
+        sp.y = y;
+        sp.visible = true;
+    }
+    this.clearPick2Sprites(used);
+};
+// 清掉不再需要的候选精灵。传 keep 就只留那几个，不传就全清（选完时用）。
+Scene_D678.prototype.clearPick2Sprites = function (keep) {
+    if (!this._p2Sprites) return;
+    for (var k in this._p2Sprites) {
+        if (keep && keep[k]) continue;
+        this._topLayer.removeChild(this._p2Sprites[k]);
+        delete this._p2Sprites[k];
+    }
+};
+
+Scene_D678.prototype.onPick2 = function (idx) {
+    var b = this._battle;
+    if (!b || !b.pending2 || b.pending2.side !== 0) return;
+    this.pick2Commit(idx);
+};
+
+// 落实选择。单机直接调规则层；联机那份在 678net.js 里覆写成发请求。
+Scene_D678.prototype.pick2Commit = function (idx) {
+    var b = this._battle;
+    var r = b.pick2Resolve(0, idx);
+    if (!r) return;
+    this.clearPick2Sprites(null);
+    this.funcFx();
+    this.afterPlayerAction();
+};
+
 Scene_D678.prototype.drawFuncHand = function (b) {
     var bmp = this._uiBmp;
     var me = D678.Game.human();
+    // 待选期间功能牌区整个让给选择面板：不能再出别的牌，也不能要牌/过牌
+    if (b.pending2 && b.pending2.side === 0) { this.drawPick2(b); return; }
+    this.clearPick2Sprites(null);
     // 多人模式超过上限是服务器当场随机弃掉多余的（不像单机让玩家自己挑），
     // 所以这条规则要写在界面上 —— 只在结算后弹一句「已随机弃掉 XX」的话，
     // 玩家攒到 5、6 张时没有预期，突然少两张。
@@ -637,8 +899,12 @@ Scene_D678.prototype.syncFuncSprites = function (ids, x0, y0) {
 
 Scene_D678.prototype.drawButtons = function (b) {
     var bmp = this._uiBmp;
+    // pick2Waiting 也要算进来：待选期间 onHit/onStand 本来就会拒（弹「请先选一张」），
+    // 但按钮还画成亮的、还注册命中区 —— 看着能点、点了被拒，和 _showList
+    // 那几个的处理不一致。压暗掉更老实。
     var active = (b && !b.finished && b.turn === 0 && this._phase === 'battle' &&
-        !this._showList && !this._discardFor && !this._showRule);
+        !this._showList && !this._discardFor && !this._showRule &&
+        !this.pick2Waiting());
     var bw = 300, bh = 68;
     var y = LY.BTN_Y;
     var canHit = active && b.canHit(0);
@@ -681,7 +947,7 @@ Scene_D678.prototype.drawShowdown = function () {
 
     // 对方
     this.txt(bmp, opp.name, 60, 318, 600, 24, COL.gray, 'center');
-    this.drawShowdownTotal(t1, r.busts[1], r.maxes[1], 348);
+    this.drawShowdownTotal(t1, r.busts[1], r.maxes[1], 348, r, 1);
 
     // 中间大字：以我方为准写“胜 / 负”，胜为红色、负为绿色。
     // 平局把次数直接写进这个大字里（「平局✖1」「平局✖2」…，你定的）——
@@ -692,9 +958,9 @@ Scene_D678.prototype.drawShowdown = function () {
     else                     { mid = '负';     midCol = COL.green; }
     this.txt(bmp, mid, 60, 434, 600, 54, midCol, 'center');
 
-    // 我方
-    this.txt(bmp, '我', 60, 512, 600, 24, COL.gray, 'center');
-    this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542);
+    // 我方一律「你」（单机联机同一个口径，和 dispName 一致）
+    this.txt(bmp, '你', 60, 512, 600, 24, COL.gray, 'center');
+    this.drawShowdownTotal(t0, r.busts[0], r.maxes[0], 542, r, 0);
 
     // 平局说明（拼点阶段不显示本局扣了多少生命值，伤害只在轮次结算报表里给出）。
     // 平局次数写在上面那个中间大字里，这里不重复。
@@ -711,15 +977,31 @@ Scene_D678.prototype.drawShowdown = function () {
 // 于是满点/爆牌时数字位置和平时对不上，看着就是偏的。
 //
 // 现在数字独立居中，后缀画在数字右边 —— 数字的位置和有没有后缀无关。
-Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y) {
+Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y, r, si) {
     var bmp = this._ovBmp;
     var col = bust ? COL.red : (max ? COL.gold : COL.white);
     var s = String(t);
+    var tag = bust ? '爆牌' : (max ? '满点' : '');
+
+    // 【牛牛下点数不是成绩】总点数 24 的成绩是「牛4」，直接画 24 会看不懂。
+    // doResolve 把成绩放在 r.cows 里带出来（联机走同一份 result，无需另配）。
+    if (r && r.cows) {
+        var cow = r.cows[si];
+        s = (cow === 0) ? '无牛' : (cow === 10 ? '牛牛' : '牛' + cow);
+        if (cow === 0) col = COL.gray;
+        tag = '';                        // 「牛牛」本身已经说明是满点
+    } else if (r && r.cardCounts) {
+        // 比多：判定看的是张数，所以点数根本不该出现在这里 ——
+        // 写「5 张　24 点」会让人以为 24 点也参与了胜负。
+        // 爆牌是唯一的例外（爆了就直接输，张数多也没用），那时整行只写「爆牌」。
+        // 「满点」后缀留着：它不是判定依据，但要多打一点伤害，是玩家该看到的信息。
+        s = bust ? '爆牌' : (r.cardCounts[si] + ' 张');
+        if (bust) tag = '';
+    }
 
     // 数字居中在面板宽度上（面板 x 60 宽 600）
     this.txt(bmp, s, 60, y, 600, 60, col, 'center');
 
-    var tag = bust ? '爆牌' : (max ? '满点' : '');
     if (!tag) return;
 
     // 后缀紧跟在数字右侧。数字实际宽度要按 60 号字量出来，
@@ -752,7 +1034,7 @@ Scene_D678.prototype.drawRankList = function () {
         this.box(bmp, 26, y, 668, 62, p.isHuman ? 'rgba(80,120,60,0.5)' : 'rgba(255,255,255,0.06)',
             p.alive ? COL.line : 'rgba(255,80,80,0.4)', 8);
         this.txt(bmp, String(i + 1), 36, y + 6, 40, 22, COL.gold);
-        this.txt(bmp, p.name, 76, y + 6, 240, 22, p.alive ? COL.white : '#888');
+        this.txt(bmp, this.dispName(p), 76, y + 6, 240, 22, p.alive ? COL.white : '#888');
         // 淘汰者 HP 一律显示 0，不露出负数
         var hp = p.showHp();
         this.txt(bmp, 'HP ' + hp, 320, y + 6, 120, 22, hp > 30 ? COL.white : COL.red);
@@ -929,11 +1211,20 @@ Scene_D678.prototype.skipMaxFx = function () {
     this.refresh();
 };
 
+// 待选期间只能选牌 —— 要牌 / 过牌 / 出别的功能牌一律挡住。
+// 【三个入口都要挡】只挡界面按钮不够：联机那份会覆写 onHit/onStand，
+// 挡在这一层的话两边都得写一遍，所以做成一个谓词让三处共用。
+Scene_D678.prototype.pick2Waiting = function () {
+    var b = this._battle;
+    return !!(b && b.pending2 && b.pending2.side === 0);
+};
+
 Scene_D678.prototype.onHit = function () {
     var b = this._battle;
     if (!b || b.turn !== 0 || b.finished) return;
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     if (!b.canHit(0)) {
-        this.notice(b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌');
+        this.notice(b.noHitReason(0));
         this.refresh(); return;
     }
     this._selFunc = null;
@@ -944,6 +1235,7 @@ Scene_D678.prototype.onHit = function () {
 Scene_D678.prototype.onStand = function () {
     var b = this._battle;
     if (!b || b.turn !== 0 || b.finished) return;
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     this._selFunc = null;
     b.act(0, 'stand');
     this.afterPlayerAction();
@@ -952,18 +1244,24 @@ Scene_D678.prototype.onStand = function () {
 Scene_D678.prototype.onUseFunc = function () {
     var b = this._battle, me = D678.Game.human();
     if (!b || b.turn !== 0 || b.finished) return;
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     if (this._selFunc === null) return;
     var id = me.funcs[this._selFunc];
     if (!id) return;
     var r = b.useFunc(0, id);
     if (!r.ok) { this.notice(r.err || '无法使用'); this.refresh(); return; }
     this.funcFx();
-    if (r.fail) this.notice('此号牌已在场上');
+    // 失败原因由 useFunc 给出（抽号牌是「此号牌已在场上」，
+    // 复制是「我方没有明牌可以复制」）—— 别写死其中一种
+    if (r.fail) this.notice('失败：' + (r.err || '无法使用'));
     // 【重抽一律播完整动画】必须在 refresh 之前动精灵，否则那一帧就已经
     // 复用了旧精灵。收牌用 r.oldValue（洗回去那张的数值），发牌靠扔掉
     // 新牌的精灵让它重新入场。
     if (r.kind === 'repick') this.redealCard(0, r.oldValue);
     this._selFunc = null;
+    // 二选一：回合没结束，盘面停在待选上。这里只 refresh 让选择面板出来，
+    // 不能走 afterPlayerAction —— 那会去推进回合、让 AI 行动。
+    if (r.pending2) { this.refresh(); return; }
     this.afterPlayerAction();
 };
 
@@ -1224,9 +1522,12 @@ Scene_D678.prototype.revealFx = function () {
 
 //--- 满点演出 --------------------------------------------------------------
 //
-// 满点只可能出现在胜者身上（isMaxVal 要求不爆且恰好等于目标点数；双方都满点
-// 则距离相等 -> 平局，doResolve 在 tie 分支就 return 了，maxPoint 不累计），
-// 所以一次结算最多放一次，不必考虑两边同时演出。
+// 演出只放给**胜者**，一次结算最多一次，不必考虑两边同时演出。
+//
+// 前五张规则牌下「满点必胜」：isMaxVal 要求不爆且恰好等于目标点数，
+// 双方都满点则距离相等 -> 平局，doResolve 在 tie 分支就 return 了。
+// 但 规则比多 把这条前提打破了 —— 它先比张数，所以恰好 21 点的人可能因为
+// 张数少而输。所以触发条件写的是 r.maxes[r.winner]，不是「谁满点」。
 //
 // 演出放在屏幕正中而不是贴胜者牌区：结算面板占 y 300~680 且几乎不透明，
 // 贴牌区必然被平切。居中 + 走 _fxTopLayer + 面板延后淡入，三者一起才不打架。
@@ -1241,12 +1542,23 @@ D678.MAXFX_HOLD  = D678.MAXFX_DELAY + D678.MAXFX_SHOW;
 D678.RESOLVE_WAIT     = 150;
 D678.RESOLVE_WAIT_MAX = 200;
 
+// 满点演出上那行大字。牛牛下「满点」这个词是错的 —— 那条规则里满点就叫牛牛，
+// 玩家看到的成绩行也写着「牛牛」，大字再写「满点」两边对不上。
+// 【为什么按 r.cows 判而不是 b.isCowRule()】结算时 revealed 已经翻牌，
+// 而 cowBroken 会随场上张数变化；r.cows 是 doResolve 当时定下来的成绩，
+// 跟成绩行读的是同一份数据，不会出现「行里写牛牛、大字写满点」。
+Scene_D678.prototype.maxFxText = function (si) {
+    var r = this._battle && this._battle.result;
+    if (r && r.cows && r.cows[si] === 10) return '牛 牛 !';
+    return '满 点 !';
+};
+
 // 渐变填色的「满点!」位图。textColor 只能纯色，所以直接画在 _context 上
 // （项目里 box / ringBitmap / dealFx 已经是这个路子）。
-Scene_D678.prototype.maxTextBitmap = function () {
+Scene_D678.prototype.maxTextBitmap = function (txt) {
     var W = 640, H = 170;
     var b = new Bitmap(W, H), ctx = b._context;
-    var txt = '满 点 !';
+    txt = txt || '满 点 !';
     ctx.save();
     // 走 Bitmap 自己的字体名（GameFont），别写死字体族。
     // _makeFontNameText 是 MV 内部方法，保险起见留一条回退。
@@ -1345,7 +1657,7 @@ Scene_D678.prototype.maxFx = function (si) {
 
     // 5) 主体大字。缩放走 maxEase（过冲后收住），
     //    到第 MAXFX_SHOW 帧开始缩小淡出，正好是面板淡入那一帧。
-    var sp = new Sprite(this.maxTextBitmap());
+    var sp = new Sprite(this.maxTextBitmap(this.maxFxText(si)));
     sp.anchor.x = sp.anchor.y = 0.5;
     sp.x = cx; sp.y = cy;
     this.addFx(sp, life, function (s, r, tick) {
@@ -1405,6 +1717,7 @@ Scene_D678.prototype.beginRound = function () {
     if (!myPair) {                       // 玩家轮空
         this._battle = null;
         this._lastLog = null;            // 轮空没有对战记录
+    this._reportVs = null;           // 对手战绩块（只有 gameover 用）
         this.simulateOthers();
         this.handleElimination();
         this._phase = 'roundResult';
@@ -1451,7 +1764,14 @@ Scene_D678.prototype.updateBattle = function () {
     if (b.turn === 1) {
         var ev = D678.AI.step(b, 1);
         if (ev.action === 'func') this.funcFx();
-        this.pushMsg(ev.msg);
+        // AI 的二选一不演出选择过程（你定的）：它是瞬间选完的，
+        // 只在提示条上说清结果 —— 否则玩家只看到「对方使用了二选一」，
+        // 场上多了张牌却不知道是怎么来的。
+        if (ev.pick2 && ev.pick2.value !== null) {
+            this.pushMsg(ev.msg + '，抽出了 ' + ev.pick2.value);
+        } else {
+            this.pushMsg(ev.msg);
+        }
         this._wait = 45;
         // 对方重抽也要播完整动画（收牌 + 发牌）—— 否则看不出他到底做了什么。
         // 判 kind 而不是 ev.same：抽到不同数字时旧牌同样该飞回牌库。
@@ -1468,7 +1788,9 @@ Scene_D678.prototype.onBattleEnd = function () {
         this._phase = 'tie';
         b.revealed = true;
         this.revealFx();
-        // 平局不可能满点（双方同点在 doResolve 里走 tie 分支），面板照旧立刻画
+        // 平局一律不放满点演出，面板照旧立刻画。
+        // （牛牛 / 规则比多 下双方可以同时满点又打平 —— 双牛牛、或张数点数全同，
+        //   那时也不放演出：演出是给胜者的。）
         this._panelHold = 0;
         this._panelFade = 1;
         this.pushMsg('平局，重新发牌');
@@ -1480,13 +1802,17 @@ Scene_D678.prototype.onBattleEnd = function () {
         this._phase = 'resolve';
         var r = b.result;
         this.revealFx();
-        var isMax = !!(r.maxes[0] || r.maxes[1]);
+        // 【只给胜者放演出】原来是「谁满点给谁放」，靠的是「满点必胜」这条前提。
+        // 规则比多 把这条前提打破了：先比张数，所以恰好 21 点（满点）的人
+        // 完全可能因为张数少而输 —— 那时会给刚输掉的人放一场庆祝演出。
+        // 前五张规则牌下满点仍然必胜，所以这个收紧对它们没有任何影响。
+        var isMax = !!(r.maxes[r.winner]);
         if (isMax) {
             // 满点：先翻底牌，第 MAXFX_DELAY 帧砸大字，这段时间不画结算面板。
             // 只有满点才拉长（约 3.3 秒），普通胜负仍是 150 帧（2.5 秒）。
             this._panelHold = D678.MAXFX_HOLD;
             this._panelFade = 0;
-            var side = r.maxes[0] ? 0 : 1;
+            var side = r.winner;
             this.laterFx(D678.MAXFX_DELAY, function () { this.maxFx(side); });
             this._wait = D678.RESOLVE_WAIT_MAX;
         } else {
@@ -1574,12 +1900,17 @@ Scene_D678.prototype.buildRoundReport = function () {
         var a = r.pairs[i][0], b = r.pairs[i][1];
         var mine = (a.isHuman || b.isHuman);
         var w = (a.last && a.last.type === 'win') ? a : ((b.last && b.last.type === 'win') ? b : null);
-        if (!w) { rows.push({ type: 'none', win: a.name, lose: b.name, me: mine }); continue; }
+        // 名字走 dispName —— 单机里我那一行显示「你」而不是昵称
+        if (!w) {
+            rows.push({ type: 'none', win: this.dispName(a), lose: this.dispName(b),
+                        me: mine });
+            continue;
+        }
         var l = (w === a) ? b : a;
-        rows.push({ type: 'match', win: w.name, lose: l.name, dmg: l.last.dmg,
-                    out: !l.alive, me: mine });
+        rows.push({ type: 'match', win: this.dispName(w), lose: this.dispName(l),
+                    dmg: l.last.dmg, out: !l.alive, me: mine });
     }
-    if (r.bye) rows.push({ type: 'bye', win: r.bye.name, me: r.bye.isHuman });
+    if (r.bye) rows.push({ type: 'bye', win: this.dispName(r.bye), me: r.bye.isHuman });
     this._report = rows;
 };
 
@@ -1627,6 +1958,7 @@ Scene_D678.prototype.checkGameEnd = function () {
         this._notice = '你被淘汰了……';
         var me = g.human();
         this._report = this.buildFinalReport(g.rankedPlayers().indexOf(me) + 1);
+        this._reportVs = this.buildVsRows();
         this.refresh();
         return true;
     }
@@ -1635,6 +1967,7 @@ Scene_D678.prototype.checkGameEnd = function () {
         this._battle = null;
         this._notice = '最后的幸存者！你赢得了这场赌局！';
         this._report = this.buildFinalReport(1);
+        this._reportVs = this.buildVsRows();
         this.refresh();
         return true;
     }
@@ -1642,6 +1975,15 @@ Scene_D678.prototype.checkGameEnd = function () {
 };
 
 // 淘汰 / 通关画面的战绩表。胜率与满点率的分母是真正打完的场次（平局重发不计入）
+//
+// 【2026-08-05 改成和锦标赛淘汰页一致（你定的）】原来这里在我的详情之后
+// 按名次列全员（8 行），有两个问题：
+//   1. 和联机锦标赛淘汰页的观感不一致 —— 那边是「我的详情 + 对手战绩」，
+//      没有全员表（见 678net.js 的 drawElim）。
+//   2. 那 8 行画到 y=708，而对战记录框从 y=584 起、后画、半透明 ——
+//      最后 4 个人本来就被盖住了，等于白画。
+// 现在只留我的详情 5 行，全员信息走血条上的「▼ 排名」（gameover 时
+// drawHpBar 照样画、命中区照样注册，点得开），那份还更详细。
 Scene_D678.prototype.buildFinalReport = function (rank) {
     var g = D678.Game, me = g.human();
     return [
@@ -1651,6 +1993,36 @@ Scene_D678.prototype.buildFinalReport = function (rank) {
         '满点 ' + me.maxPoint + ' 次　满点率 ' + me.rateText(me.maxRate()),
         '共使用功能牌 ' + (me.funcUses || 0) + ' 次'
     ];
+};
+
+// 对每个对手的头对头战绩，给结算页的「对手战绩」块用。
+// 口径和锦标赛淘汰页完全一致（678net.js:872-883）：VS 名字 / 对局 N 场 / 胜率 Z%。
+//
+// 【为什么不是排名表里那个胜率】排名表列的是那个人的**总胜率**，
+// 这里是**他跟我**打的胜率 —— 两个数不一样，回答的也不是同一个问题
+// （「谁厉害」vs「我打得过谁」）。所以两块都留着，不重复。
+//
+// 数据来自 me.vsLog（core 层记的，单机联机共用同一条 doResolve 路径），
+// 平局不计入 —— 和 wins/losses 的口径一致。
+Scene_D678.prototype.buildVsRows = function () {
+    var me = D678.Game.human(), out = [];
+    var log = me.vsLog || {};
+    for (var id in log) {
+        if (!Object.prototype.hasOwnProperty.call(log, id)) continue;
+        var e = log[id], g = e.wins + e.losses;
+        out.push({
+            name: e.name,
+            games: g,
+            // 没打过的显示 '—'（和 rateText / 联机的 pct 一致），不显示 0%
+            rate: g > 0 ? Math.round(e.wins / g * 100) : null
+        });
+    }
+    // 交手多的排前面，同场次按胜率高的在前 —— 让「打得最多的对手」一眼看到
+    out.sort(function (a, b) {
+        if (b.games !== a.games) return b.games - a.games;
+        return (b.rate === null ? -1 : b.rate) - (a.rate === null ? -1 : a.rate);
+    });
+    return out;
 };
 
 Scene_D678.prototype.leaveScene = function () {
@@ -1667,15 +2039,61 @@ Scene_D678.prototype.refresh = function () {
     if (!this._battle) {
         this.syncFuncSprites([], 20, LY.FUNC_Y);
         var bmp = this._uiBmp;
-        this.box(bmp, 40, 268, 640, 300, 'rgba(0,0,0,0.5)', COL.line, 12);
-        this.txt(bmp, '第 ' + D678.Game.round + ' 轮结果', 0, 286, LY.SW, 28, COL.gold, 'center');
         var rows = this._report || [];
+        // 【gameover 的几何单独算】要装「我的详情 5 行 + 对手战绩块」，而且
+        // 整块必须收在 y<584 以内 —— 对战记录框从 584 起、后画、半透明，
+        // 越线的行会被它盖住（原来的全员表就是这么白画了 4 行）。
+        var over0 = (this._phase === 'gameover');
+        var vs    = over0 ? (this._reportVs || []) : [];
+        var top   = over0 ? 132 : 268;
+        var rowY  = over0 ? 196 : 340;
+        var lineH = over0 ? 28  : 42;
+        // 【高度按真实内容底边算，别照抄锦标赛那个公式】原来写的是
+        // `196 + (30 + n*26)`，那是从 678net.js 的 drawElim 抄来的 ——
+        // 但那边头部只有 4 行文字、起始 y 也不一样，照抄的结果是**每种条数
+        // 都溢出 6px**，末行正好压在金色边框上／掉到框外（用户看到的
+        // 「所有玩家名称超过了框」）。
+        //
+        // 现在从底边倒推，和下面画 VS 块用的是同一套数：
+        //   VS 标题 y  = rowY + 5*lineH + 8      （= top + 212）
+        //   末行 y     = 标题 + 26 + (n-1)*26
+        //   末行底边   = 末行 y + 20              （行高 20）
+        // 相对 top 就是 232 + 26n，再留 16 的下边距。
+        var PAD = 16, VS_LINE = 26, VS_ROW_H = 20;
+        var vsTopOff = 5 * lineH + (rowY - top) + 8;      // VS 标题相对 top
+        var hgt;
+        if (!over0) {
+            hgt = 300;
+        } else if (vs.length) {
+            hgt = vsTopOff + VS_LINE + (vs.length - 1) * VS_LINE + VS_ROW_H + PAD;
+        } else {
+            hgt = (rowY - top) + 5 * lineH + PAD;         // 没对手就只装 5 行
+        }
+        this.box(bmp, 40, top, 640, hgt, 'rgba(0,0,0,0.5)', COL.line, 12);
+        this.txt(bmp, over0 ? '最终战绩' : ('第 ' + D678.Game.round + ' 轮结果'),
+            0, top + 18, LY.SW, 28, COL.gold, 'center');
         if (rows.length && typeof rows[0] === 'string') {
             for (var i = 0; i < rows.length; i++) {
-                this.txt(bmp, rows[i], 0, 340 + i * 42, LY.SW, 22, COL.white, 'center');
+                this.txt(bmp, rows[i], 0, rowY + i * lineH, LY.SW,
+                    over0 ? 20 : 22, COL.white, 'center');
+            }
+            // 对手战绩块：坐标 / 列宽 / 配色全部照锦标赛淘汰页（678net.js:872-883），
+            // 两边观感一致。720 宽下 96/316/456 三列正好排满。
+            if (vs.length) {
+                var vy = rowY + rows.length * lineH + 8;
+                this.txt(bmp, '对手战绩', 0, vy, LY.SW, 20, COL.gold, 'center');
+                for (var k = 0; k < vs.length; k++) {
+                    var v = vs[k], ry = vy + 26 + k * 26;
+                    this.txt(bmp, 'VS ' + v.name, 96, ry, 220, 20, COL.white, 'left');
+                    this.txt(bmp, '对局 ' + v.games + ' 场', 316, ry, 140, 20, COL.gray, 'left');
+                    // 胜率颜色：过半绿、其余灰，一眼看出打得过谁（同锦标赛）
+                    var vcol = (v.rate !== null && v.rate >= 50) ? COL.green : COL.gray;
+                    this.txt(bmp, '胜率 ' + (v.rate === null ? '—' : v.rate + '%'),
+                        456, ry, 160, 20, vcol, 'left');
+                }
             }
         } else {
-            this.drawReport(rows, 66, 340, 42);
+            this.drawReport(rows, 66, rowY, lineH);
         }
         // 锦标赛：我这桌打完了、本轮还没结束时，在框上方点明在等什么，
         // 并在报表下面列出还在打的人（你定的，复用这个页面不另做）。
@@ -1742,7 +2160,7 @@ Scene_D678.prototype.drawBattleLog = function () {
         var e = shown[i];
         // 我方一行用青色、对方用橙色，一眼分得清是谁的动作
         var col = (e.side === 0) ? COL.aqua : COL.orange;
-        this.txt(bmp, e.name + e.what, x + 16, ly, 430, 18, col, 'left');
+        this.txt(bmp, this.dispLogName(e) + e.what, x + 16, ly, 430, 18, col, 'left');
         this.txt(bmp, e.hand, x + 452, ly, 172, 18, COL.white, 'right');
         ly += lineH;
     }

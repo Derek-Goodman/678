@@ -63,6 +63,16 @@ D678N.saveName = function (s) {
     try { localStorage.setItem('d678_name', s); } catch (e) {}
 };
 
+// 单机也用这个昵称：覆写 678core 留的钩子（核心那边不能直接读 localStorage，
+// 它要跑在 Node 里）。没设过昵称时退回核心的默认值。
+//
+// 【只影响下一局】D678_Game 在构造时把名字定下来，所以在大厅改完名
+// 再开新的单机赌局才生效，进行中的那局不会中途改名。
+D678.humanName = function () {
+    var s = D678N.savedName();
+    return s ? s : '我';
+};
+
 // 会话用 sessionStorage 而不是 localStorage：同一个浏览器开两个标签页
 // 测试时，localStorage 是共享的，两边会抢同一个座位
 D678N.session = function () {
@@ -364,11 +374,24 @@ D678N.buildBattle = function (v, game) {
             // uid 照抄服务器发的 —— 精灵靠它认牌。丢了的话「删中间那张」时
             // 后面的牌会被当成新牌一起重新入场（见 678.js 的 cardKey）。
             cards: s.cards.map(function (c) {
-                return { v: c.v, hidden: c.hidden, uid: c.uid };
+                // fake / face 照抄：绘制层靠它们给复制品染色、给 +1/-1 换卡图
+                // （见 678.js 的 refreshCards）。服务器只在为真时才发这两个字段。
+                var o = { v: c.v, hidden: c.hidden, uid: c.uid };
+                if (c.fake) o.fake = true;
+                if (c.face) o.face = c.face;
+                return o;
             }),
             stood: s.stood, checkN: s.checkN, known: [],
         };
     });
+    // 二选一的待选。服务器已经按人遮蔽过：只有选的那个人拿到两张候选的点数，
+    // 对手那份 vals 是 null（他只知道有人在选）。
+    // 【side 恒为 0】客户端永远把自己当 side 0，所以 mine 直接映射成 0/1。
+    b.pending2 = v.pick2 ? {
+        side: v.pick2.mine ? 0 : 1,
+        vals: v.pick2.vals || null,
+        funcName: '二选一'
+    } : null;
     b.log = null;   // 日志由服务器在揭牌后单独下发
     return b;
 };
@@ -1878,9 +1901,19 @@ Scene_D678.prototype.netSend = function (action) {
         if (!r) { self.notice('网络异常'); self.refresh(); return; }
         if (r.stale) { self.refresh(); return; }   // 重复提交，静默丢掉
         if (!r.ok) { self.notice(r.err || '无法操作'); self.refresh(); return; }
-        if (r.fail) self.notice('此号牌已在场上');
+        // r.fail 是服务器的 failNote，内容就是失败原因（抽号牌 / 复制各不相同）
+        if (r.fail) self.notice('失败：' + (typeof r.fail === 'string' ? r.fail : '无法使用'));
         self.refresh();
     });
+};
+
+// 二选一的选择：联机不能本地结算（那等于让客户端决定抽到哪张牌），
+// 只把选了哪个下标发上去，服务器改盘面再推回来。
+var _p2c = Scene_D678.prototype.pick2Commit;
+Scene_D678.prototype.pick2Commit = function (idx) {
+    if (!this._net) { _p2c.call(this, idx); return; }
+    if (!this.pick2Waiting()) return;
+    this.netSend({ type: 'pick2', idx: idx });
 };
 
 var _oh = Scene_D678.prototype.onHit;
@@ -1888,9 +1921,10 @@ Scene_D678.prototype.onHit = function () {
     if (!this._net) { _oh.call(this); return; }
     var b = this._battle;
     if (!this.netCanAct()) return;
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     // 本地先挡一下明显不合法的，省一次往返（服务器仍会独立校验）
     if (!b.canHit(0)) {
-        this.notice(b.deck.length === 0 ? '牌库已空' : '明牌合计大于等于21点无法继续要牌');
+        this.notice(b.noHitReason(0));
         this.refresh();
         return;
     }
@@ -1900,6 +1934,7 @@ Scene_D678.prototype.onHit = function () {
 var _os = Scene_D678.prototype.onStand;
 Scene_D678.prototype.onStand = function () {
     if (!this._net) { _os.call(this); return; }
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     this.netSend({ type: 'stand' });
 };
 
@@ -1907,6 +1942,7 @@ var _ouf = Scene_D678.prototype.onUseFunc;
 Scene_D678.prototype.onUseFunc = function () {
     if (!this._net) { _ouf.call(this); return; }
     if (!this.netCanAct()) return;
+    if (this.pick2Waiting()) { this.notice('请先在两张牌里选一张'); return; }
     if (this._selFunc === null) return;
     var me = D678.Game.human();
     var id = me.funcs[this._selFunc];
