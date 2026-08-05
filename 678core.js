@@ -133,7 +133,7 @@ D678.FUNCS = [];
     D678.FUNCS.push({ id: 'check', img: 'check', name: '查看牌库', kind: 'check',
         desc: '查看牌库顶部 4 张牌（不足则显示剩余）。\n结果会常驻显示，只有自己可见。\n不消耗回合。' });
     D678.FUNCS.push({ id: 'repick', img: 'repick', name: '重抽', kind: 'repick',
-        desc: '将自己最新的一张明牌洗进牌库，然后重抽一张（明牌）。\n因为洗回去了，有可能重新抽到同一个数字。\n抽牌后本回合结束。' });
+        desc: '将自己最新的一张明牌洗进牌库，然后重抽一张（明牌）。\n刚洗回去的那个数字这次抽不到。\n抽牌后本回合结束。' });
     D678.FUNCS.push({ id: 'reback', img: 'reback', name: '干扰', kind: 'reback',
         desc: '强制替换对方的第一张底牌，\n换上来的数字一定不是原来那张。\n换下的牌洗回牌库。\n不消耗回合。' });
     D678.FUNCS.push({ id: 'picksmall', img: 'picksmall', name: '抽小', kind: 'picksmall',
@@ -158,8 +158,12 @@ D678.FUNCS = [];
         desc: '游戏规则改为牛牛，本规则没有爆牌限制。\n每位玩家最多 5 张数字牌（含底牌）。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
     D678.FUNCS.push({ id: 'rulemore', img: 'rulemore', name: '规则比多', kind: 'rule',
         desc: '改为比牌的张数，多者获胜。\n超过 21 点仍算爆牌，张数相同才比谁近 21 点。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+    // 【这张的卡面被 4 行上限逼着把末尾两句并成一行】其它规则牌是
+    // 「规则牌互相覆盖，场上只存在一张。」+「不消耗回合。」两行，这张多了
+    // 「底牌重掷」那句代价，不并就是 5 行、面板会截断（见 _test_rules.js
+    // 的 B3-6e，那个上限是从 678.js 的绘制参数算出来的）。
     D678.FUNCS.push({ id: 'rulenoseencard', img: 'rulenoseencard', name: '规则暗牌', kind: 'rule',
-        desc: '只有暗牌的点数计入判定，明牌一律不算。\n仍以接近 21 点为目标，超过即爆牌。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+        desc: '只有暗牌的点数计入判定，明牌一律不算。\n出牌时自己的底牌换成随机的一张。\n仍以接近 21 点为目标，超过即爆牌。\n规则牌互相覆盖，只存在一张。不消耗回合。' });
     // 【唯一一张要玩家在回合中途做选择的牌】其它牌打出去就结算完了，
     // 这张会留下一个「待选」状态（pending2），选完才真正拿牌。
     // 所以它牵动的地方比别的牌多：回合计时、掉线兜底、平局重发的清理。
@@ -838,6 +842,33 @@ D678_Battle.prototype.firstHole = function (si) {
     return null;
 };
 
+// 把 si 方自己的第一张底牌换成牌库里随机的一张，换下来的洗回牌库。
+// 返回 {oldValue, value}，换不了（没有底牌 / 牌库空）时返回 null。
+//
+// 【和 reback 的区别只有方向】reback 换的是对方的底牌，换上来的那张是
+// 自己亲手放的、所以自己确知；这里换的是**自己**的底牌，对手看不见新的那张，
+// 所以 known 的更新方向正好相反：
+//   · side.known 记的是「我推理出对方底牌有X」—— 我方底牌动了，跟它无关，不能碰。
+//   · opp.known 记的是「对方推理出我方底牌有X」—— 换掉的那个作废，必须摘掉。
+//     新的那张对手没见过，不能替他记上（那等于凭空送他情报）。
+// 这两条搞反的后果不会抛异常，只会让 AI 拿着一个已经不成立的前提推演。
+//
+// 【只换第一张】用过「抽暗牌」的人手上可能有多张暗牌，但底牌指的是开局那张
+// （firstHole 找的就是它），后面暗抽来的不动 —— 你定的口径。
+D678_Battle.prototype.rerollOwnHole = function (si) {
+    var hole = this.firstHole(si);
+    if (!hole) return null;
+    if (this.deck.length === 0) return null;
+    var idx = Math.floor(Math.random() * this.deck.length);
+    var newV = this.deck.splice(idx, 1)[0];
+    var oldV = hole.v;
+    hole.v = newV;
+    this.shuffleInto(oldV);        // 换下来的牌洗回牌库
+    this.consumeCheck();           // 牌库被动过，查看牌库的情报作废一层
+    D678.remove(this.sides[1 - si].known, oldV);
+    return { oldValue: oldV, value: newV };
+};
+
 //--- 回合 ------------------------------------------------------------------
 
 D678_Battle.prototype.endTurn = function () {
@@ -970,6 +1001,17 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         var rblock = this.ruleBlockedReason(id);
         if (rblock) { res.err = rblock; return res; }
         this.rule = id;
+        // 【规则暗牌自带代价：出牌方自己的底牌重掷】这条规则实际上就是拼底牌
+        // （开局双方各只有 1 张暗牌），不加代价的话「偷看自己底牌是 10 -> 出这张」
+        // 就是稳赢，胜负在发牌那一刻就定了。重掷之后出牌方也得赌一次。
+        //
+        // 【每次出都重掷】手上有两张就能连着重掷两次（规则牌不消耗回合），
+        // 已经是暗牌规则时再出一张也照样重掷 —— 你定的口径：花一张牌买一次重摇。
+        if (id === 'rulenoseencard') {
+            // 牌库空时换不了，规则照样生效（不因为换不成就让整张牌失效）
+            var rr = this.rerollOwnHole(si);
+            if (rr) { res.oldValue = rr.oldValue; res.value = rr.value; }
+        }
         res.ok = true; res.msg = '对方使用了' + f.name;
         break;
     case 'check':
@@ -978,16 +1020,31 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         break;
     case 'repick':
         // 自己最新的明牌洗回牌库，然后重抽一张。
-        // 因为是洗回去再抽，有可能抽到刚洗进去的那一张（同一个数字）。
+        //
+        // 【刚洗回去那个数字这次抽不到】靠顺序保证：先抽，再把旧牌洗回去。
+        // 和「抽大」排除刚退回那张是同一个路子（见 pickbig 分支的注释），
+        // 不用额外的排除逻辑。原来是「先洗回去再抽」，于是有 1/(n+1) 抽回同一张，
+        // 玩家看到的是「用了重抽好像没反应」—— 这条改动就是为了掐掉那种空转。
+        //
+        // 例外：牌库空时没有别的牌可抽，只能洗回去再抽回同一张（你定的）。
+        // 这时牌照样消耗，等于白出一张 —— 但不拦着他出。
         var rp = this.newestUp(si);
         if (!rp) { res.err = '我方场上没有明牌'; return res; }
         var rpPos = side.cards.indexOf(rp);
         side.cards.splice(rpPos, 1);
-        // 假牌不洗回牌库，直接消失，然后照常重抽一张（见 mkCard 的注释）
-        if (!rp.fake) this.shuffleInto(rp.v);
         res.fakeGone = !!rp.fake;
         res.oldValue = rp.v;
-        res.value = this.doDraw(si, false);
+        if (rp.fake) {
+            // 假牌不洗回牌库，直接消失，然后照常重抽一张（见 mkCard 的注释）。
+            // 它本来就不占牌库的位子，所以没有「排除刚洗回去那张」这回事。
+            res.value = this.doDraw(si, false);
+        } else if (this.deck.length === 0) {
+            this.shuffleInto(rp.v);
+            res.value = this.doDraw(si, false);
+        } else {
+            res.value = this.doDraw(si, false);
+            this.shuffleInto(rp.v);
+        }
         res.same = (!rp.fake && res.value === rp.v);
         res.ok = true; res.endTurn = true;
         res.msg = '对方使用了' + f.name;
@@ -1086,7 +1143,10 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         else if (f.kind === 'swap')       what += '，双方最新明牌互换';
         else if (f.kind === 'rob')        what += '，夺走对方明牌';
         else if (f.kind === 'return')     what += '，明牌退回牌库底';
-        else if (f.kind === 'rule')       what += '，规则变为' + f.name;
+        else if (f.kind === 'rule')       what += '，规则变为' + f.name +
+                                                  // 规则暗牌会重掷出牌方的底牌（换不成时没有这两个字段）
+                                                  (res.value !== undefined && res.value !== null ?
+                                                   '，自己底牌 ' + res.oldValue + ' 换成 ' + res.value : '');
         else if (f.kind === 'check')      what += '，看了牌库顶 ' + side.checkN + ' 张';
         else if (f.kind === 'repick')     what += '，洗掉 ' + res.oldValue + ' 重抽到 ' +
                                                   res.value + (res.same ? '（又是同一张）' : '');
@@ -2000,8 +2060,31 @@ D678.AI.ruleTimingOK = function (b, si, id) {
     // 所以这三张换成「改完之后我相对对手是不是真的更好」——
     // 直接拿 cmpScore 比双方成绩，比任何距离代理量都准。
     if (b.isCowRule() || b.isMoreRule() || b.isHiddenRule()) {
+        // 【规则暗牌要按重掷之后的底牌判，不能按现在这张】出这张牌会把自己的
+        // 底牌换成随机一张，所以拿当前底牌算出来的成绩，正是这一手会亲手作废的
+        // 前提 —— 不换的话 AI 会因为「我现在底牌 10」而出牌，而出完那张 10 就没了。
+        // 换成「候选的平均值」当代理：闸门只要挡住「换完平均还不如对手」就够，
+        // 真正的取舍在 simFunc 那边按候选逐一取期望。
+        var hole = null, holeSave = 0;
+        if (b.isHiddenRule() && id === 'rulenoseencard') {
+            hole = b.firstHole(si);
+            if (hole && b.deck.length > 0) {
+                var pool = b.sides[si].p.isGod ? b.deck : D678.AI.unseen(b, si);
+                if (pool.length) {
+                    var sum = 0;
+                    for (var pi = 0; pi < pool.length; pi++) sum += pool[pi];
+                    holeSave = hole.v;
+                    hole.v = Math.round(sum / pool.length);
+                } else {
+                    hole = null;
+                }
+            } else {
+                hole = null;
+            }
+        }
         var mine = b.scoreOf(si), theirs = b.scoreOf(1 - si);
         var better = D678.cmpScore(mine, theirs) > 0;
+        if (hole) hole.v = holeSave;
         // 对手的暗牌我方看不见，scoreOf 会把它按面值算进去 ——
         // 这是乐观估计，但双方同样口径，作为闸门够用（真正的取舍在 simFunc 的期望值里）。
         b.rule = save;
@@ -2186,34 +2269,29 @@ D678.AI.simFunc = function (b, si, id, depth) {
     } else if (f.kind === 'repick') {
         var rpc = b.newestUp(si);
         if (!rpc) return null;
-        // 牌库空也能用：那张牌洗回去后牌库就有 1 张，重抽必定拿回同一张
         var oldV = rpc.v;
-        // 先把这张明牌拿掉、洗回牌库，再看重抽的结果。
+        // 先把这张明牌拿掉，再看重抽的结果。
         // 在克隆盘面上用 newestUp 重新定位，避免场上有同值牌时错删。
         var cr = b.clone();
         cr.sides[si].cards.splice(cr.sides[si].cards.indexOf(cr.newestUp(si)), 1);
-        cr.deck.push(oldV);
-        if (god) {
-            // 洗回去是随机插入：以 1/(n+1) 抽到刚洗进去的那张，
-            // 否则抽到他原本已知的牌库顶那张。这两种结果都是确定的。
-            var n0 = b.deck.length;
-            var pSame = 1 / (n0 + 1);
-            var vSame = null, vTop = null;
-            var cA = cr.clone();
-            this.simAdd(cA, si, oldV, false);
-            vSame = this.bestValue(cA, si, Math.max(0, depth - 1));
-            if (n0 > 0) {
-                var cB = cr.clone();
-                this.simAdd(cB, si, b.deck[0], false);
-                vTop = this.bestValue(cB, si, Math.max(0, depth - 1));
-                val = pSame * vSame + (1 - pSame) * vTop;
-            } else {
-                val = vSame;
-            }
+        // 【刚洗回去那张这次抽不到】useFunc 是先抽再洗回去，所以推演里
+        // 那张旧牌不进候选。牌库空是唯一的例外（必定抽回同一张）。
+        var rpEmpty = (b.deck.length === 0);
+        if (rpEmpty) {
+            var cE = cr.clone();
+            this.simAdd(cE, si, oldV, false);
+            val = this.bestValue(cE, si, Math.max(0, depth - 1));
+        } else if (god) {
+            // 超哥知道牌库顺序，抽的必定是牌库顶那张 —— 没有随机性。
+            // （旧牌是抽完之后才洗回去的，影响不到这一抽。）
+            var cB = cr.clone();
+            this.simAdd(cB, si, b.deck[0], false);
+            val = this.bestValue(cB, si, Math.max(0, depth - 1));
         } else {
-            // 其他人眼里重抽的结果就是「未见牌 ∪ 刚洗回去的那张」里随机一张
+            // 其他人眼里重抽的结果是「未见牌里除掉刚洗回去那张」的随机一张。
+            // cr 里那张牌已经离场，unseen 会把它算成未见 —— 手工摘掉。
             var Ur = this.unseen(cr, si);
-            if (Ur.indexOf(oldV) < 0) Ur = Ur.concat([oldV]);
+            D678.remove(Ur, oldV);
             if (!Ur.length) return null;
             var sr = 0;
             for (var ri = 0; ri < Ur.length; ri++) {
@@ -2314,6 +2392,30 @@ D678.AI.simFunc = function (b, si, id, depth) {
             sb += this.bestValue(cb2, si, depth);
         }
         val = sb / cand.length - fv;
+    } else if (id === 'rulenoseencard' && b.firstHole(si) && b.deck.length > 0) {
+        // 【这张要按期望估，不能只掷一次】它会把出牌方自己的底牌换成随机一张，
+        // 而这条规则下底牌就是成绩本身 —— 直接 useFunc 只能采到一个样本，
+        // 估值会随机漂移，AI 有时把一手烂底牌估成好棋。
+        // 所以照 reback 的路子枚举候选取平均。
+        if (!this.ruleTimingOK(b, si, id)) return null;
+        var hcand = god ? b.deck.slice(0) : this.unseen(b, si);
+        if (!hcand.length) return null;
+        if (hcand.length > 8) hcand = hcand.slice(0, 8);
+        var sh = 0;
+        for (var hi = 0; hi < hcand.length; hi++) {
+            var ch = b.clone();
+            var hh = ch.firstHole(si);
+            if (!hh) continue;
+            var oldHV = hh.v;
+            ch.rule = id;
+            hh.v = hcand[hi];
+            D678.remove(ch.deck, hcand[hi]);
+            ch.deck.push(oldHV);
+            // 对手对我方底牌的推理作废（useFunc 里 rerollOwnHole 做的是同一件事）
+            D678.remove(ch.sides[1 - si].known, oldHV);
+            sh += this.bestValue(ch, si, depth);
+        }
+        val = sh / hcand.length - fv;
     } else {
         // 规则牌先过时机闸门：离新目标太远就不出，把牌留到够得着的时候
         if (f.kind === 'rule' && !this.ruleTimingOK(b, si, id)) return null;
