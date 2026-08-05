@@ -467,6 +467,70 @@ function viewOrder(playerN, mePIdx, oppPIdx) {
     return ord;
 }
 
+//--- 结算结果的遮蔽（1v1 和锦标赛共用这一份）--------------------------------
+//
+// 【为什么必须共用】原来 maskView 和 maskViewT 各自手写了一份字段清单，
+// 而 doResolve 会按规则往 result 上挂额外字段：
+//   · 牛牛  -> r.cows        （成绩是「牛4 / 牛牛 / 无牛」，不是点数）
+//   · 比多  -> r.cardCounts  （判定看张数，点数根本不该显示）
+// 两份清单都漏了这两个字段，于是多人模式下：
+//   · 拼点画面退回画总点数（drawShowdownTotal 靠 r.cows / r.cardCounts 分支）
+//   · 满点大字写「满点!」而不是「牛 牛 !」（maxFxText 读 r.cows）
+// 规则在服务器上其实是生效的 —— 只是客户端拿不到成绩，看起来像「没生效」。
+// 这就是用户报的「牛牛/比多没生效、拼点时显示也不会」。
+//
+// 【新增规则牌时看这里】如果新规则也往 result 上挂按 side 索引的数组，
+// 加进 SIDE_ARRAYS 就行，两种模式一起生效，不会再漏一边。
+// 挂的是标量（双方对称）就加进 SCALARS。
+const RESULT_SIDE_ARRAYS = ['totals', 'busts', 'maxes', 'cows', 'cardCounts'];
+const RESULT_SCALARS     = ['tie', 'dmg', 'items', 'target',
+                            'tieCount', 'tieBonus', 'prevLosses'];
+
+// meSide 是「我」在这桌的 side（0/1）。返回的视图里我恒为下标 0。
+// winnerP / loserP 是 Player 对象引用，绝不能直接发（会把对方全部字段带出去），
+// 所以单独抽成 winnerName / loserName。
+function maskResult(r, meSide) {
+    if (!r) return null;
+    const sw = (arr) => (meSide === 0 ? arr.slice(0) : [arr[1], arr[0]]);
+    const out = {
+        winner: r.tie ? -1 : (r.winner === meSide ? 0 : 1),
+        winnerName: r.winnerP ? r.winnerP.name : '',
+        loserName:  r.loserP  ? r.loserP.name  : '',
+    };
+    // 按 side 索引的数组：跟着镜像。没有这个字段的规则就不发（客户端按
+    // 「有没有这个字段」分支，发个 undefined 会让 JSON 里整个消失，正合适）
+    RESULT_SIDE_ARRAYS.forEach(k => {
+        if (Array.isArray(r[k])) out[k] = sw(r[k]);
+    });
+    // 双方对称的标量：原样带过去。tie 要保证是布尔，别把 undefined 发出去
+    RESULT_SCALARS.forEach(k => {
+        if (r[k] !== undefined) out[k] = (k === 'tie') ? !!r[k] : r[k];
+    });
+    if (out.tie === undefined) out.tie = false;
+    if (out.dmg === undefined) out.dmg = 0;
+    if (out.items === undefined) out.items = 0;
+    return out;
+}
+
+//--- 二选一待选状态的遮蔽（1v1 和锦标赛共用）-------------------------------
+//
+// 【两张候选的点数只发给选的那个人】对手只该知道「他正在二选一」——
+// 知道候选是什么就等于知道了牌库顶两张，那是查看牌库才有的情报。
+// 没选的那张会压到牌库底，所以泄漏出去连「牌库最后一张是什么」都送了。
+//
+// 【锦标赛原来整个漏了这个字段】maskViewT 的 view 里压根没有 pick2，
+// 客户端于是永远不知道「该我选牌了」：buildBattle 造出来的副本 pending2
+// 是 null，drawPick2 不会被调用，两个候选牌的点击区一个都不注册 ——
+// 表现就是用户报的「二选一点击后无任何反应」。
+function maskPick2(b, meSide) {
+    if (!b.pending2) return null;
+    const mine = (b.pending2.side === meSide);
+    return {
+        mine: mine,
+        vals: mine ? b.pending2.vals.slice(0) : null,
+    };
+}
+
 // b 是一桌对局；me / opp 是这桌的两个 side 对应的 game.players 下标。
 // meSide 是「我」在这桌的 side（0 或 1）—— 镜像后我永远显示成 side 0。
 function maskView(b, me, snapPre) {
@@ -503,22 +567,7 @@ function maskView(b, me, snapPre) {
 
     // result 的 totals/busts/maxes 都是按 side 索引的数组，要跟着镜像；
     // winnerP / loserP 是 Player 对象引用，不能发（会把对方全部字段带出去）
-    let result = null;
-    if (b.result) {
-        const r = b.result;
-        const sw = (arr) => (me === 0 ? arr : [arr[1], arr[0]]);
-        result = {
-            totals: sw(r.totals), busts: sw(r.busts), maxes: sw(r.maxes),
-            winner: r.tie ? -1 : (r.winner === me ? 0 : 1),
-            tie: !!r.tie,
-            dmg: r.dmg || 0, items: r.items || 0, target: r.target,
-            // 平局次数 / 平局加伤（拼点画面显示「平局✖N」，你定的）。
-            // 双方对称的公开信息，不需要镜像。
-            tieCount: r.tieCount || 0, tieBonus: r.tieBonus || 0,
-            winnerName: r.winnerP ? r.winnerP.name : '',
-            loserName:  r.loserP  ? r.loserP.name  : '',
-        };
-    }
+    const result = maskResult(b.result, me);
 
     const P = (si) => {
         const p = b.players[si];
@@ -545,18 +594,8 @@ function maskView(b, me, snapPre) {
 
     const ord = (f) => (me === 0 ? [f(0), f(1)] : [f(1), f(0)]);
 
-    // 二选一的待选状态。
-    // 【两张候选的点数只发给选的那个人】对手只该知道「他正在二选一」——
-    // 知道候选是什么就等于知道了牌库顶两张，那是查看牌库才有的情报。
-    // 没选的那张会压到牌库底，所以泄漏出去连「牌库最后一张是什么」都送了。
-    let pick2 = null;
-    if (b.pending2) {
-        const mine = (b.pending2.side === me);
-        pick2 = {
-            mine: mine,
-            vals: mine ? b.pending2.vals.slice(0) : null,
-        };
-    }
+    // 二选一的待选状态（遮蔽规则见 maskPick2）
+    const pick2 = maskPick2(b, me);
 
     return {
         deck: deck,
@@ -619,7 +658,6 @@ function maskViewT(room, bt, seat, snapPre) {
     if (bt) {
         const b = bt.b;
         const meSide = (bt.pIdx[0] === mePIdx) ? 0 : 1;
-        const sw = (arr) => (meSide === 0 ? arr : [arr[1], arr[0]]);
 
         const maskSide = (si) => {
             const s = b.sides[si];
@@ -639,20 +677,9 @@ function maskViewT(room, bt, seat, snapPre) {
             };
         };
 
-        let result = null;
-        if (b.result) {
-            const r = b.result;
-            result = {
-                totals: sw(r.totals), busts: sw(r.busts), maxes: sw(r.maxes),
-                winner: r.tie ? -1 : (r.winner === meSide ? 0 : 1),
-                tie: !!r.tie,
-                dmg: r.dmg || 0, items: r.items || 0, target: r.target,
-                // 平局次数 / 平局加伤，和 1v1 那边同一份（拼点画面用）
-                tieCount: r.tieCount || 0, tieBonus: r.tieBonus || 0,
-                winnerName: r.winnerP ? r.winnerP.name : '',
-                loserName:  r.loserP  ? r.loserP.name  : '',
-            };
-        }
+        // 【和 1v1 共用 maskResult】原来这里手写了一份字段清单，漏掉了
+        // 牛牛的 cows 和比多的 cardCounts —— 见 maskResult 上方的注释。
+        const result = maskResult(b.result, meSide);
 
         const preOf = (pIdx) => {
             if (!snapPre) return null;
@@ -669,6 +696,9 @@ function maskViewT(room, bt, seat, snapPre) {
             redeals: b.redeals,
             sides: [maskSide(meSide), maskSide(1 - meSide)],
             result: result,
+            // 【这个字段原来整个没有】少了它锦标赛的二选一点了没反应，
+            // 见 maskPick2 上方的注释
+            pick2: maskPick2(b, meSide),
             preFuncs: snapPre ? ord.map(preOf) : null,
             preFuncCounts: snapPre
                 ? ord.map(i => (snapPre[i] ? snapPre[i].length : null)) : null,
