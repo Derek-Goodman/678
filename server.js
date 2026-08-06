@@ -41,6 +41,9 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 const zlib = require('zlib');
+// 只给天梯登录令牌用。房号和 sid 照旧走 rndId（Math.random）——
+// 那两个猜中了也只能进一个房间，令牌猜中了是别人的号。
+const crypto = require('crypto');
 
 // 规则层的位置有两种：开发时这个文件在 server/ 下，678core.js 在上一层；
 // 装配到上线包后两者同级。两个都试，省得为部署单独改一行。
@@ -130,10 +133,51 @@ const CFG = {
 
     // 「本日」按哪个时区算（小时）。默认东八区。
     //
-    // 【别用服务器本地时间】Railway 跑在 UTC，不校正的话「本日」会在
-    // 北京时间早上 8 点翻篇 —— 正好是有人在玩的时候，数字会当着人的面归零。
+    // 【别用服务器本地时间】部署平台（Zeabur / Railway）跑在 UTC，不校正的话
+    // 「本日」会在北京时间早上 8 点翻篇 —— 正好是有人在玩的时候，
+    // 数字会当着人的面归零。
     tzOffset: Number(argOf('--tz-offset', 8)),
+
+    // 要落盘的数据存哪个目录（本日计数、天梯账号）。
+    //
+    // 【为什么要能改】容器化部署每次上线都拿新镜像重建容器，运行期写出来的
+    // 文件不在镜像里，重建完就没了。本日计数无所谓（归零就归零），
+    // **但账号不行** —— 那等于每次上线所有人重新注册。
+    //
+    // 解法是在平台上挂一个持久卷、把 DATA_DIR 指向挂载点（比如 /data）。
+    // 没配就退回 server/ 目录：本地 `node server.js` 照旧能跑，
+    // 部署时不挂卷也能跑，只是账号活不过下一次上线。
+    dataDir: path.resolve(process.env.DATA_DIR || argOf('--data-dir', __dirname)),
 };
+
+// 数据目录可能不存在（挂载点是空的 / 传了个新路径）。建不出来也别让服务起不来
+// —— 落盘那两处各自 try 过，最坏情况是存不住，功能照常。
+try { fs.mkdirSync(CFG.dataDir, { recursive: true }); } catch (e) {}
+
+// 数据目录到底能不能写。
+//
+// 【为什么光打印路径不够】路径对、目录也在，但卷没真挂上去 —— 那时候写的是
+// 容器自己的文件系统，下次上线照样清号，而日志上看不出任何区别。所以真写一个
+// 探测文件再删掉，把结果打在启动横幅上。
+//
+// 返回 ok / 只读 / 建不出来，附带这个目录里已有的账号数（挂对了的话重新部署
+// 之后这个数不该归零 —— 那是「持久化真的生效了」最直接的证据）。
+function probeDataDir() {
+    const out = { ok: false, why: '', accFileBytes: -1 };
+    const probe = path.join(CFG.dataDir, '.write-probe');
+    try {
+        fs.writeFileSync(probe, String(Date.now()), 'utf8');
+        fs.unlinkSync(probe);
+        out.ok = true;
+    } catch (e) {
+        out.why = e.code || e.message;
+    }
+    try {
+        out.accFileBytes = fs.statSync(path.join(CFG.dataDir,
+            '678-account.json')).size;
+    } catch (e) { /* 第一次跑还没这个文件，正常 */ }
+    return out;
+}
 
 // 时间戳要拼进格式串里，不能当第一个参数传 —— 那样 %s 不会被替换
 const log = (fmt, ...a) => console.log(new Date().toISOString().slice(11, 19) + ' ' + fmt, ...a);
@@ -156,7 +200,7 @@ const log = (fmt, ...a) => console.log(new Date().toISOString().slice(11, 19) + 
 //
 // 【为什么 online 不信客户端】开赛这件事服务器自己知道，让客户端上报等于
 // 白开一个能刷的口子。单机那三项没办法 —— 服务器看不见单机局，只能客户端报。
-const DAILY_FILE = path.join(__dirname, '_daily.json');
+const DAILY_FILE = path.join(CFG.dataDir, '_daily.json');
 const DAILY_MAX_BUMP = 8;      // 单次请求最多加这么多（多人开赛按人数加，8 人赛顶格）
 
 const daily = { day: '', plays: 0, finishes: 0, champs: 0, online: 0 };
@@ -432,6 +476,207 @@ function cleanName(s, fallback) {
     if (!s) s = fallback || '玩家';
     if (AI_NAME_SET.has(s)) s += '.';   // 撞 AI 名字就加个点区分
     return s;
+}
+
+//=============================================================================
+// 天梯账号
+//=============================================================================
+//
+// 明文存密码（你定的）。这个体量不搞加盐哈希，代价是这份文件泄了就等于泄了
+// 一份「账号+密码」对照表 —— 所以登录界面上挂一句「请勿使用你在其他地方用的
+// 密码」，风险交给玩家自己判断。
+//
+// 【文件绝不能放进 CFG.dir】serveStatic 把那底下所有文件都对外提供，放进去
+// 等于挂在网上任人下载。这里写 CFG.dataDir，和 public/ 没有交集。
+//
+// 【天梯游戏名和多人首界面那个玩家名是两个东西】后者存在浏览器 localStorage
+// 里、随便改、管锦标赛和单机；天梯名绑在账号上、全服唯一、每天只能改一次。
+// 不共用是因为：登录天梯顺带改掉朋友局的名字说不通，退出天梯后名字还锁着
+// 每天一次更说不通。
+//
+// 落盘的只有账号、密码、游戏名、最后一次改名是哪天。**登录令牌只在内存里**
+// —— 进程重启就得重新认证（客户端收到 401 回登录页）。
+
+const ACC_FILE = path.join(CFG.dataDir, '678-account.json');
+
+// 账号总数上限。注册接口不需要鉴权，谁都能拿脚本灌 —— 满了就不再收新的。
+// 2000 个账号的 JSON 大约 200KB，离撑爆任何东西都很远。
+const ACC_MAX = 2000;
+
+// 同一个 IP 两次注册之间至少隔这么久（毫秒）。挡的是脚本连发，
+// 不挡正常人 —— 一个人一辈子就注册一次。
+const REG_COOL_MS = 10000;
+
+// 令牌上限。认证一次发一个，满了淘汰最早的（Map 保插入序）。
+const TOKEN_MAX = 5000;
+
+const accounts  = new Map();   // 账号小写 -> {acc, pw, name, renamedDay}
+const ladNames  = new Map();   // 游戏名小写 -> 账号小写（唯一性索引）
+const ladTokens = new Map();   // 令牌 -> 账号小写
+const regCool   = new Map();   // IP -> 上次注册时刻
+
+//--- 校验 ------------------------------------------------------------------
+
+// 账号：4-16 位，只收 ASCII 字母数字下划线。
+//
+// 不收中文 —— 它是登录 ID，得能在任何输入法状态下敲出来；而且中文还有
+// 全角半角、繁简这些等价问题，比对起来全是坑。大小写不敏感（Derek 和 derek
+// 是同一个号），但原样保留一份给界面显示。
+function chkAcc(s) {
+    s = String(s == null ? '' : s);
+    return /^[A-Za-z0-9_]{4,16}$/.test(s) ? s : null;
+}
+
+// 密码：4-16 位可打印 ASCII，不含空白。
+// 禁空白是防「手机输入法自动补了个尾随空格」那种查不出来的登录失败。
+function chkPw(s) {
+    s = String(s == null ? '' : s);
+    if (s.length < 4 || s.length > 16) return null;
+    return /^[\x21-\x7e]+$/.test(s) ? s : null;
+}
+
+// 天梯游戏名：4-8 个字符，汉字算 1 个。汉字 / 字母 / 数字，别的一概不收。
+//
+// 【为什么不收 emoji 和标点】8 个汉字正好等于 cleanName 的宽度上限 16
+// （排名列表就 696px 宽），emoji 的绘制宽度不可控，而且截断会切碎代理对。
+//
+// 【为什么撞 AI 名字要直接拒】678core 的 isGod 是按名字判的
+// （name === GOD_NAME），真人取名「超哥」会被当成知道牌库顺序的 AI。
+// 不能像 cleanName 那样撞了就加个点 —— 那会破了 4-8 位这条。
+function chkLadName(s) {
+    s = String(s == null ? '' : s).trim();
+    let n = 0;
+    for (const ch of s) {
+        const c = ch.codePointAt(0);
+        const ok = (c >= 0x30 && c <= 0x39) ||       // 0-9
+                   (c >= 0x41 && c <= 0x5a) ||       // A-Z
+                   (c >= 0x61 && c <= 0x7a) ||       // a-z
+                   (c >= 0x4e00 && c <= 0x9fff);     // 汉字
+        if (!ok) return null;
+        n++;
+    }
+    if (n < 4 || n > 8) return null;
+    if (AI_NAME_SET.has(s)) return null;
+    return s;
+}
+
+//--- 落盘 ------------------------------------------------------------------
+
+let accDirty = false, accSaveTimer = null;
+
+// 攒 2 秒写一次，和本日计数同一个思路。注册和改名都是低频操作，
+// 认证则完全不写盘 —— 别让每次登录都同步写一遍文件。
+//
+// 【先写临时文件再改名】账号不像本日计数那样丢了就丢了。直接覆写的话，
+// 进程在写一半时被杀（部署、OOM）会留下一个截断的 JSON，下次启动读不回来
+// —— 那是所有人的号一起没。rename 在同一个文件系统上是原子的。
+function accSave() {
+    accDirty = true;
+    if (accSaveTimer) return;
+    accSaveTimer = setTimeout(() => {
+        accSaveTimer = null;
+        if (!accDirty) return;
+        accDirty = false;
+        const out = { v: 1, list: [] };
+        for (const a of accounts.values()) {
+            out.list.push({ acc: a.acc, pw: a.pw, name: a.name,
+                            renamedDay: a.renamedDay });
+        }
+        const tmp = ACC_FILE + '.tmp';
+        try {
+            fs.writeFileSync(tmp, JSON.stringify(out), 'utf8');
+            fs.renameSync(tmp, ACC_FILE);
+        } catch (e) {
+            log('天梯账号写盘失败（忽略）: %s', e.message);
+            try { fs.unlinkSync(tmp); } catch (e2) {}
+        }
+    }, 2000);
+}
+
+function accLoad() {
+    let raw = null;
+    try { raw = fs.readFileSync(ACC_FILE, 'utf8'); }
+    catch (e) { return; }            // 没有文件是正常的（第一次跑）
+    // 去掉 BOM。我们自己写的没有，但这个文件是有可能被手工看/改的
+    // （Windows 记事本、PowerShell 的 Out-File 都会加 BOM），而 JSON.parse
+    // 遇到 BOM 直接抛 —— 那就会走到下面「读不回来」那条路，
+    // 把整份账号挪进 .bad，所有人的号一起没。
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+    let o = null;
+    try { o = JSON.parse(raw); } catch (e) {}
+    if (!o || !Array.isArray(o.list)) {
+        // 读不回来别静默当成「没有账号」—— 那样下一次 accSave 就把这个坏文件
+        // 覆盖掉，连证据都没了。挪到 .bad 留着，空着起服务。
+        log('！天梯账号文件读不回来，已挪到 678-account.json.bad，本次以空账号启动');
+        try { fs.renameSync(ACC_FILE, ACC_FILE + '.bad'); } catch (e) {}
+        return;
+    }
+    for (const a of o.list) {
+        const acc = chkAcc(a && a.acc);
+        if (!acc) continue;
+        const key = acc.toLowerCase();
+        const rec = {
+            acc: acc, pw: String(a.pw == null ? '' : a.pw), name: '',
+            renamedDay: String(a.renamedDay || ''),
+        };
+        // 名字要过一遍校验再认：规则以后收紧的话，老数据里不合规的那些
+        // 就当没起过名，让他重新起一个
+        const nm = a.name ? chkLadName(a.name) : null;
+        if (nm && !ladNames.has(nm.toLowerCase())) {
+            rec.name = nm;
+            ladNames.set(nm.toLowerCase(), key);
+        }
+        accounts.set(key, rec);
+    }
+    log('天梯账号载入 %d 个（%s）', accounts.size, ACC_FILE);
+}
+
+//--- 令牌 / 请求辅助 -------------------------------------------------------
+
+function newToken() {
+    if (ladTokens.size >= TOKEN_MAX) {
+        // 淘汰最早的那个。被淘汰的人下一次操作收到 401，客户端回登录页重认证
+        const first = ladTokens.keys().next();
+        if (!first.done) ladTokens.delete(first.value);
+    }
+    return crypto.randomBytes(16).toString('hex');
+}
+
+function accOfToken(tk) {
+    const key = ladTokens.get(String(tk == null ? '' : tk));
+    return key ? (accounts.get(key) || null) : null;
+}
+
+// 发给客户端的账号信息。**绝不带 pw** —— 明文存是一回事，顺着接口发回去
+// 是另一回事（浏览器 devtools 里直接就能看到）。
+function accView(a) {
+    return {
+        acc: a.acc,
+        name: a.name || '',
+        // 今天还能不能改名。还没起过名时是「首次设置」，不算改名，所以也是 true
+        canRename: !a.name || a.renamedDay !== dayKey(),
+    };
+}
+
+// 取客户端 IP。平台在前面架了反向代理，socket 上看到的是代理的地址，
+// 所以先认 x-forwarded-for 的第一段。这个头可以伪造 —— 它只用来给注册
+// 加个冷却，不做任何鉴权用途。
+function ipOf(req) {
+    const f = req.headers['x-forwarded-for'];
+    if (f) return String(f).split(',')[0].trim().slice(0, 45);
+    return String((req.socket && req.socket.remoteAddress) || '').slice(0, 45);
+}
+
+function regTooSoon(ip) {
+    const now = Date.now();
+    // 顺手清过期的，免得这个表跟着 IP 数一直涨
+    if (regCool.size > 1000) {
+        for (const [k, t] of regCool) {
+            if (now - t > REG_COOL_MS) regCool.delete(k);
+        }
+    }
+    const last = regCool.get(ip);
+    return !!(last && now - last < REG_COOL_MS);
 }
 
 //=============================================================================
@@ -2292,6 +2537,106 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    //--- 天梯：注册 --------------------------------------------------------
+    // 注册成功直接发令牌（等于顺带登录）。让人注册完再去点一次「认证」是白
+    // 多一步 —— 他刚刚才输过这对账号密码。
+    if (u === '/api/lad/reg' && req.method === 'POST') {
+        readBody(req, body => {
+            if (!body) return json(res, 400, { err: '请求格式错误' });
+            const acc = chkAcc(body.acc);
+            if (!acc) return json(res, 400, { err: '账号是 4-16 位字母、数字或下划线' });
+            const pw = chkPw(body.pw);
+            if (!pw) return json(res, 400, { err: '密码是 4-16 位字母、数字或符号' });
+            const key = acc.toLowerCase();
+            if (accounts.has(key)) return json(res, 409, { err: '这个账号已经被注册了' });
+            if (accounts.size >= ACC_MAX) {
+                return json(res, 507, { err: '账号数已达上限，联系管理员' });
+            }
+            const ip = ipOf(req);
+            if (regTooSoon(ip)) {
+                return json(res, 429, { err: '注册太频繁，等十秒再试' });
+            }
+            regCool.set(ip, Date.now());
+            const rec = { acc: acc, pw: pw, name: '', renamedDay: '' };
+            accounts.set(key, rec);
+            accSave();
+            const tk = newToken();
+            ladTokens.set(tk, key);
+            log('天梯注册 %s（共 %d 个账号）', acc, accounts.size);
+            json(res, 200, Object.assign({ ok: true, token: tk }, accView(rec)));
+        });
+        return;
+    }
+
+    //--- 天梯：认证 --------------------------------------------------------
+    // 账号不存在和密码错一律回同一句「账号或密码不对」—— 分开说等于告诉
+    // 试密码的人「这个账号存在，继续试」。
+    if (u === '/api/lad/auth' && req.method === 'POST') {
+        readBody(req, body => {
+            if (!body) return json(res, 400, { err: '请求格式错误' });
+            const acc = chkAcc(body.acc);
+            const pw  = chkPw(body.pw);
+            if (!acc || !pw) return json(res, 401, { err: '账号或密码不对' });
+            const rec = accounts.get(acc.toLowerCase());
+            if (!rec || rec.pw !== pw) return json(res, 401, { err: '账号或密码不对' });
+            const tk = newToken();
+            ladTokens.set(tk, acc.toLowerCase());
+            json(res, 200, Object.assign({ ok: true, token: tk }, accView(rec)));
+        });
+        return;
+    }
+
+    //--- 天梯：拿自己的信息（刷新页面后用令牌换回登录态）------------------
+    if (u === '/api/lad/me' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const rec = accOfToken(body.token);
+            if (!rec) return json(res, 401, { err: '登录已失效，请重新认证' });
+            json(res, 200, Object.assign({ ok: true }, accView(rec)));
+        });
+        return;
+    }
+
+    //--- 天梯：设置 / 修改游戏名 -------------------------------------------
+    // 首次设置不算用掉当天那一次（注册完就要起名，起完发现打错字当天就锁死
+    // 太糙）。之后每天一次，记在服务器的账号上 —— 记浏览器的话清一下
+    // localStorage 就能无限改。翻篇点复用 dayKey()，和本日计数同一套
+    // （北京时间 00:00）。
+    if (u === '/api/lad/name' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const rec = accOfToken(body.token);
+            if (!rec) return json(res, 401, { err: '登录已失效，请重新认证' });
+            const nm = chkLadName(body.name);
+            if (!nm) return json(res, 400, { err: '名字是 4-8 位汉字、字母或数字' });
+            const today = dayKey();
+            const first = !rec.name;
+            if (!first && rec.renamedDay === today) {
+                return json(res, 429, Object.assign(
+                    { err: '每天只能修改一次' }, accView(rec)));
+            }
+            // 改成和现在一样的名字：直接当成功返回，别把当天那一次用掉
+            if (rec.name === nm) {
+                return json(res, 200, Object.assign({ ok: true }, accView(rec)));
+            }
+            const lower = nm.toLowerCase();
+            const owner = ladNames.get(lower);
+            // 唯一性按小写比 —— 榜上同时有 Derek 和 derek 是分不清谁是谁的
+            if (owner && owner !== rec.acc.toLowerCase()) {
+                return json(res, 409, Object.assign(
+                    { err: '这个名字有人用了' }, accView(rec)));
+            }
+            if (rec.name) ladNames.delete(rec.name.toLowerCase());
+            rec.name = nm;
+            ladNames.set(lower, rec.acc.toLowerCase());
+            // 首次设置不写 renamedDay，所以当天还能再改一次
+            if (!first) rec.renamedDay = today;
+            accSave();
+            json(res, 200, Object.assign({ ok: true, first: first }, accView(rec)));
+        });
+        return;
+    }
+
     //--- 在线人数（兼心跳）-------------------------------------------------
     // 大厅页每 5 秒打一次。故意不更新 room.touched —— 那是「房间有人在用」的
     // 判据，被一个只是站在菜单上的旁观者刷新的话，空房间永远等不到清理。
@@ -2477,17 +2822,30 @@ if (!fs.existsSync(path.join(CFG.dir, 'index.html'))) {
 }
 
 dailyLoad();
+accLoad();
 
 // 给测试用：房间状态是模块内私有的，而 D678.Game 只在 withRoom 期间有效，
 // 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出随机弃牌）。
 // 只导出引用，不导出任何操作函数。daily 也导出，回归要断言计数。
-module.exports = { rooms, CFG, withRoom, visitors, daily };
+// accounts / ladTokens 给天梯回归用（要能直接改 renamedDay 模拟翻篇）。
+module.exports = { rooms, CFG, withRoom, visitors, daily, accounts, ladTokens };
 
 server.listen(CFG.port, '0.0.0.0', () => {
     console.log('');
     console.log('  678 联机服务器已启动');
     console.log('  ─────────────────────────────────────────');
     console.log('  游戏目录  %s', CFG.dir);
+    // 挂了持久卷没生效的话，这几行是唯一能当场看出来的地方
+    const pr = probeDataDir();
+    console.log('  数据目录  %s%s', CFG.dataDir,
+        process.env.DATA_DIR ? '（DATA_DIR）' : '（默认，上线会被冲掉）');
+    console.log('  可写      %s', pr.ok ? '是' : '！否（' + pr.why + '）—— 账号存不住');
+    if (!process.env.DATA_DIR) {
+        console.log('  ！没设 DATA_DIR，账号活不过下一次上线。挂了卷就把它指过去');
+    }
+    console.log('  账号文件  %s', pr.accFileBytes >= 0
+        ? pr.accFileBytes + ' 字节 / ' + accounts.size + ' 个账号'
+        : '还没有（第一次跑，或者卷是新的）');
     console.log('  起始 HP   %d', CFG.startHp);
     console.log('  回合超时  %s', CFG.turnSec ? CFG.turnSec + ' 秒' : '关闭');
     console.log('  在线判定  %d 秒无心跳算离线', CFG.visitorSec);

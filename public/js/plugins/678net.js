@@ -113,6 +113,46 @@ D678N.visitorToken = function () {
 D678N.stats = null;
 
 //=============================================================================
+// 天梯登录态
+//=============================================================================
+//
+// 令牌存 sessionStorage，和对局会话同一个理由（见上面那段）：localStorage
+// 是同浏览器所有标签页共享的，双开测试时两边会互相顶。刷新页面不丢，
+// 关标签页就没了。
+//
+// 账号名另外存 localStorage —— 那只是「下次帮你填上」的便利，不是登录态。
+//
+// 【服务器重启后令牌就失效了】它只在服务器内存里。客户端收到 401 就把本地
+// 那份清掉、回登录页，不要在界面上装作还登录着。
+D678N.ladToken = function () {
+    try { return sessionStorage.getItem('d678_lad') || ''; } catch (e) { return ''; }
+};
+D678N.setLadToken = function (t) {
+    try {
+        if (t) sessionStorage.setItem('d678_lad', t);
+        else sessionStorage.removeItem('d678_lad');
+    } catch (e) {}
+};
+D678N.lastAcc = function () {
+    try { return localStorage.getItem('d678_lad_acc') || ''; } catch (e) { return ''; }
+};
+D678N.setLastAcc = function (s) {
+    try { localStorage.setItem('d678_lad_acc', s); } catch (e) {}
+};
+
+// 内存里的天梯身份。null = 没登录。{acc, name, canRename}
+D678N.lad = null;
+
+// 天梯页现在停在哪一步。三步是递进的，服务器的状态决定走到哪：
+//   login  没认证 —— 输账号密码
+//   name   认证了但还没起名 —— 输 4-8 位游戏名
+//   ready  有名字了 —— 「开启排位」可以点
+D678N.ladStage = function () {
+    if (!D678N.lad) return 'login';
+    return D678N.lad.name ? 'ready' : 'name';
+};
+
+//=============================================================================
 // 本日计数（标题画面上方三行）
 //=============================================================================
 // 全服累计，所有人看到同一个数（你定的）。
@@ -445,6 +485,180 @@ function drawBtn(bmp, x, y, w, h, on, press) {
     bmp._setDirty();
 }
 
+//=============================================================================
+// 天梯登录表单（canvas 上盖 DOM <input>）
+//=============================================================================
+//
+// **只有输入框是 DOM**，面板、标签、按钮照旧画在 canvas 上、走 _hits 那套
+// 命中测试。这样观感和别处一致，DOM 只有两三个元素，也不用重做一遍按钮。
+//
+// 为什么不用 window.prompt（房号那边就是）：注册要连弹三次系统对话框
+// （账号→密码→确认密码），而天梯是门面。
+//
+// 坐标只有一份 —— ladLayout() 同时喂给绘制代码和这个浮层，
+// 两边各写一套的话改一次尺寸就会错位。
+
+var LAD_IN_H = 52, LAD_ROW = 68, LAD_LBL_W = 96;
+
+// stage: login | name。reg = 注册态（多一栏「确认密码」）
+function ladLayout(stage, reg) {
+    var W = Graphics.width;
+    // 388 而不是 340 —— 天梯页的名字条比别处高（多一行红字，到 310），
+    // 「天梯模式」那行标题占 336~376，面板必须从这之后开始
+    var px = Math.round(W / 2 - BTN_W / 2), py = 388, pw = BTN_W;
+    var ix = px + 24 + LAD_LBL_W, iw = pw - 48 - LAD_LBL_W;
+    var rows = [];
+    if (stage === 'name') {
+        rows.push({ key: 'name', label: '游戏名', ph: '4-8 位' });
+    } else {
+        rows.push({ key: 'acc', label: '账号', ph: '4-16 位字母数字' });
+        rows.push({ key: 'pw', label: '密码', ph: '' });
+        if (reg) rows.push({ key: 'pw2', label: '确认密码', ph: '再输一次' });
+    }
+    for (var i = 0; i < rows.length; i++) {
+        rows[i].x = ix; rows[i].w = iw; rows[i].h = LAD_IN_H;
+        rows[i].y = py + 26 + i * LAD_ROW;
+    }
+    var last = rows[rows.length - 1];
+    // 提示语那一行（登录页写「别用你在其他地方用的密码」，起名页写位数）
+    var hintY = last.y + LAD_IN_H + 10;
+    var btnY = hintY + 30;
+    var bh = 60;
+    var btns = [];
+    if (stage === 'name') {
+        btns.push({ key: 'setname', label: '确定',
+                    x: px + (pw - 200) / 2, y: btnY, w: 200, h: bh });
+    } else {
+        var bw = (pw - 48 - 20) / 2;
+        btns.push({ key: 'auth', label: '认证', x: px + 24, y: btnY, w: bw, h: bh });
+        btns.push({ key: 'reg',  label: reg ? '确认注册' : '注册',
+                    x: px + 24 + bw + 20, y: btnY, w: bw, h: bh });
+    }
+    return { px: px, py: py, pw: pw, ph: btnY + bh + 24 - py,
+             rows: rows, btns: btns, hintY: hintY };
+}
+
+// 浮层。整个模块只在真的有 document 时才做事 —— 烟测跑在 Node 里，
+// exe（NW.js）的 DOM 也不保证长一样。
+D678N.LadForm = {
+    box: null,
+    inputs: null,       // {key: <input>}
+    _sig: '',           // 当前建的是哪一套（stage|reg），变了就重建
+    _rect: '',          // 上一次贴的位置，没变就不动样式
+
+    live: function () { return !!this.box; },
+
+    // canvas 在页面上的位置和缩放。RMMV 把画布等比缩放居中，
+    // 所以 canvas 坐标要乘 scale 再加偏移才是页面坐标。
+    _geo: function () {
+        if (typeof document === 'undefined') return null;
+        var c = Graphics._canvas;
+        if (!c || !c.getBoundingClientRect) return null;
+        var r = c.getBoundingClientRect();
+        if (!r.width) return null;
+        return { left: r.left, top: r.top, scale: r.width / Graphics.width };
+    },
+
+    open: function (stage, reg, onEnter) {
+        if (typeof document === 'undefined') return;
+        var sig = stage + '|' + (reg ? 1 : 0);
+        if (this.box && this._sig === sig) return;   // 已经是这一套了
+        var keep = this.values();                    // 重建时把已输入的留下
+        this.close();
+        this._sig = sig;
+        var lay = ladLayout(stage, reg);
+        var box = document.createElement('div');
+        box.style.cssText = 'position:absolute;left:0;top:0;margin:0;padding:0;' +
+                            'z-index:20;';
+        this.inputs = {};
+        var self = this;
+        for (var i = 0; i < lay.rows.length; i++) {
+            var r = lay.rows[i];
+            var el = document.createElement('input');
+            el.type = (r.key === 'pw' || r.key === 'pw2') ? 'text' : 'text';
+            // 【密码不遮】你定的：明着输入就行，不搞星号
+            el.placeholder = r.ph || '';
+            el.maxLength = (r.key === 'name') ? 8 : 16;
+            el.value = keep[r.key] || '';
+            el.autocomplete = 'off';
+            el.spellcheck = false;
+            el.style.cssText = 'position:absolute;box-sizing:border-box;' +
+                'background:rgba(0,0,0,0.55);color:#fff;' +
+                'border:2px solid rgba(255,235,170,0.55);border-radius:8px;' +
+                'outline:none;padding:0 10px;font-family:inherit;';
+            // RMMV 在 document 上收触摸和键盘。不掐住的话：点输入框会被当成
+            // 点画布（可能触发按钮），打字会同时驱动游戏输入。
+            ['touchstart', 'touchend', 'mousedown', 'mouseup', 'keyup']
+                .forEach(function (ev) {
+                    el.addEventListener(ev, function (e) { e.stopPropagation(); });
+                });
+            el.addEventListener('keydown', function (e) {
+                e.stopPropagation();
+                if (e.keyCode === 13 && onEnter) onEnter();
+            });
+            box.appendChild(el);
+            this.inputs[r.key] = el;
+        }
+        document.body.appendChild(box);
+        this.box = box;
+        this._rect = '';
+        this.sync();
+        // 自动聚焦第一个空框，省一次点击。手机上不主动聚焦 ——
+        // 那会立刻弹出键盘把界面顶掉一半，让人不知道自己在哪一页。
+        if (!('ontouchstart' in window)) {
+            var first = lay.rows.filter(function (r) {
+                return !self.inputs[r.key].value;
+            })[0] || lay.rows[0];
+            try { this.inputs[first.key].focus(); } catch (e) {}
+        }
+    },
+
+    // 贴到画布对应的位置。位置没变就什么都不做（别每帧写样式）
+    sync: function () {
+        if (!this.box) return;
+        var g = this._geo();
+        if (!g) return;
+        var sig = [g.left, g.top, g.scale].join(',');
+        if (sig === this._rect) return;
+        this._rect = sig;
+        var parts = this._sig.split('|');
+        var lay = ladLayout(parts[0], parts[1] === '1');
+        for (var i = 0; i < lay.rows.length; i++) {
+            var r = lay.rows[i];
+            var el = this.inputs[r.key];
+            if (!el) continue;
+            el.style.left   = Math.round(g.left + r.x * g.scale) + 'px';
+            el.style.top    = Math.round(g.top  + r.y * g.scale) + 'px';
+            el.style.width  = Math.round(r.w * g.scale) + 'px';
+            el.style.height = Math.round(r.h * g.scale) + 'px';
+            el.style.fontSize = Math.max(12, Math.round(26 * g.scale)) + 'px';
+        }
+    },
+
+    values: function () {
+        var o = {};
+        if (!this.inputs) return o;
+        for (var k in this.inputs) {
+            if (this.inputs[k]) o[k] = String(this.inputs[k].value || '').trim();
+        }
+        return o;
+    },
+
+    clearPw: function () {
+        if (!this.inputs) return;
+        ['pw', 'pw2'].forEach(function (k) {
+            if (this.inputs[k]) this.inputs[k].value = '';
+        }, this);
+    },
+
+    close: function () {
+        if (this.box && this.box.parentNode) {
+            try { this.box.parentNode.removeChild(this.box); } catch (e) {}
+        }
+        this.box = null; this.inputs = null; this._sig = ''; this._rect = '';
+    },
+};
+
 function Scene_D678Net() { this.initialize.apply(this, arguments); }
 Scene_D678Net.prototype = Object.create(Scene_Base.prototype);
 Scene_D678Net.prototype.constructor = Scene_D678Net;
@@ -467,6 +681,7 @@ Scene_D678Net.prototype.create = function () {
     this._resuming = false;   // 刷新后正在恢复对局
     this._statsWait = 1;      // 1 = 下一帧就问一次，别等满 5 秒
     this._statsFail = false;  // 服务器没有 /api/stats（老版本）
+    this._ladReg = false;     // 天梯登录表单是不是展开成注册态（多一栏确认密码）
 
     var W = Graphics.width, H = Graphics.height;
     var bg = new Bitmap(W, H);
@@ -653,23 +868,44 @@ Scene_D678Net.prototype.refresh = function () {
     // 玩家名条。原来是一行 20 号灰字（整屏最小）加一句「（点这里可改）」，
     // 点击区还没画框 —— 看不出能点。现在名字提到 32 号白字，和菜单按钮同级，
     // 「修改」做成独立小按钮。点名字本身不改名，避免误触。
-    var nm = D678N.savedName();
-    var px = Math.round(W / 2 - BTN_W / 2), py = 186, ph = 96;
+    // 名字条是三分的（你定的）：
+    //   多人首界面   玩家名 + 「修改」，随便改
+    //   锦标赛 / 单人对决 / 等待 / 淘汰 / 排名   只显示，没有按钮
+    //   天梯页       天梯游戏名 + 「修改」，下面挂红字「每天只能修改一次」
+    //
+    // 【为什么天梯名和玩家名不共用】登录天梯顺带改掉朋友局的名字说不通，
+    // 退出天梯后名字还锁着每天一次更说不通。所以两套各管一摊。
+    var isLad = (this._page === 'ladder');
+    var lad = D678N.lad;
+    var nm = isLad ? (lad ? (lad.name || '') : '') : D678N.savedName();
+    var px = Math.round(W / 2 - BTN_W / 2), py = 186;
+    var ph = isLad ? 124 : 96;
     this.panel(px, py, BTN_W, ph);
-    this.txt('玩家名', px + 24, py + 12, 200, 18, LC.gray, 'left');
+    this.txt(isLad ? '天梯游戏名' : '玩家名',
+             px + 24, py + 12, 200, 18, LC.gray, 'left');
 
     var mw = 96, mh = 56;
-    var mx = px + BTN_W - 20 - mw, my = py + (ph - mh) / 2;
+    var mx = px + BTN_W - 20 - mw;
+    var my = isLad ? py + 36 : py + (ph - mh) / 2;
     // 【赛事结束后不给改名】（2026-08-05 你定的）淘汰页 / 最终排名页上那些
     // 名次和战绩是服务器按**当时那个名字**算好发下来的，就摆在这块名字条
     // 下面。这时候改名，界面上就成了「叫 B 的人拿了第 3 名，而排名表里
     // 第 3 名写着 A」—— 两个名字指同一个人，看着像是排错了。
     // 名字本身照旧显示：那是「这一局我是谁」的说明，去掉反而少了信息。
     // 看完点返回回到子页，那时候按钮就回来了（改的是下一局的名字）。
-    var canRename = (this._page !== 'elim' && this._page !== 'ranks');
-    this.txt(nm || '未设置', px + 24, py + 40,
+    // 天梯页：登录了才给改名按钮（没登录时下面就是登录表单，那才是当务之急）。
+    // 其余页只有多人首界面能改。
+    var canRename = isLad ? !!lad : (this._page === 'menu');
+    this.txt(nm || (isLad ? (lad ? '未设置' : '未登录') : '未设置'),
+             px + 24, py + 40,
              (canRename ? mx - px - 40 : BTN_W - 48), 32,
              nm ? LC.text : LC.gray, 'left');
+
+    // 红字。天梯改名的限次说明，只写一句（你要的）
+    if (isLad && lad) {
+        this.txt('每天只能修改一次', px + 24, py + 86, BTN_W - 48, 20,
+                 LC.red, 'left');
+    }
 
     if (canRename) {
         // 按下反馈沿用 i: -2（改名一直占着这个号），和菜单按钮同一套观感
@@ -684,7 +920,8 @@ Scene_D678Net.prototype.refresh = function () {
         // 没存过名字时也要能点 —— 原来 if (nm) 为假整行都不画，
         // 第一次进来看不到「我是谁」，也没法主动设名字
         this._hits.push({ x: mx, y: my, w: mw, h: mh, i: -2,
-                          cb: this.onChangeName.bind(this) });
+                          cb: (isLad ? this.onLadRename : this.onChangeName)
+                              .bind(this) });
     }
 
     if (this._page === 'menu' || this._page === 'duel' ||
@@ -693,6 +930,7 @@ Scene_D678Net.prototype.refresh = function () {
     if (this._page === 'menu')    this.drawMenu();
     if (this._page === 'duel')    this.drawDuel();
     if (this._page === 'tourney') this.drawTourney();
+    if (this._page === 'ladder')  this.drawLadder();
     if (this._page === 'waiting') this.drawWaiting();
     if (this._page === 'elim')    this.drawElim();
     if (this._page === 'ranks')   this.drawFinalRanks();
@@ -722,10 +960,116 @@ Scene_D678Net.prototype.drawTourney = function () {
     this.txt('锦标赛', 0, 336, Graphics.width, 30, LC.gold, 'center');
     this.buttons([
         { label: '匹配模式', cb: this.onMatch.bind(this) },
-        // 「暂未开启」并进标题：它是 dim 按钮，点了没反应，
-        // 不说一句玩家会以为是坏的
-        { label: '天梯模式（暂未开启）', dim: true, cb: function () {} },
+        { label: '天梯模式', cb: this.onLadder.bind(this) },
     ], 400);
+};
+
+// 天梯页。三步递进（login → name → ready），「开启排位」三步都画 ——
+// 没登录的人也该看得见它，只是点不动（你定的）。
+Scene_D678Net.prototype.drawLadder = function () {
+    var W = Graphics.width;
+    var stage = D678N.ladStage();
+    this.txt('天梯模式', 0, 336, W, 30, LC.gold, 'center');
+
+    if (stage === 'ready') {
+        this.drawLadReady();
+        return;
+    }
+
+    var lay = ladLayout(stage, !!this._ladReg);
+    this.panel(lay.px, lay.py, lay.pw, lay.ph);
+    for (var i = 0; i < lay.rows.length; i++) {
+        var r = lay.rows[i];
+        this.txt(r.label, lay.px + 24, r.y + (LAD_IN_H - 26) / 2,
+                 LAD_LBL_W, 24, LC.text, 'left');
+        // 输入框本身是 DOM（见 D678N.LadForm）。没有 DOM 的环境下画个空框，
+        // 至少版面看着是完整的
+        if (!D678N.LadForm.live()) {
+            var ctx = this._bmp._context;
+            ctx.save();
+            roundRect(ctx, r.x, r.y, r.w, r.h, 8);
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255,235,170,0.55)';
+            ctx.lineWidth = 2; ctx.stroke();
+            ctx.restore();
+            this._bmp._setDirty();
+        }
+    }
+
+    // 【这句是明文存密码的配套】不加的话玩家会拿他在别处用的密码来注册
+    this.txt(stage === 'name' ? '4-8 位，汉字、字母或数字'
+                              : '请勿使用你在其他地方用的密码',
+             lay.px + 24, lay.hintY, lay.pw - 48, 18, LC.gray, 'left');
+
+    for (var j = 0; j < lay.btns.length; j++) {
+        var b = lay.btns[j];
+        var press = (this._press === 100 + j);
+        drawBtn(this._bmp, b.x, b.y, b.w, b.h, press, press);
+        this._bmp.fontSize = 26;
+        this._bmp.textColor = press ? LC.edge : LC.text;
+        this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+        this._bmp.outlineWidth = 4;
+        this._bmp.drawText(b.label, b.x, b.y + (b.h - 32) / 2 + (press ? 2 : 0),
+                           b.w, 32, 'center');
+        this._hits.push({ x: b.x, y: b.y, w: b.w, h: b.h, i: 100 + j,
+                          cb: this.ladBtnCb(b.key) });
+    }
+
+    this.drawRankBtn(lay.py + lay.ph + 28, false);
+};
+
+// 登录且有名字了：只剩「开启排位」和「退出登录」
+Scene_D678Net.prototype.drawLadReady = function () {
+    var W = Graphics.width;
+    var px = Math.round(W / 2 - BTN_W / 2);
+    this.txt('账号 ' + (D678N.lad.acc || ''), px + 24, 388, BTN_W - 48, 20,
+             LC.gray, 'left');
+    this.drawRankBtn(432, true);
+
+    var bw = 200, bh = 54;
+    var bx = px + BTN_W - bw, by = 432 + BTN_H + 28;
+    var press = (this._press === 110);
+    drawBtn(this._bmp, bx, by, bw, bh, press, press);
+    this._bmp.fontSize = 22;
+    this._bmp.textColor = press ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('退出登录', bx, by + (bh - 28) / 2 + (press ? 2 : 0),
+                       bw, 28, 'center');
+    this._hits.push({ x: bx, y: by, w: bw, h: bh, i: 110,
+                      cb: this.onLadLogout.bind(this) });
+};
+
+// 「开启排位」。lit = 亮着（登录且有名字）。没登录也画，只是点不动 ——
+// 看不见的按钮等于没告诉玩家「登录之后有东西」。
+Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
+    var W = Graphics.width;
+    var x = Math.round(W / 2 - BTN_W / 2);
+    var press = lit && (this._press === 120);
+    drawBtn(this._bmp, x, y, BTN_W, BTN_H, press, press);
+    this._bmp.fontSize = 32;
+    this._bmp.textColor = lit ? (press ? LC.edge : LC.text) : LC.gray;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('开启排位', x, y + (BTN_H - 40) / 2 + (press ? 2 : 0),
+                       BTN_W, 40, 'center');
+    if (!lit) {
+        this.txt('认证登录并设置游戏名后可用', x, y + BTN_H - 4, BTN_W, 16,
+                 LC.gray, 'center');
+        return;
+    }
+    this._hits.push({ x: x, y: y, w: BTN_W, h: BTN_H, i: 120,
+                      cb: this.onRank.bind(this) });
+};
+
+Scene_D678Net.prototype.ladBtnCb = function (key) {
+    var self = this;
+    return function () {
+        if (key === 'auth')    { self.onLadAuth(); return; }
+        if (key === 'reg')     { self.onLadReg(); return; }
+        if (key === 'setname') { self.onLadSetName(); return; }
+    };
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
@@ -940,6 +1284,9 @@ Scene_D678Net.prototype.update = function () {
     this.pollNet();
     this.updateStats();
     this.updateInput();
+    // 窗口缩放 / 页面滚动后输入框要跟着画布走。sync 内部比对过位置，
+    // 没变就直接返回，不会每帧写样式。
+    if (D678N.LadForm.live()) D678N.LadForm.sync();
 };
 
 Scene_D678Net.prototype.pollNet = function () {
@@ -1061,6 +1408,169 @@ Scene_D678Net.prototype.onTourney = function () {
     this.refresh();
 };
 
+//--- 天梯 ------------------------------------------------------------------
+
+Scene_D678Net.prototype.onLadder = function () {
+    this._page = 'ladder';
+    this._ladReg = false;
+    // 有令牌就先换回登录态（刷新页面后回到这一页的情形）
+    var tk = D678N.ladToken();
+    if (tk && !D678N.lad) {
+        var self = this;
+        this._busy = true;
+        this.refresh();
+        D678N.Net.post('/api/lad/me', { token: tk }, function (r, code) {
+            self._busy = false;
+            if (r && code === 200 && r.ok) D678N.lad = r;
+            else D678N.setLadToken('');   // 服务器重启过，令牌没了
+            self.syncLadForm();
+            self.refresh();
+        });
+        return;
+    }
+    this.syncLadForm();
+    this.refresh();
+};
+
+// 表单该开哪一套 / 该关掉。每次页面或步骤变了都调一次。
+Scene_D678Net.prototype.syncLadForm = function () {
+    if (this._page !== 'ladder') { D678N.LadForm.close(); return; }
+    var stage = D678N.ladStage();
+    if (stage === 'ready') { D678N.LadForm.close(); return; }
+    var self = this;
+    D678N.LadForm.open(stage, !!this._ladReg, function () {
+        // 回车 = 点主按钮。注册态下是「确认注册」
+        if (stage === 'name') self.onLadSetName();
+        else if (self._ladReg) self.onLadReg();
+        else self.onLadAuth();
+    });
+};
+
+Scene_D678Net.prototype.onLadAuth = function () {
+    var v = D678N.LadForm.values();
+    if (!v.acc || !v.pw) { this.notice('账号和密码都要填'); this.refresh(); return; }
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/lad/auth', { acc: v.acc, pw: v.pw }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200 || !r.ok) {
+            self.notice((r && r.err) || '认证失败，服务器没响应');
+            D678N.LadForm.clearPw();
+            self.refresh();
+            return;
+        }
+        D678N.setLadToken(r.token);
+        D678N.setLastAcc(r.acc);
+        D678N.lad = r;
+        self._ladReg = false;
+        self.syncLadForm();
+        self.refresh();
+    });
+};
+
+// 第一次点「注册」只是把「确认密码」那一栏展开；再点才真的提交。
+// 这就是你说的「点击注册后会让对方再次输入密码确认」。
+Scene_D678Net.prototype.onLadReg = function () {
+    if (!this._ladReg) {
+        this._ladReg = true;
+        this.syncLadForm();
+        this.refresh();
+        return;
+    }
+    var v = D678N.LadForm.values();
+    if (!v.acc || !v.pw) { this.notice('账号和密码都要填'); this.refresh(); return; }
+    if (v.pw !== v.pw2) {
+        this.notice('两次输入的密码不一样');
+        this.refresh();
+        return;
+    }
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/lad/reg', { acc: v.acc, pw: v.pw }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200 || !r.ok) {
+            self.notice((r && r.err) || '注册失败，服务器没响应');
+            self.refresh();
+            return;
+        }
+        // 注册成功直接就是登录态（服务器一并发了令牌），跳到起名那一步
+        D678N.setLadToken(r.token);
+        D678N.setLastAcc(r.acc);
+        D678N.lad = r;
+        self._ladReg = false;
+        self.syncLadForm();
+        self.notice('注册成功，接下来设置游戏名');
+        self.refresh();
+    });
+};
+
+Scene_D678Net.prototype.onLadSetName = function () {
+    var v = D678N.LadForm.values();
+    if (!v.name) { this.notice('名字不能为空'); this.refresh(); return; }
+    this.postLadName(v.name);
+};
+
+// 「修改」按钮：ready 那一步没有输入框，用原生 prompt 拿一次就够 ——
+// 改名是偶发操作，为它常驻一个输入框会把这一页塞满。
+Scene_D678Net.prototype.onLadRename = function () {
+    if (!D678N.lad) return;
+    if (!D678N.lad.canRename) {
+        this.notice('每天只能修改一次');
+        this.refresh();
+        return;
+    }
+    var s = window.prompt('输入游戏名（4-8 位汉字、字母或数字）',
+                          D678N.lad.name || '');
+    if (s === null) return;
+    s = String(s).trim();
+    if (!s) { this.notice('名字不能为空'); this.refresh(); return; }
+    this.postLadName(s);
+};
+
+Scene_D678Net.prototype.postLadName = function (name) {
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/lad/name',
+        { token: D678N.ladToken(), name: name }, function (r, code) {
+        self._busy = false;
+        if (code === 401) { self.onLadExpired(); return; }
+        if (!r || code !== 200 || !r.ok) {
+            self.notice((r && r.err) || '设置失败，服务器没响应');
+            // 被拒时服务器会把当前状态一起回来（canRename 可能变了）
+            if (r && r.acc) D678N.lad = r;
+            self.refresh();
+            return;
+        }
+        D678N.lad = r;
+        self.syncLadForm();
+        self.refresh();
+    });
+};
+
+// 令牌失效（服务器重启过）。别装作还登录着 —— 回登录页重新认证。
+Scene_D678Net.prototype.onLadExpired = function () {
+    D678N.setLadToken('');
+    D678N.lad = null;
+    this._ladReg = false;
+    this.syncLadForm();
+    this.notice('登录已失效，请重新认证');
+    this.refresh();
+};
+
+Scene_D678Net.prototype.onLadLogout = function () {
+    D678N.setLadToken('');
+    D678N.lad = null;
+    this._ladReg = false;
+    this.syncLadForm();
+    this.refresh();
+};
+
+// 排位赛还没做。给一句提示 —— 一个亮着的按钮点下去纯静默，看着像坏的。
+Scene_D678Net.prototype.onRank = function () {
+    this.notice('排位赛还没开放');
+    this.refresh();
+};
+
 // 匹配：服务器找一个未满未开始的锦标赛房，没有就建。不要房号 —— 朋友局
 // 直接进同一个空房就行（你定的）。
 Scene_D678Net.prototype.onMatch = function () {
@@ -1122,6 +1632,16 @@ Scene_D678Net.prototype.onBack = function () {
         // 锦标赛退回子页而不是主菜单 —— 想再匹配一次少点一下
         this._page = wasTourney ? 'tourney' : 'menu';
         this._roomInfo = null;
+        this.refresh();
+        return;
+    }
+    // 天梯退回锦标赛子页（它是从那儿进来的）。登录态**不清** ——
+    // 出去看一眼再回来还要重输一遍账号密码太烦。表单要收掉，
+    // 不然那几个 DOM 输入框会浮在别的页面上。
+    if (this._page === 'ladder') {
+        D678N.LadForm.close();
+        this._ladReg = false;
+        this._page = 'tourney';
         this.refresh();
         return;
     }
@@ -1191,6 +1711,9 @@ Scene_D678Net.prototype.doJoin = function (code) {
 
 Scene_D678Net.prototype.terminate = function () {
     Scene_Base.prototype.terminate.call(this);
+    // 场景走了 DOM 浮层必须跟着走，否则那几个输入框会一直浮在标题画面
+    // 和牌桌上（它们挂在 document.body 上，不受场景树管）
+    D678N.LadForm.close();
 };
 
 //=============================================================================
