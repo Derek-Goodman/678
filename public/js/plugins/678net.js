@@ -486,17 +486,19 @@ function drawBtn(bmp, x, y, w, h, on, press) {
 }
 
 //=============================================================================
-// 天梯登录表单（canvas 上盖 DOM <input>）
+// 天梯登录表单（全画在 canvas 上，输入走 window.prompt）
 //=============================================================================
 //
-// **只有输入框是 DOM**，面板、标签、按钮照旧画在 canvas 上、走 _hits 那套
-// 命中测试。这样观感和别处一致，DOM 只有两三个元素，也不用重做一遍按钮。
+// 【为什么不用 DOM <input>】试过，点不动。RMMV 启动时给 document.body 抹了
+// user-select:none（Graphics._disableTextSelection），盖在画布上的输入框继承下来
+// 就选不中内容；再加上 RMMV 在 document 上收触摸/指针事件、画布是等比缩放
+// 居中的（位置要跟着窗口和页面滚动算），坑一个接一个。
 //
-// 为什么不用 window.prompt（房号那边就是）：注册要连弹三次系统对话框
-// （账号→密码→确认密码），而天梯是门面。
+// 现在的做法和「修改名字」那边一致：面板上每栏画出当前值，点「输入」用
+// window.prompt 依次问一遍。prompt 是浏览器自己的输入框，中文输入法、
+// 手机键盘、粘贴全都天然正常，还不受 maxLength 卡住拼音的影响。
 //
-// 坐标只有一份 —— ladLayout() 同时喂给绘制代码和这个浮层，
-// 两边各写一套的话改一次尺寸就会错位。
+// 坐标只有一份 —— ladLayout() 同时喂给绘制和命中测试。
 
 var LAD_IN_H = 52, LAD_ROW = 68, LAD_LBL_W = 96;
 
@@ -512,7 +514,7 @@ function ladLayout(stage, reg) {
         rows.push({ key: 'name', label: '游戏名', ph: '4-8 位' });
     } else {
         rows.push({ key: 'acc', label: '账号', ph: '4-16 位字母数字' });
-        rows.push({ key: 'pw', label: '密码', ph: '' });
+        rows.push({ key: 'pw', label: '密码', ph: '4-16 位' });
         if (reg) rows.push({ key: 'pw2', label: '确认密码', ph: '再输一次' });
     }
     for (var i = 0; i < rows.length; i++) {
@@ -524,170 +526,85 @@ function ladLayout(stage, reg) {
     var hintY = last.y + LAD_IN_H + 10;
     var btnY = hintY + 30;
     var bh = 60;
-    var btns = [];
+    // 「输入」独占一行，主按钮在它下面 —— 输入是每次都要点的那个，
+    // 挤在认证/注册旁边会让人以为三个是并列的选项
+    var btns = [{ key: 'edit', label: '输入',
+                  x: px + 24, y: btnY, w: pw - 48, h: bh }];
+    var y2 = btnY + bh + 16;
     if (stage === 'name') {
         btns.push({ key: 'setname', label: '确定',
-                    x: px + (pw - 200) / 2, y: btnY, w: 200, h: bh });
+                    x: px + (pw - 200) / 2, y: y2, w: 200, h: bh });
     } else {
         var bw = (pw - 48 - 20) / 2;
-        btns.push({ key: 'auth', label: '认证', x: px + 24, y: btnY, w: bw, h: bh });
+        btns.push({ key: 'auth', label: '认证', x: px + 24, y: y2, w: bw, h: bh });
         btns.push({ key: 'reg',  label: reg ? '确认注册' : '注册',
-                    x: px + 24 + bw + 20, y: btnY, w: bw, h: bh });
+                    x: px + 24 + bw + 20, y: y2, w: bw, h: bh });
     }
-    return { px: px, py: py, pw: pw, ph: btnY + bh + 24 - py,
+    return { px: px, py: py, pw: pw, ph: y2 + bh + 24 - py,
              rows: rows, btns: btns, hintY: hintY };
 }
 
-// 浮层。整个模块只在真的有 document 时才做事 —— 烟测跑在 Node 里，
-// exe（NW.js）的 DOM 也不保证长一样。
+// 输入暂存。没有 DOM 了，就是三个字符串 —— 画面读它、prompt 写它、
+// 提交时取它。live() 表示「这一步有东西要填」，ready 那步是 false。
 D678N.LadForm = {
-    box: null,
-    inputs: null,       // {key: <input>}
-    _sig: '',           // 当前建的是哪一套（stage|reg），变了就重建
-    _rect: '',          // 上一次贴的位置，没变就不动样式
+    vals: null,         // {acc, pw, pw2} 或 {name}；null = 没在填
+    _sig: '',           // 当前是哪一套（stage|reg）
 
-    live: function () { return !!this.box; },
+    live: function () { return !!this.vals; },
 
-    // canvas 在页面上的位置和缩放。RMMV 把画布等比缩放居中，
-    // 所以 canvas 坐标要乘 scale 再加偏移才是页面坐标。
-    //
-    // 【为什么要加滚动量】getBoundingClientRect 给的是**视口**坐标，而输入框是
-    // position:absolute（相对文档）。手机上地址栏收起、软键盘弹出都会让页面
-    // 滚一段，只用 rect 的话输入框会整体偏离画上去的框 —— 看着在框里，
-    // 点下去却什么都没有。
-    _geo: function () {
-        if (typeof document === 'undefined') return null;
-        var c = Graphics._canvas;
-        if (!c || !c.getBoundingClientRect) return null;
-        var r = c.getBoundingClientRect();
-        if (!r.width) return null;
-        var de = document.documentElement;
-        var sx = window.pageXOffset || (de && de.scrollLeft) || 0;
-        var sy = window.pageYOffset || (de && de.scrollTop) || 0;
-        return { left: r.left + sx, top: r.top + sy,
-                 scale: r.width / Graphics.width };
-    },
-
-    open: function (stage, reg, onEnter) {
-        if (typeof document === 'undefined') return;
-        var sig = stage + '|' + (reg ? 1 : 0);
-        if (this.box && this._sig === sig) return;   // 已经是这一套了
-        var keep = this.values();                    // 重建时把已输入的留下
-        this.close();
-        this._sig = sig;
-        var lay = ladLayout(stage, reg);
-        var box = document.createElement('div');
-        box.style.cssText = 'position:absolute;left:0;top:0;margin:0;padding:0;' +
-                            'z-index:20;';
-        this.inputs = {};
-        var self = this;
-        for (var i = 0; i < lay.rows.length; i++) {
-            var r = lay.rows[i];
-            var el = document.createElement('input');
-            // 【密码不遮】你定的：明着输入就行，不搞星号，所以三个框都是 text
-            el.type = 'text';
-            el.placeholder = r.ph || '';
-            el.maxLength = (r.key === 'name') ? 8 : 16;
-            el.value = keep[r.key] || '';
-            el.autocomplete = 'off';
-            el.spellcheck = false;
-            // 账号是字母数字，手机键盘别自动把首字母顶成大写
-            if (r.key !== 'name') el.autocapitalize = 'off';
-            el.style.cssText = 'position:absolute;box-sizing:border-box;' +
-                'background:rgba(0,0,0,0.55);color:#fff;' +
-                'border:2px solid rgba(255,235,170,0.55);border-radius:8px;' +
-                'outline:none;padding:0 10px;font-family:inherit;' +
-                // 【这三行是「点不动、选不中」的正解】RMMV 启动时给 body 抹了
-                // user-select:none（Graphics._disableTextSelection），子元素继承下来
-                // 之后：输入框拖不出选区、双击选不中词，WebKit 上连光标都落不进去。
-                // 所以这里显式要回来。
-                'user-select:text;-webkit-user-select:text;-ms-user-select:text;' +
-                '-moz-user-select:text;-webkit-touch-callout:default;' +
-                'pointer-events:auto;touch-action:manipulation;';
-            // RMMV 在 document 上收触摸、指针和键盘。不掐住的话：点输入框会被当成
-            // 点画布（可能触发按钮），打字会同时驱动游戏输入。
-            // click / dblclick / contextmenu 也掐 —— 双击选词和右键粘贴不该漏给游戏。
-            ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup',
-             'pointerdown', 'click', 'dblclick', 'contextmenu', 'keyup']
-                .forEach(function (ev) {
-                    el.addEventListener(ev, function (e) { e.stopPropagation(); });
-                });
-            // 上面掐住了冒泡，个别 WebKit 版本就不再自动给焦点了（body 上那个
-            // user-select:none 也会掺一脚）。自己补一次，别让人点了没光标。
-            ['mousedown', 'touchstart'].forEach(function (ev) {
-                el.addEventListener(ev, function (e) {
-                    var t = e.currentTarget || el;
-                    if (document.activeElement !== t) {
-                        try { t.focus(); } catch (err) {}
-                    }
-                });
-            });
-            el.addEventListener('keydown', function (e) {
-                e.stopPropagation();
-                if (e.keyCode === 13 && onEnter) onEnter();
-            });
-            box.appendChild(el);
-            this.inputs[r.key] = el;
-        }
-        document.body.appendChild(box);
-        this.box = box;
-        this._rect = '';
-        this.sync();
-        // 自动聚焦第一个空框，省一次点击。手机上不主动聚焦 ——
-        // 那会立刻弹出键盘把界面顶掉一半，让人不知道自己在哪一页。
-        if (!('ontouchstart' in window)) {
-            var first = lay.rows.filter(function (r) {
-                return !self.inputs[r.key].value;
-            })[0] || lay.rows[0];
-            try { this.inputs[first.key].focus(); } catch (e) {}
-        }
-    },
-
-    // 贴到画布对应的位置。位置没变就什么都不做（别每帧写样式）
-    sync: function () {
-        if (!this.box) return;
-        var g = this._geo();
-        if (!g) return;
-        var sig = [g.left, g.top, g.scale].join(',');
-        if (sig === this._rect) return;
-        this._rect = sig;
+    // 当前这一套要填哪几栏
+    keys: function () {
+        if (!this._sig) return [];
         var parts = this._sig.split('|');
-        var lay = ladLayout(parts[0], parts[1] === '1');
-        for (var i = 0; i < lay.rows.length; i++) {
-            var r = lay.rows[i];
-            var el = this.inputs[r.key];
-            if (!el) continue;
-            el.style.left   = Math.round(g.left + r.x * g.scale) + 'px';
-            el.style.top    = Math.round(g.top  + r.y * g.scale) + 'px';
-            el.style.width  = Math.round(r.w * g.scale) + 'px';
-            el.style.height = Math.round(r.h * g.scale) + 'px';
-            // 下限 16 不是排版口味 —— iOS Safari 对小于 16px 的输入框会在聚焦时
-            // 自动放大整个页面，画布跟着被顶飞，人就不知道自己在哪一栏了
-            el.style.fontSize = Math.max(16, Math.round(26 * g.scale)) + 'px';
+        if (parts[0] === 'name') return ['name'];
+        return parts[1] === '1' ? ['acc', 'pw', 'pw2'] : ['acc', 'pw'];
+    },
+
+    // 这一栏的显示值。密码不遮（你定的：明着输入就行，不搞星号）——
+    // 而且 prompt 输错字只能靠回来看一眼，遮了就没法核对
+    shown: function (key) {
+        var v = this.vals && this.vals[key];
+        return v ? String(v) : '';
+    },
+
+    // 切到这一套。已经填的留着 —— 点「注册」展开确认密码那栏时
+    // 不该让人把账号密码重打一遍
+    open: function (stage, reg) {
+        var sig = stage + '|' + (reg ? 1 : 0);
+        if (this.vals && this._sig === sig) return;
+        var keep = this.values();
+        this._sig = sig;
+        this.vals = {};
+        var ks = this.keys();
+        for (var i = 0; i < ks.length; i++) {
+            this.vals[ks[i]] = keep[ks[i]] || '';
         }
+    },
+
+    // 记一栏。null / undefined 当没改（prompt 被取消）
+    set: function (key, v) {
+        if (!this.vals || v == null) return;
+        this.vals[key] = String(v).trim();
     },
 
     values: function () {
         var o = {};
-        if (!this.inputs) return o;
-        for (var k in this.inputs) {
-            if (this.inputs[k]) o[k] = String(this.inputs[k].value || '').trim();
+        if (!this.vals) return o;
+        for (var k in this.vals) {
+            o[k] = String(this.vals[k] || '').trim();
         }
         return o;
     },
 
     clearPw: function () {
-        if (!this.inputs) return;
+        if (!this.vals) return;
         ['pw', 'pw2'].forEach(function (k) {
-            if (this.inputs[k]) this.inputs[k].value = '';
+            if (k in this.vals) this.vals[k] = '';
         }, this);
     },
 
     close: function () {
-        if (this.box && this.box.parentNode) {
-            try { this.box.parentNode.removeChild(this.box); } catch (e) {}
-        }
-        this.box = null; this.inputs = null; this._sig = ''; this._rect = '';
+        this.vals = null; this._sig = '';
     },
 };
 
@@ -1014,19 +931,20 @@ Scene_D678Net.prototype.drawLadder = function () {
         var r = lay.rows[i];
         this.txt(r.label, lay.px + 24, r.y + (LAD_IN_H - 26) / 2,
                  LAD_LBL_W, 24, LC.text, 'left');
-        // 输入框本身是 DOM（见 D678N.LadForm）。没有 DOM 的环境下画个空框，
-        // 至少版面看着是完整的
-        if (!D678N.LadForm.live()) {
-            var ctx = this._bmp._context;
-            ctx.save();
-            roundRect(ctx, r.x, r.y, r.w, r.h, 8);
-            ctx.fillStyle = 'rgba(0,0,0,0.55)';
-            ctx.fill();
-            ctx.strokeStyle = 'rgba(255,235,170,0.55)';
-            ctx.lineWidth = 2; ctx.stroke();
-            ctx.restore();
-            this._bmp._setDirty();
-        }
+        // 框和里头的值都画在 canvas 上。输入走「输入」按钮 + window.prompt
+        var ctx = this._bmp._context;
+        ctx.save();
+        roundRect(ctx, r.x, r.y, r.w, r.h, 8);
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,235,170,0.55)';
+        ctx.lineWidth = 2; ctx.stroke();
+        ctx.restore();
+        this._bmp._setDirty();
+        // 有值就显示值，没值显示灰色的占位说明（那栏该填什么）
+        var v = D678N.LadForm.shown(r.key);
+        this.txt(v || r.ph, r.x + 12, r.y + (LAD_IN_H - 26) / 2,
+                 r.w - 24, 24, v ? LC.text : LC.gray, 'left');
     }
 
     // 【这句是明文存密码的配套】不加的话玩家会拿他在别处用的密码来注册
@@ -1098,6 +1016,7 @@ Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
 Scene_D678Net.prototype.ladBtnCb = function (key) {
     var self = this;
     return function () {
+        if (key === 'edit')    { self.onLadEdit(); return; }
         if (key === 'auth')    { self.onLadAuth(); return; }
         if (key === 'reg')     { self.onLadReg(); return; }
         if (key === 'setname') { self.onLadSetName(); return; }
@@ -1316,9 +1235,6 @@ Scene_D678Net.prototype.update = function () {
     this.pollNet();
     this.updateStats();
     this.updateInput();
-    // 窗口缩放 / 页面滚动后输入框要跟着画布走。sync 内部比对过位置，
-    // 没变就直接返回，不会每帧写样式。
-    if (D678N.LadForm.live()) D678N.LadForm.sync();
 };
 
 Scene_D678Net.prototype.pollNet = function () {
@@ -1469,17 +1385,43 @@ Scene_D678Net.prototype.syncLadForm = function () {
     if (this._page !== 'ladder') { D678N.LadForm.close(); return; }
     var stage = D678N.ladStage();
     if (stage === 'ready') { D678N.LadForm.close(); return; }
-    var self = this;
-    D678N.LadForm.open(stage, !!this._ladReg, function () {
-        // 回车 = 点主按钮。注册态下是「确认注册」
-        if (stage === 'name') self.onLadSetName();
-        else if (self._ladReg) self.onLadReg();
-        else self.onLadAuth();
-    });
+    D678N.LadForm.open(stage, !!this._ladReg);
+};
+
+// 「输入」按钮：把这一步该填的几栏依次问一遍。中途按取消就停在那儿，
+// 已经答过的留着 —— 别因为最后一栏取消了把前面的也清掉。
+//
+// 用 window.prompt 而不是画布上的输入框：浏览器自己的输入框，中文输入法、
+// 手机键盘、粘贴全都天然正常（房号那边一直就是这么做的）。
+Scene_D678Net.prototype.onLadEdit = function () {
+    var F = D678N.LadForm;
+    if (!F.live()) return;
+    var ks = F.keys();
+    for (var i = 0; i < ks.length; i++) {
+        var k = ks[i];
+        var s = window.prompt(LAD_ASK[k], F.shown(k) ||
+                              (k === 'acc' ? D678N.lastAcc() : ''));
+        if (s === null) break;         // 取消：停下，前面答过的保留
+        F.set(k, s);
+    }
+    this.refresh();
+};
+
+// 每栏的问法。写清位数和字符范围 —— prompt 没有占位说明那一行
+var LAD_ASK = {
+    acc:  '输入账号（4-16 位字母或数字）',
+    pw:   '输入密码（4-16 位，请勿使用你在其他地方用的密码）',
+    pw2:  '再输一次密码',
+    name: '输入天梯游戏名（4-8 位汉字、字母或数字）',
 };
 
 Scene_D678Net.prototype.onLadAuth = function () {
     var v = D678N.LadForm.values();
+    // 还没填就先问一遍 —— 直接点「认证」的人不该只得到一句「都要填」
+    if (!v.acc || !v.pw) {
+        this.onLadEdit();
+        v = D678N.LadForm.values();
+    }
     if (!v.acc || !v.pw) { this.notice('账号和密码都要填'); this.refresh(); return; }
     var self = this;
     this._busy = true;
@@ -1500,17 +1442,26 @@ Scene_D678Net.prototype.onLadAuth = function () {
     });
 };
 
-// 第一次点「注册」只是把「确认密码」那一栏展开；再点才真的提交。
-// 这就是你说的「点击注册后会让对方再次输入密码确认」。
+// 第一次点「注册」展开「确认密码」那一栏并当场问一次；再点「确认注册」
+// 才真的提交。这就是你说的「点击注册后会让对方再次输入密码确认」。
 Scene_D678Net.prototype.onLadReg = function () {
+    var F = D678N.LadForm;
     if (!this._ladReg) {
         this._ladReg = true;
         this.syncLadForm();
+        var v0 = F.values();
+        // 账号密码还没填就三栏一起问；填了就只问确认密码那一栏
+        if (!v0.acc || !v0.pw) {
+            this.onLadEdit();
+        } else {
+            F.set('pw2', window.prompt(LAD_ASK.pw2, ''));
+        }
         this.refresh();
         return;
     }
     var v = D678N.LadForm.values();
     if (!v.acc || !v.pw) { this.notice('账号和密码都要填'); this.refresh(); return; }
+    if (!v.pw2) { this.notice('请再输一次密码确认'); this.refresh(); return; }
     if (v.pw !== v.pw2) {
         this.notice('两次输入的密码不一样');
         this.refresh();
@@ -1538,6 +1489,10 @@ Scene_D678Net.prototype.onLadReg = function () {
 
 Scene_D678Net.prototype.onLadSetName = function () {
     var v = D678N.LadForm.values();
+    if (!v.name) {                       // 直接点「确定」的人先问一遍
+        this.onLadEdit();
+        v = D678N.LadForm.values();
+    }
     if (!v.name) { this.notice('名字不能为空'); this.refresh(); return; }
     this.postLadName(v.name);
 };
