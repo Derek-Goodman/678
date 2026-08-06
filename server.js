@@ -381,6 +381,175 @@ function ladFakeTableMs(steps) {
 }
 
 //=============================================================================
+// AI 也会掉线 / 离开（只天梯）
+//=============================================================================
+//
+// 天梯的整个前提是「让人以为在跟真人打」。8 个人打一整局没有一个掉线、没有
+// 一个中途走人，本身就是个破绽 —— 真人局里这两件事经常发生。所以给 AI 掷骰：
+//
+//   掉线  5%   30~45 秒随机，期间不能做任何动作，回合计时器照常烧完自动过牌，
+//              到点自己回来接着打
+//   离开  2%   再也不回来，一路自动过牌挨打到血空被淘汰
+//
+// 【为什么只天梯】（2026-08-07 你定的）锦标赛用的是单机那批名字（超哥、
+// 嘎子哥），玩家本来就知道对面是 AI，给它加掉线只是给对局添堵。
+//
+// 【为什么不排除同桌的那个 AI】（你定的）掉线正好落在你对面时你会实打实等
+// 2~3 个回合 —— 这跟真人掉线的体验一模一样，最有说服力的掉线恰恰是亲身等到
+// 的那一次。5% 本来就少。
+//
+// 【状态存房间上，不伪造座位】掉线 / 离开两个标注现在全靠座位算
+// （maskViewT 里 `st.left ? 'left' : st.connected ? '' : 'gone'`），而 AI 压根
+// 没有座位。塞假座位进 room.seats 会连累一片 —— 在线人数、结算、轮次屏障、
+// 开赛条件到处遍历它。所以另存一份 room.aiNet，取 status 的地方「先看座位，
+// 没座位再看 aiNet」。客户端三处渲染（对手名字后缀、排名表、最终排名）
+// 一行都不用改。
+const LAD_AI_GONE_P = 0.05;     // 每个 AI 每局掉线的概率
+const LAD_AI_LEFT_P = 0.02;     // 每个 AI 每局直接离开的概率
+const LAD_AI_GONE_MIN_MS = 30000;
+const LAD_AI_GONE_MAX_MS = 45000;
+
+// 测试用的强制口：null = 按概率抽，'gone' / 'left' / 'ok' = 钉死。
+// 和 D678.LAD_GOD_FORCE 同一套路 —— 概率性的东西写进断言就是随机失败。
+let LAD_AI_NET_FORCE = null;
+function setAiNetForce(v) { LAD_AI_NET_FORCE = v; }
+
+// 掉线时长。测试里 ladThinkScale 会把整局压快，掉线时长也得跟着缩 ——
+// 不缩的话一次掉线就超过整局时长，测不到「自己回来了」那一段。
+function aiGoneMs() {
+    const span = LAD_AI_GONE_MAX_MS - LAD_AI_GONE_MIN_MS;
+    const ms = LAD_AI_GONE_MIN_MS + Math.random() * span;
+    return Math.max(1, Math.round(ms * CFG.ladThinkScale));
+}
+
+// 开赛时给每个 AI 掷一次。返回 {pIdx: {st, at}}，st 是 'gone' / 'left'，
+// at 是「第几轮开始时触发」。
+//
+// 【为什么按局掷而不是按轮掷】一局约 28 轮，5% 逐轮掷下来几乎每个 AI 都会掉
+// 一次线 —— 那就不是「个别 AI 偶尔掉线」而是全场都在掉。按局掷的话 7 个 AI
+// 期望 0.35 次掉线，大约每 3 局见一次。
+//
+// 【两个都中按离开算】更严重的那个。
+function aiNetRoll(room) {
+    if (!room || room.mode !== 'ladder' || !room.game) return;
+    room.aiNet = {};
+    room.aiNetPlan = {};
+    room.game.players.forEach((p, pIdx) => {
+        if (p.isHuman) return;
+        let st = null;
+        if (LAD_AI_NET_FORCE) {
+            if (LAD_AI_NET_FORCE === 'ok') return;
+            st = LAD_AI_NET_FORCE;
+        } else {
+            const u = Math.random();
+            if (u < LAD_AI_LEFT_P) st = 'left';
+            else if (u < LAD_AI_LEFT_P + LAD_AI_GONE_P) st = 'gone';
+        }
+        if (!st) return;
+        // 触发轮次：1~12 轮之间随机。第 1 轮就掉线的话开局就有人是灰的，
+        // 太巧；太靠后又可能人已经被淘汰了轮不到。
+        room.aiNetPlan[pIdx] = { st: st, round: 1 + Math.floor(Math.random() * 12) };
+    });
+}
+
+// 每轮开始时调：把计划里到点的那些置成掉线 / 离开。
+function aiNetTick(room) {
+    if (!room || room.mode !== 'ladder' || !room.aiNetPlan || !room.game) return;
+    // makeRound() 里 this.round++ 已经跑过了（startRound 先配对再调这里），
+    // 所以第一轮进来 round 就是 1
+    const rnd = room.game.round || 0;
+    for (const key of Object.keys(room.aiNetPlan)) {
+        const plan = room.aiNetPlan[key];
+        if (plan.round > rnd) continue;
+        delete room.aiNetPlan[key];
+        const pIdx = Number(key);
+        const p = room.game.players[pIdx];
+        // 已经被淘汰的不用掉线了（它的 status 已经是「离开」）
+        if (!p || !p.alive) continue;
+        if (plan.st === 'left') {
+            aiNetSet(room, pIdx, 'left', 0);
+            log('房间 %s AI %s 离开（不再回来）', room.code, p.name);
+        } else {
+            const ms = aiGoneMs();
+            aiNetSet(room, pIdx, 'gone', ms);
+            log('房间 %s AI %s 掉线 %d 秒', room.code, p.name, Math.round(ms / 1000));
+        }
+    }
+}
+
+// 置状态。backMs > 0 就排一个解冻定时器。
+//
+// 【为什么解冻要自己推一次状态】状态只在有事发生时才推（pushStateT）。
+// 不推的话玩家界面上那个「掉线」会一直挂着，直到下一次有人出牌才消失 ——
+// 而掉线的人正好不出牌，很可能整轮都不刷。
+// quiet = 只改状态不推盘面。淘汰标注要用它 —— 那一刻紧接着就是
+// sendTo(eliminated) + releaseSeatConn（收掉 SSE），多推一份状态会挤在
+// 「写入」和「关连接」之间，让本来就存在的竞态更容易踩到（表现为客户端
+// 收不到 eliminated）。淘汰的标注不急着这一下推：赛事继续的话下一轮
+// startRound 会推，赛事结束的话 enterOverT 直接读 aiNetOf 拍进 overInfo。
+function aiNetSet(room, pIdx, st, backMs, quiet) {
+    if (!room.aiNet) room.aiNet = {};
+    const rec = room.aiNet[pIdx];
+    if (rec && rec.timer) clearTimeout(rec.timer);
+    const now = Date.now();
+    const out = { st: st, at: now, timer: null };
+    room.aiNet[pIdx] = out;
+    if (backMs > 0) {
+        out.timer = setTimeout(() => {
+            const cur = room.aiNet && room.aiNet[pIdx];
+            if (!cur || cur !== out) return;         // 已经被改成别的了
+            delete room.aiNet[pIdx];
+            const p = room.game && room.game.players[pIdx];
+            log('房间 %s AI %s 重连回来了', room.code, p ? p.name : pIdx);
+            if (room.phase === 'battle' || room.phase === 'resolved') {
+                pushStateT(room);
+                // 正好轮到它：解冻后要立刻接着走，否则它会干等到超时判过牌
+                const bt = room.battles &&
+                    room.battles.find(x => !x.done && x.b && !x.b.finished &&
+                        x.pIdx[x.b.turn] === pIdx);
+                if (bt) { armTurnTimerT(room, bt); stepAIIfNeeded(room, bt); }
+            }
+        }, backMs);
+    }
+    if (!quiet && (room.phase === 'battle' || room.phase === 'resolved')) {
+        pushStateT(room);
+    }
+}
+
+// 这个 pIdx 此刻的假网络状态：'' / 'gone' / 'left'
+function aiNetOf(room, pIdx) {
+    const rec = room.aiNet && room.aiNet[pIdx];
+    return rec ? rec.st : '';
+}
+
+// 冻结 = 不能做任何动作。掉线和离开都冻结。
+function aiFrozen(room, pIdx) {
+    const st = aiNetOf(room, pIdx);
+    return st === 'gone' || st === 'left';
+}
+
+// 被淘汰的 AI 也标「离开」（你定的）—— 真人被淘汰时服务器会置 seat.left
+// （为了不再推盘面给他），所以排名表里真人淘汰后带着「离开」而 AI 什么都没有。
+// 那个差别肉眼看得出来：一局下来只有真人会「离开」，剩下 7 个永远在线。
+function aiNetMarkOut(room, pIdx) {
+    if (!room || room.mode !== 'ladder') return;
+    const p = room.game && room.game.players[pIdx];
+    if (!p || p.isHuman) return;
+    aiNetSet(room, pIdx, 'left', 0, true);   // quiet：见 aiNetSet 的注释
+}
+
+// 房间销毁 / 赛事结束时清掉所有解冻定时器。漏了会让进程一直握着房间对象。
+function aiNetClear(room) {
+    if (!room || !room.aiNet) return;
+    for (const k of Object.keys(room.aiNet)) {
+        const rec = room.aiNet[k];
+        if (rec && rec.timer) clearTimeout(rec.timer);
+    }
+    room.aiNet = {};
+    room.aiNetPlan = {};
+}
+
+//=============================================================================
 // 天梯假匹配
 //=============================================================================
 //
@@ -779,6 +948,28 @@ function accOfToken(tk) {
     return key ? (accounts.get(key) || null) : null;
 }
 
+//--- GM ---------------------------------------------------------------------
+// 运营数据（本日计数那四行、在线人数那两行）只有 GM 看得见（你定的）。
+// 别人和未登录的一律拿不到数字，客户端收不到就整块不画。
+//
+// 【门禁必须在服务器】只在客户端判 `if (acc === 'derekgoodman')` 的话接口
+// 照样对外裸奔 —— 改个前端变量、或者直接 curl 一下就看到了。
+//
+// 【按小写比】账号唯一性本来就是按小写存的（见 ladNames / accounts 的键）。
+//
+// 【密码不写死】账号由你自己注册并保管（2026-08-07 你定的）。所以这里只认
+// 账号名 —— 谁登录上这个账号谁就是 GM。
+const GM_ACC = 'derekgoodman';
+
+function isGmAcc(a) {
+    return !!(a && String(a.acc || '').toLowerCase() === GM_ACC);
+}
+
+// 请求带的令牌是不是 GM 的。给 /api/daily 和 /api/stats 用。
+function isGmToken(tk) {
+    return isGmAcc(accOfToken(tk));
+}
+
 // 发给客户端的账号信息。**绝不带 pw** —— 明文存是一回事，顺着接口发回去
 // 是另一回事（浏览器 devtools 里直接就能看到）。
 function accView(a) {
@@ -984,21 +1175,33 @@ function ladRollRank(name, p, k, seedKey) {
     return Math.min(8, Math.max(1, Math.round(target + z * LAD_RANK_SD)));
 }
 
-// AI 的「账号起点」。累计场次 / 冠军从这里数起 ——
-// 【为什么需要】只有分数按赛季重置，场次和冠军是累计的。否则赛季头一分钟
-// 榜上 115 行全是「0 场 / 0 冠军 / 均名次 —」，一眼假。
-// 冠军次数当累计数字看本来也更有意义（「这人拿过 163 次冠军」）。
-const LAD_AI_EPOCH = Date.UTC(2026, 5, 1) / 1000 - LAD_TZ;   // 北京 2026-06-01
+// 天梯的「上线时刻」。AI 的虚拟对局从这里才开始数 —— 场次 / 冠军的累计起点。
+//
+// 【为什么需要这么一条线】原来这里是 LAD_AI_EPOCH = 2026-06-01，历史赛季
+// 一路重放到今天，于是 AI 的场次累到了 400~800 场。天梯 2026-08-06 才真的
+// 开放，「刚上线就有人打了 700 局」一眼假（你报的）。
+//
+// 【为什么不用清零】分数不需要时间累积（ladConv 算出来的收敛值），所以就算
+// 场次只有个位数，榜上照样是 760~1300 散开的、有强弱层次。要的正是这个：
+// 榜看着是活的，但没人有夸张的场次。
+//
+// 【往后不用再动】重放是 f(名字, 时刻)，场次自己跟着真实时间长：上线第 1 天
+// 中位 9 场，第 2 天 19 场，第 7 天 67 场。
+const LAD_LAUNCH = Date.UTC(2026, 7, 6) / 1000 - LAD_TZ;   // 北京 2026-08-06
 
 // 单个赛季内的重放。返回 {score, games, rankSum, champs}。
 // upto 截断到某个时刻（当前赛季用 now，历史赛季用赛季终点）。
+//
+// 【起点要夹一道 LAD_LAUNCH】天梯是 8/6 上线的，而 8 月赛季从 8/1 起算 ——
+// 不夹的话头 5 天的对局也会被重放出来，等于凭空多算 5 天的场次。
 function ladReplaySeason(name, season, upto, startScore) {
     const seedKey = season.key;
     const p = ladPersona(name, seedKey);
+    const from = Math.max(season.startSec, LAD_LAUNCH);
     let R = (startScore === undefined) ? p.start : startScore;
     let games = 0, rankSum = 0, champs = 0;
     for (let k = 0; k < 100000; k++) {
-        const t = ladMatchAt(name, p, k, season.startSec, seedKey);
+        const t = ladMatchAt(name, p, k, from, seedKey);
         if (t > upto) break;
         if (!ladHappens(name, k, t, seedKey)) continue;
         const r = ladRollRank(name, p, k, seedKey);
@@ -1021,7 +1224,9 @@ function ladHistory(name, curSeason) {
     const hit = ladHistCache.get(ck);
     if (hit) return hit;
     let games = 0, rankSum = 0, champs = 0;
-    let cur = LAD_AI_EPOCH;
+    // 从上线时刻起算。上线那个赛季（8 月）本身不在历史里 —— 循环条件是
+    // 「早于当前赛季起点」，所以上线当月就是当前赛季时这个循环一次都不跑。
+    let cur = LAD_LAUNCH;
     // 一个月一个月往前推到当前赛季（不含）
     let guard = 0;
     while (cur < curSeason.startSec && guard++ < 600) {
@@ -1184,8 +1389,14 @@ function ladBoard() {
     if (ladBoardCache && now - ladBoardAt < LAD_BOARD_TTL) return ladBoardCache;
     const t = nowSec();
     const rows = [];
-    // AI
-    for (const nm of D678.LAD_AI_NAMES) rows.push(ladAiState(nm, t));
+    // AI。**一场没打的不进榜**（你定的）——「0 场 / 0 冠军 / 均名次 —」这种行
+    // 摆在榜上一眼假。所以榜是跟着上线时间自己长满的：上线头几个小时只有
+    // 十几行，一天后 100 行满。不套真人那道 10 场门槛（LAD_MINGAMES），
+    // 那是「定级中不上榜」的规则，AI 没有定级这回事。
+    for (const nm of D678.LAD_AI_NAMES) {
+        const st = ladAiState(nm, t);
+        if (st.games > 0) rows.push(st);
+    }
     // 真人。门槛按**累计**场次算 —— 按赛季场次算的话月初全体「定级中」，
     // 榜会空掉好几个小时。
     for (const a of accounts.values()) {
@@ -1486,8 +1697,11 @@ function maskViewT(room, bt, seat, snapPre) {
             // 谁赢了，在轮次屏障放开之前不该让我提前知道。
             prevLast: p.prevLast || null,
             last: (bt && bt.pIdx.indexOf(pIdx) >= 0) ? (p.last || null) : null,
-            // 真人的连线状态。AI 一律不标注 —— 排名列表里看不出谁是 AI。
-            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone')) : '',
+            // 连线状态。真人看座位，AI 看 room.aiNet（天梯下 AI 也会掉线 /
+            // 离开，见 aiNetRoll）—— 两边同一套取值，所以客户端
+            // statusText() 那三处渲染不用区分谁是 AI。
+            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone'))
+                       : aiNetOf(room, pIdx),
             // 这个人此刻是否还在打（等待画面里「谁在对局」用）
             inBattle: !!room.battles.find(x => !x.done && x.pIdx.indexOf(pIdx) >= 0),
         };
@@ -1718,6 +1932,8 @@ function dropRoom(room, why) {
         clearTimeout(bt.turnTimer);
         clearTimeout(bt.aiTimer);
     });
+    // AI 假掉线的解冻定时器。同上，漏了会对着已删除的房间 pushStateT
+    aiNetClear(room);
     room.seats.forEach(s => {
         if (!s) return;
         clearTimeout(s.graceTimer);
@@ -1796,50 +2012,60 @@ function computeStats() {
         loose++;
     }
 
-    // 【天梯在场的人要算进在线总数】不加的话界面上会出现
-    // 「在线 1 人 · 28 人天梯对局中」—— 在天梯打的人当然也在线，
-    // 两个数摆在一起自相矛盾。
+    // 【2026-08-07：一律真数】原来 online 里加了 ladPlayingCount()（AI 模拟
+    // 对局的假人数），ladPlaying 发的也是那个假数。现在这几行只有 GM 看得见
+    // （见 /api/stats 的门禁），假数就没有存在的理由了 —— GM 要看的是真实
+    // 运营情况，冲了假人数反而看不出「到底有没有人在玩」。
     //
-    // playing（对局中）不加天梯那批：天梯单独一行显示，加进去就是重复计数。
-    const ladN = ladPlayingCount();
+    // ladPlaying = 真的在天梯房里打的真人（ladRealPlaying）。
+    // aiPlaying  = AI 模拟对局数，单独一个字段，只给 GM 看运营。
+    //
+    // playing（对局中）不含天梯那批：天梯单独一行显示，加进去就是重复计数。
+    const ladN = ladRealPlaying();
     return {
         online: seated + loose + ladN,
         playing: playing,
         waiting: waiting,
         ladPlaying: ladN,
+        aiPlaying: ladAiPlayingCount(),
     };
 }
 
-// 此刻有多少人在天梯对局中。
+// 此刻有多少个 **AI** 在模拟对局。
 //
 // 【这个数是从漂移模型推出来的，不是编的】AI 的虚拟对局时刻本来就是确定性
 // 算出来的（ladMatchAt + 作息筛），所以「上一场开在多久之前」是可算的：
 // 落在一局时长以内的就还在打。于是这个数天然跟着作息走 —— 晚上八九点二十几个，
 // 凌晨三四点个位数，和榜上分数在动的那批人是同一批。
 //
+// 【2026-08-07 起只发给 GM】原来它被加进 stats.online 冒充在线人数，
+// 现在在线人数一律是真数（见 computeStats），这个数单独作为 aiPlaying 字段
+// 发给 GM 看运营情况。所以这里**不再**加上真人 —— 真人走 ladRealPlaying()。
+//
 // 一局按 18 分钟算（实测中位数：60 场模拟里真人第 28 轮出局、每轮 36 秒）。
 const LAD_GAME_MS = 18 * 60 * 1000;
 
 let ladPlayCache = -1, ladPlayAt = 0;
-function ladPlayingCount() {
+function ladAiPlayingCount() {
     const now = Date.now();
     // 30 秒缓存。这个数分钟级才有变化，而 /api/stats 是每 5 秒一次心跳 ——
     // 不缓存的话每次心跳都要把 115 个 AI 的当季对局重放一遍。
-    if (ladPlayCache >= 0 && now - ladPlayAt < 30000) {
-        return ladPlayCache + ladRealPlaying();
-    }
+    if (ladPlayCache >= 0 && now - ladPlayAt < 30000) return ladPlayCache;
     const t = Math.floor(now / 1000);
     const sn = ladSeason(t);
     const seedKey = sn.key;
+    // 起点和 ladReplaySeason 一样要夹 LAD_LAUNCH，否则上线当天算出来的
+    // kNow 是按「赛季初就开打」推的，对不上榜上的场次
+    const from = Math.max(sn.startSec, LAD_LAUNCH);
     let n = 0;
     for (const nm of D678.LAD_AI_NAMES) {
         const p = ladPersona(nm, seedKey);
-        // 从当季起点往后找最后一场不晚于现在的对局。步长是固定的，
+        // 从起点往后找最后一场不晚于现在的对局。步长是固定的，
         // 所以可以直接从 now 附近倒着找几步，不用整季重放。
         const step = 86400 / p.rate;
-        const kNow = Math.floor((t - sn.startSec) / step);
+        const kNow = Math.floor((t - from) / step);
         for (let k = kNow + 2; k >= 0 && k >= kNow - 4; k--) {
-            const at = ladMatchAt(nm, p, k, sn.startSec, seedKey);
+            const at = ladMatchAt(nm, p, k, from, seedKey);
             if (at > t) continue;
             if (!ladHappens(nm, k, at, seedKey)) continue;
             // 最近一场开在多久之前
@@ -1849,7 +2075,7 @@ function ladPlayingCount() {
     }
     ladPlayCache = n;
     ladPlayAt = now;
-    return n + ladRealPlaying();
+    return n;
 }
 
 // 真的在天梯房里打的真人。加进去，免得「我自己正在打，界面却说 0 人在天梯」。
@@ -2234,6 +2460,8 @@ function startLadder(room) {
 
     room.phase = 'battle';
     dailyBump('online', humans.length);
+    // 谁会掉线 / 离开，这一局一次掷定（见 aiNetRoll）
+    aiNetRoll(room);
     // 超哥是谁只记在服务器日志里 —— 客户端永远收不到（见 maskViewT 的 isGod）
     log('房间 %s 天梯开始：%d 真人 + %d AI，超哥 %d 个（%s）',
         room.code, humans.length, aiNames.length, room.ladGodN,
@@ -2257,6 +2485,10 @@ function startRound(room) {
     room.phase = 'battle';
     room.seats.forEach(s => { if (s) { s.acked = false; s.autoDiscarded = null; } });
 
+    // 到点的 AI 在这里掉线 / 离开。**必须在配对之后、开打之前** ——
+    // 下面纯 AI 桌的快路要读冻结状态来决定强制过牌。
+    aiNetTick(room);
+
     r.pairs.forEach(pair => {
         const [pa, pb] = pair;
         const ia = g.players.indexOf(pa), ib = g.players.indexOf(pb);
@@ -2273,7 +2505,20 @@ function startRound(room) {
             if (room.mode === 'ladder') {
                 let steps = 0;
                 const raw = D678.AI.step;
-                D678.AI.step = function (b, si) { steps++; return raw.call(this, b, si); };
+                // 【冻结的一方要强制过牌】掉线 / 离开的 AI 在纯 AI 桌上也不能
+                // 正常打 —— 否则界面上是「这人显示离开，血却一点没掉、还赢了」，
+                // 比不标注更假。包一层 AI.step，轮到冻结那一方就直接过牌，
+                // 和它在真人桌上的行为一致（forceStand）。
+                const frozenA = aiFrozen(room, ia), frozenB = aiFrozen(room, ib);
+                D678.AI.step = function (b, si) {
+                    steps++;
+                    // simulateMatch 里 pa 是 side 0、pb 是 side 1（new Battle(pa, pb)）
+                    if ((si === 0 && frozenA) || (si === 1 && frozenB)) {
+                        b.act(si, 'stand');
+                        return { side: si, action: 'stand', msg: '对方过牌' };
+                    }
+                    return raw.call(this, b, si);
+                };
                 try {
                     withRoom(room, () => { D678.simulateMatch(pa, pb); });
                 } finally {
@@ -2353,6 +2598,18 @@ function armTurnTimerT(room, bt) {
         bt.turnTimer = setTimeout(() => forceStand(room, bt, '离开'), 0);
         return;
     }
+    // 【掉线的 AI 要挂真计时器】下面的 AI 分支只写 turnDeadline 不 setTimeout
+    // （怕和 AI 长考抢，详见那段注释）。但掉线的 AI 压根不会行动
+    // （stepAIIfNeeded 直接 return），没有真计时器就永远卡在这个回合。
+    // 挂上之后它和真人掉线走完全同一条路：倒计时烧完 -> 判过牌 -> 挂 idled
+    // -> 下一个回合缩到 goneTurnSec。
+    if (isAI && aiFrozen(room, pIdx)) {
+        const gsec = room.game.players[pIdx].aiIdled ? (CFG.goneTurnSec || tsec) : tsec;
+        bt.turnDeadline = bt.turnStartAt + gsec * 1000;
+        bt.turnTimer = setTimeout(() => forceStand(room, bt, 'AI 掉线'),
+            Math.max(0, bt.turnDeadline - now));
+        return;
+    }
     // AI 回合：不挂计时器（它不会超时），但**要给一个只用于显示的 deadline**。
     //
     // 【为什么】pushStateT 的 turnLeft 是从 bt.turnDeadline 算的，原来这里直接
@@ -2427,6 +2684,16 @@ function stepAIIfNeeded(room, bt) {
     }
     if (p.isHuman) return;
 
+    // 【掉线 / 离开的 AI 不动作】天梯下 AI 也会掉线（见 aiNetRoll）。
+    //   · 离开：一路自动过牌，和真人离开同一个口径
+    //   · 掉线：什么都不做，让 armTurnTimerT 挂的回合计时器烧完判过牌
+    //     —— 真人掉线就是这个样子（干等到超时），所以观感一致
+    if (aiNetOf(room, pIdx) === 'left') {
+        bt.aiTimer = setTimeout(() => forceStand(room, bt, 'AI 离开'), 0);
+        return;
+    }
+    if (aiFrozen(room, pIdx)) return;
+
     // 天梯：拟人延迟（多数 1.8~5 秒，偶尔长考到 16 秒，每步都不一样）。
     // 锦标赛照旧固定 900ms —— 那是「让人看清对手做了什么」的节奏，
     // 不是为了拟人（你定的，两套模式各管一摊）。
@@ -2469,8 +2736,16 @@ function applyActionT(room, bt, side, action, forced) {
     // 挂机标记，和 1v1 同一套（见 applyAction 里的注释）。
     // 锦标赛里 side 是「这一桌的 0/1」，得先换成座位。
     // 二选一超时同样不算挂机 —— 他有操作，只是慢了。
-    const actorT = room.seats.find(s => s && s.pIdx === bt.pIdx[side]);
+    const actorPIdx = bt.pIdx[side];
+    const actorT = room.seats.find(s => s && s.pIdx === actorPIdx);
     if (actorT && !(forced && action.type === 'pick2')) actorT.idled = !!forced;
+    // 掉线的 AI 没有座位，挂机标记记在 player 上 —— armTurnTimerT 靠它把
+    // 第二个回合起缩到 goneTurnSec，和真人掉线同一套（不缩的话 30~45 秒的
+    // 掉线只烧得掉一个回合，看着不像掉线像是在长考）
+    if (!actorT && !(forced && action.type === 'pick2')) {
+        const ap = room.game.players[actorPIdx];
+        if (ap && !ap.isHuman) ap.aiIdled = !!forced;
+    }
 
     const turnBefore = b.turn;
     let msg = '', ok = true, err = '', failNote = '';
@@ -2614,6 +2889,15 @@ function checkRoundBarrier(room) {
     // 给一点时间看自己那桌的结果，再开下一轮
     clearTimeout(room.roundTimer);
     room.roundTimer = setTimeout(() => {
+        // 【被淘汰的 AI 标「离开」】真人被淘汰时下面会置 s.left（为了不再推
+        // 盘面给他），于是排名表里真人淘汰后带着「离开」而 AI 什么都没有 ——
+        // 一局下来只有真人会离开，剩下 7 个永远在线，这个差别肉眼看得出来
+        // （你报的）。所以 AI 淘汰后也标上。
+        room.game.players.forEach((p, pIdx) => {
+            if (p.isHuman || p.alive) return;
+            if (aiNetOf(room, pIdx) === 'left') return;      // 已经标过了
+            aiNetMarkOut(room, pIdx);
+        });
         // 淘汰：血空的人踢回大厅，赛事继续（你定的）
         const outSeats = [];
         room.seats.forEach(s => {
@@ -2700,9 +2984,12 @@ function enterOverT(room) {
             rank: i + 1, name: p.name, hp: p.hp, alive: p.alive,
             wins: p.wins, losses: p.losses, maxPoint: p.maxPoint,
             games: p.wins + p.losses, funcUses: p.funcUses,
-            // 和 maskViewT 里的 status 同一套取值。AI 一律空串 ——
-            // 排名表里看不出谁是 AI（有座位才是真人）。
-            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone')) : '',
+            // 和 maskViewT 里的 status 同一套取值：真人看座位，AI 看 aiNet。
+            // 天梯下被淘汰的 AI 会被标成「离开」（见 aiNetMarkOut）——
+            // 真人淘汰后本来就带这个标注，AI 不带的话最终排名里一眼看出
+            // 「只有真人会离开」。
+            status: st ? (st.left ? 'left' : (st.connected ? '' : 'gone'))
+                       : aiNetOf(room, pi),
         };
     });
     // 发给所有座位，包括已淘汰的（他们的 SSE 还连着）—— 淘汰的人回到大厅后
@@ -2725,6 +3012,9 @@ function enterOverT(room) {
             lad: seat.ladResult || undefined,
         });
     });
+    // 解冻定时器不用留了 —— overInfo 已经拍好快照（status 在上面读过），
+    // 之后再改 aiNet 也影响不到任何显示。留着只会让房间在销毁前多握几个定时器。
+    aiNetClear(room);
     log('房间 %s %s结束，冠军 %s', room.code,
         room.mode === 'ladder' ? '天梯' : '锦标赛',
         ranked[0] ? ranked[0].name : '?');
@@ -3635,7 +3925,14 @@ const server = http.createServer((req, res) => {
             // sid 要验过才认，否则随便编一个就能把自己从统计里抹掉
             const found = body.sid ? seatOf(body.sid) : null;
             touchVisitor(token, found ? body.sid : null);
-            json(res, 200, computeStats());
+            // 【心跳和数字要分开】门禁只挡数字，上面的 touchVisitor 一定要跑 ——
+            // 这个请求同时是「我还在线」的心跳，非 GM 也得数进在线人数里，
+            // 不然 GM 看到的在线数会漏掉所有没登录 GM 的人。
+            //
+            // 非 GM 回 {gm:false} 不带任何数字（你定的）。客户端拿不到 online
+            // 就整块不画那两行。
+            if (!isGmToken(body.ladToken)) return json(res, 200, { gm: false });
+            json(res, 200, Object.assign({ gm: true }, computeStats()));
         });
         return;
     }
@@ -3646,18 +3943,26 @@ const server = http.createServer((req, res) => {
     // 【只接受单机那三项】play / finish / champ 服务器看不见单机局，只能客户端报。
     // online 由服务器在开赛时自己加（startTourney / startDuel）——
     // 这里**故意不收** online，否则谁都能拿脚本把联机人数刷上去。
+    //
+    // 【读要 GM，写不要】(2026-08-07 你定的：这四行只有 GM 看得见)
+    //   · 计数照旧对所有人开放上报 —— 挡了的话数字就不长了，GM 自己也看不到
+    //     全服的真实活跃。
+    //   · 但返回的数字只给 GM。非 GM 回 {ok:true, gm:false} 不带数字，
+    //     客户端 dailyFetch 拿不到 plays 就整块不画。
     if (u === '/api/daily' && req.method === 'POST') {
         readBody(req, body => {
             body = body || {};
             const bump = String(body.bump == null ? '' : body.bump);
+            const gm = isGmToken(body.ladToken);
             if (bump) {
                 if (bump !== 'play' && bump !== 'finish' && bump !== 'champ') {
                     return json(res, 200, Object.assign({ ok: false, err: '未知计数' },
-                        dailyView()));
+                        gm ? dailyView() : { gm: false }));
                 }
                 dailyBump(bump, body.n);
             }
-            json(res, 200, Object.assign({ ok: true }, dailyView()));
+            if (!gm) return json(res, 200, { ok: true, gm: false });
+            json(res, 200, Object.assign({ ok: true, gm: true }, dailyView()));
         });
         return;
     }
@@ -3839,7 +4144,9 @@ module.exports = {
     rooms, CFG, withRoom, visitors, daily, accounts, ladTokens,
     ladSeason, ladTier, ladConv, ladAiState, ladBoard, ladBoardView,
     ladPersona, ladReplaySeason, ladFrac, ladK, ladBoardBust,
+    ladAiPlayingCount, ladRealPlaying, aiNetRoll, aiNetOf, setAiNetForce, GM_ACC,
     LAD_BASE, LAD_FLOOR, LAD_SCALE, LAD_MINGAMES, LAD_BOARD_N, LAD_TIERS,
+    LAD_LAUNCH, LAD_AI_GONE_P, LAD_AI_LEFT_P,
 };
 
 server.listen(CFG.port, '0.0.0.0', () => {

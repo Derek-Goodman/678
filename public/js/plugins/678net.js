@@ -181,31 +181,43 @@ D678N.ladStage = function () {
 };
 
 //=============================================================================
-// 本日计数（标题画面上方三行）
+// 本日计数（标题画面上方四行）
 //=============================================================================
-// 全服累计，所有人看到同一个数（你定的）。
+// 全服累计。
 //
 //   游玩次数 = 进入对局。单机在这里报；多人由服务器在开赛时自己加
 //              （startTourney / startDuel），这边不能再报，会重复。
 //   完局次数 = 单机打到结算画面（拿第几名都算）
 //   冠军次数 = 单机最后幸存者。冠军同时也计入完局。
+//   联机人数 = 多人开局的人数，服务器自己加
 //
-// 连不上服务器（单机 exe / 服务器没起）就整块不画 —— 留三个「0」或者
-// 「--」在标题上比不显示更难看，而且会让人以为功能坏了。
-D678N.daily = null;      // 最近一次拿到的计数。null = 还没问到 / 问不到
+// 【2026-08-07 起只有 GM 看得见】（你定的）非 GM 和未登录的人一律看不到这
+// 四行。门禁在服务器（/api/daily 只对 GM 回数字），这边只要把天梯令牌带上；
+// 拿不到 plays 就整块不画。
+//
+// 【上报照旧对所有人开放】挡了的话数字就不长了，GM 自己也看不到全服的真实
+// 活跃 —— 门禁只挡「读」。
+//
+// 连不上服务器（单机 exe / 服务器没起）同样整块不画 —— 留四个「0」在标题上
+// 比不显示更难看，而且会让人以为功能坏了。
+D678N.daily = null;      // 最近一次拿到的计数。null = 还没问到 / 不是 GM
 
+// 服务器认 GM 靠天梯令牌。没登录就是空串，服务器回 {gm:false}。
 D678N.dailyFetch = function (cb) {
-    D678N.Net.post('/api/daily', {}, function (r) {
-        if (r && r.ok) D678N.daily = r;
+    D678N.Net.post('/api/daily', { ladToken: D678N.ladToken() }, function (r) {
+        // gm 为假时服务器不带数字，得把本地那份清掉 —— 否则退出登录后
+        // 标题上还挂着最后一次看到的数字
+        D678N.daily = (r && r.ok && r.gm) ? r : null;
         if (cb) cb(D678N.daily);
     });
 };
 
-// 上报一次。服务器返回的新值顺手存下来，标题回去就是最新的。
+// 上报一次。GM 的话服务器会回新值，顺手存下来，标题回去就是最新的。
 D678N.dailyBump = function (kind) {
-    D678N.Net.post('/api/daily', { bump: kind }, function (r) {
-        if (r && r.ok) D678N.daily = r;
-    });
+    D678N.Net.post('/api/daily',
+        { bump: kind, ladToken: D678N.ladToken() }, function (r) {
+            if (r && r.ok && r.gm) D678N.daily = r;
+        });
 };
 
 //=============================================================================
@@ -497,9 +509,23 @@ var TIER_COL = {
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
 
-// 在线人数那一行的 y。玩家名条占 186~282，菜单按钮从 380 起，
-// 这一行塞在中间的空档里。
-var ONLINE_Y = 292;
+// 在线信息两行的 y，和它下面标题 / 按钮的 y。
+//
+// 【为什么要重排】原来在线行在 292（占 292~322），天梯行在 324（占 324~354），
+// 而「锦标赛」/「单人对决」标题画在 336（30 号字占 40 高，336~376）——
+// 天梯行和标题重叠了 18 像素（你报的）。当时 drawDuel 把标题从 300 让到 336
+// 只避开了第一行，后来加的天梯行没跟着让。
+//
+// 【为什么不是简单往下推】现在天梯那行还要多带一段「N 个 AI 模拟对局中」。
+// 三行的话底边到 386，而菜单按钮从 380 起 —— 又会压到按钮上。所以两个天梯
+// 数字并进同一行（真人红色 · AI 灰色），整块保持两行，再把标题和按钮让开。
+//
+// 【行距按 size + 10 算】this.txt 的绘制高度是 size + 10，20 号字占 30 高 ——
+// 按 20 算间距会重叠 7 像素。
+var ONLINE_Y = 288;          // 第一行：在线 / 对局中 / 等人   288~318
+var ONLINE_Y2 = 318;         // 第二行：天梯真人 / AI 模拟     318~348
+var MENU_TITLE_Y = 360;      // 「锦标赛」「单人对决」标题      360~400
+var MENU_BTN_Y = 412;        // 菜单按钮起点
 
 function roundRect(ctx, x, y, w, h, r) {
     ctx.beginPath();
@@ -765,6 +791,10 @@ Scene_D678Net.prototype.pingStats = function () {
     D678N.Net.post('/api/stats', {
         token: D678N.visitorToken(),
         sid: D678N.Net.sid || null,
+        // GM 判定（2026-08-07 起这几行只有 GM 看得见）。没登录就是空串，
+        // 服务器回 {gm:false} 不带数字。心跳照旧记 —— 门禁只挡数字，
+        // 不挡「我还在线」，否则 GM 看到的在线数会漏掉所有没登录 GM 的人。
+        ladToken: D678N.ladToken(),
     }, function (r, code) {
         if (!r || code !== 200) {
             // 老服务器没这个接口（404）。标记一下别再画那一行，
@@ -774,10 +804,14 @@ Scene_D678Net.prototype.pingStats = function () {
         }
         self._statsFail = false;
         var old = D678N.stats;
-        D678N.stats = r;
+        // 非 GM：清掉本地那份，那两行就不画了（退出登录后不能还挂着旧数字）
+        D678N.stats = r.gm ? r : null;
+        var now = D678N.stats;
         // 数字没变就不重绘，省得每 5 秒白刷一遍整个画面
-        if (!old || old.online !== r.online || old.playing !== r.playing ||
-            old.waiting !== r.waiting) {
+        if (!old !== !now || (old && now &&
+            (old.online !== now.online || old.playing !== now.playing ||
+             old.waiting !== now.waiting || old.ladPlaying !== now.ladPlaying ||
+             old.aiPlaying !== now.aiPlaying))) {
             self.refresh();
         }
     });
@@ -789,33 +823,40 @@ Scene_D678Net.prototype.updateStats = function () {
     this.pingStats();
 };
 
-// 在线人数那一行。等待页不画 —— 那时候「谁在这个房间里」才是要紧事，
+// 在线人数那两行。等待页不画 —— 那时候「谁在这个房间里」才是要紧事，
 // 全局人数只是噪音。
+//
+// 【只有 GM 看得见】（2026-08-07 你定的）非 GM 拿不到 D678N.stats
+// （pingStats 里 gm 为假就置 null），所以这里 !s 直接不画。
+//
+// 【数字一律是真的】原来 online 里掺了 AI 模拟对局的假人数。现在只有 GM 看，
+// 冲了假数反而看不出「到底有没有人在玩」，所以 online / ladPlaying 都是真人，
+// AI 模拟数单独一段（灰色）摆在第二行。
 Scene_D678Net.prototype.drawOnline = function () {
     var W = Graphics.width;
     var s = D678N.stats;
     if (this._statsFail) return;
-    if (!s) {
-        this.txt('● 连接中…', 0, ONLINE_Y, W, 20, LC.gray, 'center');
-        return;
-    }
+    // 没登录 GM / 还没问到：整块不画（不是「连接中…」—— 那会让非 GM 看到
+    // 一行永远不消失的提示）
+    if (!s) return;
+
     var parts = ['在线 ' + s.online + ' 人'];
     if (s.playing > 0) parts.push(s.playing + ' 人对局中');
     if (s.waiting > 0) parts.push(s.waiting + ' 个房间等人');
     // 有人在等就标绿：这时候点「加入房间」马上能开一局
     var col = s.waiting > 0 ? LC.green : (s.online > 1 ? LC.text : LC.gray);
-    // 【天梯那一段单独一行、用红色】房间那段是绿的（有人在等），
-    // 两段同色分不出哪个是天梯（你定的用红色）。
-    // 也单独一行 —— 挤在同一行里三段话太长，720 宽会顶到两边。
-    // 【行距要按 size + 10 算】this.txt 的绘制高度是 size + 10，
-    // 20 号字占 30 高 —— 按 20 算间距会重叠 7 像素。
-    // 名字条到 282、菜单按钮从 380 起，中间够放两行 30 高的字。
-    var hasLad = (s.ladPlaying > 0);
     this.txt('● ' + parts.join(' · '), 0, ONLINE_Y, W, 20, col, 'center');
-    if (hasLad) {
-        this.txt(s.ladPlaying + ' 人天梯对局中', 0, ONLINE_Y + 32, W, 20,
-                 LC.red, 'center');
-    }
+
+    // 第二行：天梯真人（红）+ AI 模拟（灰）。两个数字并在一行 ——
+    // 各占一行的话底边会压到下面的标题上。
+    // 真人那段为 0 时只显示 AI 那段。
+    var lad = [];
+    if (s.ladPlaying > 0) lad.push(s.ladPlaying + ' 人天梯对局中');
+    if (s.aiPlaying > 0) lad.push(s.aiPlaying + ' 个 AI 模拟对局');
+    if (!lad.length) return;
+    // 有真人就用红色（真人在打是要紧信息），只有 AI 时用灰色（那只是背景噪音）
+    this.txt(lad.join(' · '), 0, ONLINE_Y2, W, 20,
+             s.ladPlaying > 0 ? LC.red : LC.gray, 'center');
 };
 
 //--- 绘制 ------------------------------------------------------------------
@@ -981,15 +1022,15 @@ Scene_D678Net.prototype.drawMenu = function () {
     this.buttons([
         { label: '锦标赛', cb: this.onTourney.bind(this) },
         { label: '单人对决', cb: this.onDuel.bind(this) },
-    ], 380);
+    ], MENU_BTN_Y);
 };
 
 Scene_D678Net.prototype.drawTourney = function () {
-    this.txt('锦标赛', 0, 336, Graphics.width, 30, LC.gold, 'center');
+    this.txt('锦标赛', 0, MENU_TITLE_Y, Graphics.width, 30, LC.gold, 'center');
     this.buttons([
         { label: '匹配模式', cb: this.onMatch.bind(this) },
         { label: '天梯模式', cb: this.onLadder.bind(this) },
-    ], 400);
+    ], MENU_TITLE_Y + 64);
 };
 
 // 天梯页。三步递进（login → name → ready），「开启排位」三步都画 ——
@@ -1364,12 +1405,13 @@ Scene_D678Net.prototype.drawLadMatching = function (info) {
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
-    // 336 而不是原来的 300 —— 在线人数那一行占了 292~322
-    this.txt('单人对决', 0, 336, Graphics.width, 30, LC.gold, 'center');
+    // 在线信息占 288~348（两行），所以标题从 MENU_TITLE_Y=360 起 ——
+    // 原来是 336，和天梯那一行重叠了（见 ONLINE_Y 那段注释）
+    this.txt('单人对决', 0, MENU_TITLE_Y, Graphics.width, 30, LC.gold, 'center');
     this.buttons([
         { label: '建立房间', cb: this.onCreate.bind(this) },
         { label: '加入房间', cb: this.onJoinPrompt.bind(this) },
-    ], 400);
+    ], MENU_TITLE_Y + 64);
 };
 
 Scene_D678Net.prototype.drawWaiting = function () {
@@ -1752,16 +1794,31 @@ Scene_D678Net.prototype.onTourney = function () {
 Scene_D678Net.prototype.onLadder = function () {
     this._page = 'ladder';
     this._ladReg = false;
-    // 有令牌就先换回登录态（刷新页面后回到这一页的情形）
+    // 有令牌就问一次 /api/lad/me。
+    //
+    // 【为什么每次都问，不只在 !D678N.lad 时问】原来是「已经登录着就跳过」，
+    // 于是内存里那份旧分会一直挂在「开启排位」界面上，直到退出登录重进或者
+    // 关标签页（你报的「分要好久才刷新」的另一半）。进这一页是低频操作，
+    // 多一个请求换「进来看到的一定是最新分」值得。
+    //
+    // 【已经登录时不要置 _busy】那会让界面闪成「加载中」再跳回来。有旧值就
+    // 先照旧画，请求回来了再刷一次 —— 观感上就是数字自己更新了一下。
     var tk = D678N.ladToken();
-    if (tk && !D678N.lad) {
+    if (tk) {
         var self = this;
-        this._busy = true;
+        var had = !!D678N.lad;
+        if (!had) this._busy = true;
         this.refresh();
         D678N.Net.post('/api/lad/me', { token: tk }, function (r, code) {
             self._busy = false;
             if (r && code === 200 && r.ok) D678N.setLadFrom(r);
-            else D678N.setLadToken('');   // 服务器重启过，令牌没了
+            else if (!had) D678N.setLadToken('');   // 服务器重启过，令牌没了
+            else if (code === 401) {
+                // 登录着但令牌失效了（服务器重启）：清干净回登录页，
+                // 别让界面装作还登录着
+                D678N.setLadToken('');
+                D678N.setLadFrom(null);
+            }
             self.syncLadForm();
             self.refresh();
         });
@@ -2667,6 +2724,13 @@ Scene_D678.prototype.netPoll = function () {
         // 【整份留下】原来只挑了 rank / total，战绩那些字段全被丢掉，
         // 淘汰页的「胜 x 负 x 胜率」和对手战绩就都画不出来。
         D678N.elim = b.elim;
+        // 【天梯：淘汰这条路也要更新分数】服务器发 eliminated 时是带 lad 的
+        // （见 server.js 的 outSeats 那段），但这里原来只存了整份 elim，
+        // 没把分数补进登录态。而天梯里被淘汰的人**收不到 over**：淘汰那一刻
+        // 客户端 Net.reset()、服务器也主动收掉 SSE。所以对没赢的那 7 个人来说
+        // 「打完一局」走的就是这条路 —— 漏掉这一句，「开启排位」界面上的分
+        // 会一直是打之前那个值（你报的「分要好久才刷新」）。
+        if (b.elim.lad) D678N.applyLadResult(b.elim.lad);
         b.elim = null;
         // 出局了就跟这场赛事没关系了 —— 断开 SSE、清掉会话，别再占服务器
         // 一条长连接（你定的）。服务器那边也会主动关，这里是客户端侧的一半：
@@ -3335,7 +3399,12 @@ Scene_Title.prototype.start = function () {
 // 标题画面上方的本日计数
 //=============================================================================
 // 四行字：本日游玩次数 / 本日完局次数 / 本日冠军次数 / 本日联机人数
-// （全服累计，你定的）。前三项只统计单机，联机人数是多人开局的人数。
+// （全服累计）。前三项只统计单机，联机人数是多人开局的人数。
+//
+// 【只有 GM 看得见】（2026-08-07 你定的）门禁在服务器，这边靠 D678N.daily
+// 为 null 时整块不画。所以行为是：进游戏先不显示，去多人模式登录天梯
+// （账号 derekgoodman）之后回标题才有 —— 令牌存 sessionStorage，关标签页
+// 就没了，服务器重启也失效，那时候要重新登录一次。
 //
 // 【为什么放在 678net.js 而不是 title.js】取数要联网，而 title.js 先加载、
 // 那会儿还没有 D678N.Net。这个文件本来就已经包了 Scene_Title 的
@@ -3381,8 +3450,10 @@ Scene_Title.prototype.update = function () {
 Scene_Title.prototype.drawDailyCounts = function () {
     if (!this._dailyBmp) return;
     var d = D678N.daily;
-    // 问不到就整块不画（单机 exe / 服务器没起）—— 留三个 0 在标题上
-    // 比不显示更难看，还会让人以为功能坏了
+    // 问不到就整块不画（单机 exe / 服务器没起 / 不是 GM）—— 留四个 0 在标题上
+    // 比不显示更难看，还会让人以为功能坏了。
+    // 非 GM 时 dailyFetch 把 D678N.daily 置成 null，所以这条同时是 GM 门禁的
+    // 客户端一半（真门禁在服务器：/api/daily 不给非 GM 回数字）。
     var key = d ? (d.plays + '/' + d.finishes + '/' + d.champs +
                    '/' + (d.online || 0)) : '';
     if (key === this._dailyShown) return;    // 没变化不重画
