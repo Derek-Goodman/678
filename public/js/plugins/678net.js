@@ -140,8 +140,36 @@ D678N.setLastAcc = function (s) {
     try { localStorage.setItem('d678_lad_acc', s); } catch (e) {}
 };
 
-// 内存里的天梯身份。null = 没登录。{acc, name, canRename}
+// 内存里的天梯身份。null = 没登录。
+// {acc, name, canRename, score, tier, games, champs, avgRank, season}
 D678N.lad = null;
+
+// 从接口响应里装配天梯身份。
+//
+// 【为什么要这么一个函数】/api/lad/reg、/auth、/me、/name 四个接口都回同一份
+// accView，原来每处各自手写 `{acc: r.acc, name: r.name, canRename: r.canRename}`
+// —— 加了 score/tier/games 之后漏掉任何一处，那一条路进来就没有段位和分数，
+// 「开启排位」界面上是空的。集中成一份，以后加字段只改这里。
+D678N.setLadFrom = function (r) {
+    if (!r) { D678N.lad = null; return null; }
+    D678N.lad = {
+        acc: r.acc, name: r.name || '', canRename: !!r.canRename,
+        score: r.score, tier: r.tier, games: r.games,
+        champs: r.champs, avgRank: r.avgRank, season: r.season,
+    };
+    return D678N.lad;
+};
+
+// 一局天梯打完后，把结算回来的分数补进登录态 —— 否则回到「开启排位」界面
+// 显示的还是打之前那个分，得退出重登才更新。
+D678N.applyLadResult = function (lad) {
+    if (!lad || !D678N.lad) return;
+    if (typeof lad.score === 'number') D678N.lad.score = lad.score;
+    if (lad.tier) D678N.lad.tier = lad.tier;
+    if (typeof lad.games === 'number') D678N.lad.games = lad.games;
+    if (typeof lad.champs === 'number') D678N.lad.champs = lad.champs;
+    if (typeof lad.avgRank === 'number') D678N.lad.avgRank = lad.avgRank;
+};
 
 // 天梯页现在停在哪一步。三步是递进的，服务器的状态决定走到哪：
 //   login  没认证 —— 输账号密码
@@ -213,6 +241,7 @@ D678N.inbox = {
     abort:  null,    // 房间被终止
     peer:   null,    // 对手掉线 / 回来
     elim:   null,    // 锦标赛：我被淘汰了（带名次）
+    ladscore: null,  // 天梯：这一局的加减分（中途退出时单独走这条）
     netdown: false,  // 连接断了
 };
 
@@ -234,6 +263,7 @@ D678N.clearInbox = function () {
     var b = D678N.inbox;
     b.room = null; b.states = []; b.events = [];
     b.over = null; b.abort = null; b.peer = null; b.elim = null;
+    b.ladscore = null;
     b.netdown = false;
 };
 
@@ -257,6 +287,12 @@ D678N.Net.emit = function (type, data) {
     case 'abort':   b.abort = data; break;
     case 'peer':    b.peer = data; break;
     case 'eliminated': b.elim = data; break;
+    // 天梯加减分。中途退出时单独走这条 —— 那时候不会有 over / eliminated
+    // （退出的人不再收赛事消息），但分已经结算了，得让他看到。
+    case 'ladscore':
+        b.ladscore = data;
+        D678N.applyLadResult(data);
+        break;
     case 'netdown': b.netdown = true; break;
     }
 };
@@ -448,6 +484,15 @@ var LC = {
     // 和 678.js 里 COL 的取值保持一致：我方回合青色、对方回合橙色。
     // COL 是那个 IIFE 里的 var，外面拿不到，所以在这儿抄一份。
     aqua: '#48e6d2', orange: '#ff9a4d',
+};
+
+// 天梯段位配色。顶尖金、高手橙、精通青、普通白、新手灰 ——
+// 一眼能看出高低，不用去比数字。
+// 和 LC 放一起：drawLadReady 和榜页都要用，定义在用它的函数之后虽然
+// 也能跑（绘制是后调的），但读起来像是漏了。
+var TIER_COL = {
+    '顶尖': '#ffd766', '高手': '#ff9a4d', '精通': '#48e6d2',
+    '普通': '#ffffff', '新手': '#b9c8c0',
 };
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
@@ -813,6 +858,17 @@ Scene_D678Net.prototype.refresh = function () {
     b.clear();
     this._hits = [];
 
+    // 排行榜自己占满整屏（100 行要地方），不画「多人游戏」标题和名字条。
+    // 它的返回按钮也自己画 —— 位置和别处不一样（底部要留给分页按钮）。
+    if (this._page === 'board') {
+        this.drawBoard();
+        if (this._noticeTime > 0 && this._notice) {
+            this.panel(60, H - 200, W - 120, 64);
+            this.txt(this._notice, 60, H - 182, W - 120, 24, LC.red, 'center');
+        }
+        return;
+    }
+
     this.txt('多人游戏', 0, 120, W, 44, LC.gold, 'center');
     // 玩家名条。原来是一行 20 号灰字（整屏最小）加一句「（点这里可改）」，
     // 点击区还没画框 —— 看不出能点。现在名字提到 32 号白字，和菜单按钮同级，
@@ -967,18 +1023,39 @@ Scene_D678Net.prototype.drawLadder = function () {
     }
 
     this.drawRankBtn(lay.py + lay.ph + 28, false);
+    // 没登录也给榜按钮 —— 让人先看到「这里有个榜、上面有一堆人」，
+    // 比一个点不动的灰按钮更能说明登录之后有什么
+    this.drawBoardBtn(lay.py + lay.ph + 28 + BTN_H + 14);
 };
 
-// 登录且有名字了：只剩「开启排位」和「退出登录」
+// 登录且有名字了：段位 + 天梯分，然后「开启排位」「排行榜」「退出登录」
 Scene_D678Net.prototype.drawLadReady = function () {
     var W = Graphics.width;
     var px = Math.round(W / 2 - BTN_W / 2);
-    this.txt('账号 ' + (D678N.lad.acc || ''), px + 24, 388, BTN_W - 48, 20,
+    var lad = D678N.lad || {};
+    this.txt('账号 ' + (lad.acc || ''), px + 24, 384, BTN_W - 48, 20,
              LC.gray, 'left');
-    this.drawRankBtn(432, true);
+
+    // 段位 + 天梯分（你定的：开启排位界面也要显示）。
+    // 这两个值跟着 /api/lad/me 和结算回来的数据走，见 D678N.setLadFrom。
+    var sy = 410;
+    this.panel(px, sy, BTN_W, 58);
+    var tier = lad.tier || '—';
+    this.txt(tier, px + 20, sy + 16, 110, 28, TIER_COL[tier] || LC.text, 'left');
+    this.txt(lad.score == null ? '' : (lad.score + ' 分'),
+             px + 130, sy + 18, 120, 24, LC.gold, 'left');
+    // 场次和平均排名一起摆出来 —— 分数是抽象数字，均排名才是能自我对照的
+    var sub = [];
+    if (lad.games) sub.push(lad.games + ' 场');
+    if (lad.avgRank != null) sub.push('均 ' + Number(lad.avgRank).toFixed(1) + ' 名');
+    if (lad.champs) sub.push(lad.champs + ' 冠');
+    this.txt(sub.join(' · '), px + 20, sy + 18, BTN_W - 40, 20, LC.gray, 'right');
+
+    this.drawRankBtn(sy + 74, true);
+    this.drawBoardBtn(sy + 74 + BTN_H + 16);
 
     var bw = 200, bh = 54;
-    var bx = px + BTN_W - bw, by = 432 + BTN_H + 28;
+    var bx = px + BTN_W - bw, by = sy + 74 + BTN_H + 16 + 62 + 16;
     var press = (this._press === 110);
     drawBtn(this._bmp, bx, by, bw, bh, press, press);
     this._bmp.fontSize = 22;
@@ -989,6 +1066,24 @@ Scene_D678Net.prototype.drawLadReady = function () {
                        bw, 28, 'center');
     this._hits.push({ x: bx, y: by, w: bw, h: bh, i: 110,
                       cb: this.onLadLogout.bind(this) });
+};
+
+// 「排行榜」。放在开启排位下方（你定的）。不要求登录 —— 没登录也能看榜，
+// 只是看不到自己那一行。
+Scene_D678Net.prototype.drawBoardBtn = function (y) {
+    var W = Graphics.width;
+    var x = Math.round(W / 2 - BTN_W / 2);
+    var press = (this._press === 121);
+    var h = 62;
+    drawBtn(this._bmp, x, y, BTN_W, h, press, press);
+    this._bmp.fontSize = 26;
+    this._bmp.textColor = press ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('天梯排行榜', x, y + (h - 32) / 2 + (press ? 2 : 0),
+                       BTN_W, 32, 'center');
+    this._hits.push({ x: x, y: y, w: BTN_W, h: h, i: 121,
+                      cb: this.onBoard.bind(this) });
 };
 
 // 「开启排位」。lit = 亮着（登录且有名字）。没登录也画，只是点不动 ——
@@ -1013,6 +1108,145 @@ Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
                       cb: this.onRank.bind(this) });
 };
 
+//=============================================================================
+// 天梯排行榜
+//=============================================================================
+//
+// 一屏 20 行，前 100 名分 5 页。自己那一行**钉在最上方**（你定的），
+// 不在前 100 就显示「未上榜」+ 真实名次，不足 10 局显示「定级中」。
+
+var BOARD_ROWS = 20;
+
+// 五列的 x 和宽。列宽是按最长内容定的：分数 4 位、场次 4 位、
+// 均名次 3 字符（2.3）、冠军 3 位。
+function boardCols(W) {
+    var x0 = 40, w = W - 80;
+    return {
+        rank:  { x: x0,          w: 70  },
+        tier:  { x: x0 + 74,     w: 70  },
+        name:  { x: x0 + 150,    w: w - 150 - 330 },
+        score: { x: x0 + w - 326, w: 90  },
+        games: { x: x0 + w - 232, w: 80  },
+        avg:   { x: x0 + w - 148, w: 70  },
+        champ: { x: x0 + w - 74,  w: 74  },
+    };
+}
+
+Scene_D678Net.prototype.drawBoardRow = function (c, y, r, hi) {
+    var col = hi ? LC.gold : LC.text;
+    // 名次。未上榜时服务器给的 rank 是真实名次（可能 >100），没有就画 —
+    this.txt(r.rank == null ? '—' : String(r.rank), c.rank.x, y, c.rank.w, 22,
+             hi ? LC.gold : LC.gray, 'center');
+    this.txt(r.tier || '', c.tier.x, y, c.tier.w, 22,
+             TIER_COL[r.tier] || LC.text, 'center');
+    this.txt(r.name || '', c.name.x, y, c.name.w, 22, col, 'left');
+    this.txt(String(r.score), c.score.x, y, c.score.w, 22, col, 'right');
+    this.txt(String(r.games), c.games.x, y, c.games.w, 22,
+             hi ? LC.gold : LC.gray, 'right');
+    // 平均排名保留 1 位小数（服务器已经四舍五入过，这里只补 .0）
+    this.txt(r.avgRank == null ? '—' : r.avgRank.toFixed(1),
+             c.avg.x, y, c.avg.w, 22, hi ? LC.gold : LC.gray, 'right');
+    this.txt(String(r.champs), c.champ.x, y, c.champ.w, 22,
+             r.champs > 0 ? LC.gold : LC.gray, 'right');
+};
+
+Scene_D678Net.prototype.drawBoard = function () {
+    var W = Graphics.width, H = Graphics.height;
+    var d = this._board;
+    if (!d) { this.txt('读取中…', 0, 400, W, 28, LC.gray, 'center'); return; }
+    var c = boardCols(W);
+
+    this.txt('天梯排行榜', 0, 40, W, 40, LC.gold, 'center');
+    // 赛季标题（你定的：2026年8月赛季，跨月自动变）
+    this.txt(d.season || '', 0, 88, W, 26, LC.text, 'center');
+
+    //--- 自己那一行，钉在最上方 -------------------------------------------
+    var top = 130;
+    if (d.me) {
+        this.panel(32, top, W - 64, 62);
+        if (d.me.rating) {
+            // 不足 10 局：不占榜位，说清还差几局
+            this.txt('定级中', c.rank.x, top + 20, c.rank.w, 22, LC.gray, 'center');
+            this.txt(d.me.tier || '', c.tier.x, top + 20, c.tier.w, 22,
+                     TIER_COL[d.me.tier] || LC.text, 'center');
+            this.txt((d.me.name || '我') + '  还需 ' + d.me.need + ' 局定级',
+                     c.name.x, top + 20, c.name.w, 22, LC.gold, 'left');
+            this.txt(String(d.me.score), c.score.x, top + 20, c.score.w, 22,
+                     LC.gold, 'right');
+            this.txt(String(d.me.games), c.games.x, top + 20, c.games.w, 22,
+                     LC.gray, 'right');
+        } else {
+            this.drawBoardRow(c, top + 20, d.me, true);
+            if (!d.me.onBoard) {
+                this.txt('未上榜', c.name.x + c.name.w - 80, top + 20, 80, 20,
+                         LC.red, 'right');
+            }
+        }
+    } else {
+        this.panel(32, top, W - 64, 62);
+        this.txt('登录天梯账号后可以看到自己的排名', 32, top + 20, W - 64, 22,
+                 LC.gray, 'center');
+    }
+
+    //--- 表头 -------------------------------------------------------------
+    var hy = top + 78;
+    this.txt('名次', c.rank.x,  hy, c.rank.w,  18, LC.gray, 'center');
+    this.txt('段位', c.tier.x,  hy, c.tier.w,  18, LC.gray, 'center');
+    this.txt('玩家', c.name.x,  hy, c.name.w,  18, LC.gray, 'left');
+    this.txt('天梯分', c.score.x, hy, c.score.w, 18, LC.gray, 'right');
+    this.txt('场次', c.games.x, hy, c.games.w, 18, LC.gray, 'right');
+    this.txt('均排名', c.avg.x, hy, c.avg.w,   18, LC.gray, 'right');
+    this.txt('冠军', c.champ.x, hy, c.champ.w, 18, LC.gray, 'right');
+
+    //--- 榜身 -------------------------------------------------------------
+    var y0 = hy + 28, rowH = 26;
+    this.panel(32, y0 - 6, W - 64, BOARD_ROWS * rowH + 12);
+    var pg = this._boardPage || 0;
+    var rows = d.rows || [];
+    var myName = (d.me && d.me.name) || '';
+    for (var i = 0; i < BOARD_ROWS; i++) {
+        var r = rows[pg * BOARD_ROWS + i];
+        if (!r) break;
+        this.drawBoardRow(c, y0 + i * rowH, r, r.name === myName);
+    }
+
+    //--- 分页 + 返回 ------------------------------------------------------
+    var pages = Math.max(1, Math.ceil(rows.length / BOARD_ROWS));
+    var by = y0 + BOARD_ROWS * rowH + 24;
+    var bw = 130, bh = 54, gap = 16;
+    var self = this;
+    var mk = function (label, i, x, on, cb) {
+        var press = on && (self._press === i);
+        drawBtn(self._bmp, x, by, bw, bh, press, press);
+        self._bmp.fontSize = 24;
+        self._bmp.textColor = on ? (press ? LC.edge : LC.text) : LC.gray;
+        self._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+        self._bmp.outlineWidth = 4;
+        self._bmp.drawText(label, x, by + (bh - 30) / 2 + (press ? 2 : 0),
+                           bw, 30, 'center');
+        if (on) self._hits.push({ x: x, y: by, w: bw, h: bh, i: i, cb: cb });
+    };
+    var totalW = bw * 3 + gap * 2;
+    var sx = Math.round(W / 2 - totalW / 2);
+    mk('上一页', 200, sx, pg > 0, function () {
+        self._boardPage = Math.max(0, (self._boardPage || 0) - 1);
+        self.refresh();
+    });
+    // 中间那格不是按钮，写页码
+    this.txt((pg + 1) + ' / ' + pages, sx + bw + gap, by + 14, bw, 26,
+             LC.text, 'center');
+    mk('下一页', 201, sx + (bw + gap) * 2, pg < pages - 1, function () {
+        self._boardPage = Math.min(pages - 1, (self._boardPage || 0) + 1);
+        self.refresh();
+    });
+
+    var rx = Math.round(W / 2 - 110);
+    this.panel(rx, by + bh + 18, 220, 56);
+    this.txt('返回', rx, by + bh + 33, 220, 26, LC.text, 'center');
+    this._hits.push({ x: rx, y: by + bh + 18, w: 220, h: 56, i: -1,
+                      cb: this.onBack.bind(this) });
+};
+
 Scene_D678Net.prototype.ladBtnCb = function (key) {
     var self = this;
     return function () {
@@ -1021,6 +1255,78 @@ Scene_D678Net.prototype.ladBtnCb = function (key) {
         if (key === 'reg')     { self.onLadReg(); return; }
         if (key === 'setname') { self.onLadSetName(); return; }
     };
+};
+
+// 天梯匹配中。黑屏 + (N/8 匹配中) + 总计时 + 排行榜按钮（你定的）。
+//
+// 【计数是服务器给的假计数】不真的一个一个把 AI 加进房。真人在这段窗口里
+// 进来会占真实席位，计数取「假计数和真人数的较大者」，所以不会出现
+// 「3 个真人进来了界面还写 2/8」。
+Scene_D678Net.prototype.drawLadMatching = function (info) {
+    var W = Graphics.width, H = Graphics.height;
+    var f = info.ladFill || { shown: 1, total: 8, elapsed: 0 };
+
+    // 整屏压黑 —— 匹配中就该是一块干净的黑屏（你定的）
+    var ctx = this._bmp._context;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.88)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    this._bmp._setDirty();
+
+    this.txt('天梯排位', 0, 150, W, 40, LC.gold, 'center');
+
+    // (N/8 匹配中)
+    this.txt('（' + f.shown + '/' + f.total + ' 匹配中）', 0, 300, W, 56,
+             LC.text, 'center');
+
+    // 总计时。服务器每条 room 消息带 elapsed，两条之间用本地时钟补齐 ——
+    // 否则数字只在服务器推消息时才跳（假计数最长能隔一分钟不动），看着像卡住。
+    //
+    // _ladFillMs / _ladFillAt 是「服务器说过的那个值」和「收到它的时刻」，
+    // 在 pollNet 收 room 消息时记下。当前值 = 那个值 + 从那时起走了多久。
+    var ms = f.elapsed || 0;
+    if (this._ladFillAt) {
+        ms = Math.max(ms, (this._ladFillMs || 0) + (Date.now() - this._ladFillAt));
+    }
+    var sec = Math.floor(ms / 1000);
+    this.txt('已匹配 ' + Math.floor(sec / 60) + ':' +
+             ('0' + (sec % 60)).slice(-2), 0, 372, W, 30, LC.gray, 'center');
+
+    // 进度条：8 格，占几格就亮几格
+    var cw = 46, ch = 10, cg = 10;
+    var totW = f.total * cw + (f.total - 1) * cg;
+    var cx = Math.round(W / 2 - totW / 2), cy = 428;
+    for (var i = 0; i < f.total; i++) {
+        var on = i < f.shown;
+        ctx.save();
+        roundRect(ctx, cx + i * (cw + cg), cy, cw, ch, 4);
+        ctx.fillStyle = on ? LC.gold : 'rgba(255,255,255,0.18)';
+        ctx.fill();
+        ctx.restore();
+    }
+    this._bmp._setDirty();
+
+    this.txt('正在等待其他玩家加入', 0, 462, W, 22, LC.gray, 'center');
+
+    // 排行榜按钮（你定的：等的时候有东西可看）
+    this.drawBoardBtn(516);
+
+    // 取消匹配
+    var bw = 220, bh = 56;
+    var bx = Math.round(W / 2 - bw / 2), by = 516 + 62 + 20;
+    var press = (this._press === 130);
+    drawBtn(this._bmp, bx, by, bw, bh, press, press);
+    this._bmp.fontSize = 24;
+    this._bmp.textColor = press ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('取消匹配', bx, by + (bh - 30) / 2 + (press ? 2 : 0),
+                       bw, 30, 'center');
+    // 取消匹配走 onBack 的 waiting 分支：它会发 /api/leave 摘掉席位、
+    // 清会话、退回天梯页。单独写一个 onLeave 等于把那套逻辑抄第二份。
+    this._hits.push({ x: bx, y: by, w: bw, h: bh, i: 130,
+                      cb: this.onBack.bind(this) });
 };
 
 Scene_D678Net.prototype.drawDuel = function () {
@@ -1036,6 +1342,12 @@ Scene_D678Net.prototype.drawWaiting = function () {
     var W = Graphics.width;
     var info = this._roomInfo;
     if (!info) { this.txt('连接中…', 0, 400, W, 28, LC.gray, 'center'); return; }
+
+    // 【天梯匹配页要在 seats 判断之前】它压根不读 seats（界面上是假计数，
+    // 不列席位），而下面那条 `!info.seats` 会把它导到「正在恢复」页上去。
+    // _resuming 仍然优先：那时候连 ladder 标记都还没到（/api/resume 只回
+    // room/phase/mySeat），该显示恢复中。
+    if (!this._resuming && info.ladder) { this.drawLadMatching(info); return; }
 
     // 刷新后正在恢复：盘面还没到，房间信息也还没带 seats，
     // 直接走下面会踩 info.seats[i] 的空指针
@@ -1187,6 +1499,26 @@ Scene_D678Net.prototype.drawElim = function () {
             this.txt('胜率 ' + pct(v.rate), 456, ry, 160, 20, col, 'left');
         }
     }
+
+    this.drawLadDelta(e.lad, top + panelH + 14);
+};
+
+// 天梯加减分那一行（你定的：整场结束后显示 -30 / +12 这样）。
+// 只有天梯局才有 lad，锦标赛这里是 undefined，整块不画。
+Scene_D678Net.prototype.drawLadDelta = function (lad, y) {
+    if (!lad) return;
+    var W = Graphics.width;
+    var d = lad.delta;
+    var sign = (d > 0 ? '+' : '');
+    this.panel(50, y, W - 100, 62);
+    // 涨分金、掉分红 —— 不用绿色，绿在这套界面里是「有人在等你」的意思
+    this.txt('天梯分 ' + sign + d, 74, y + 16, 200, 30,
+             d >= 0 ? LC.gold : LC.red, 'left');
+    this.txt(lad.tier + '  ' + lad.score + ' 分',
+             W - 74 - 300, y + 18, 300, 26, TIER_COL[lad.tier] || LC.text, 'right');
+    if (lad.quit) {
+        this.txt('中途退出按末名结算', 74, y + 40, W - 148, 18, LC.red, 'left');
+    }
 };
 
 // 赛事最终排名。行高 62 × 8 行放不进大厅这块地方，所以压成一行一条，
@@ -1221,6 +1553,8 @@ Scene_D678Net.prototype.drawFinalRanks = function () {
         var st = D678N.statusText(p.status);
         if (st) this.txt(st, W - 180, y, 110, 20, LC.red, 'right');
     }
+
+    this.drawLadDelta(o.lad, 372 + 12 + list.length * 34 + 14);
 };
 
 //--- 输入 ------------------------------------------------------------------
@@ -1255,10 +1589,23 @@ Scene_D678Net.prototype.pollNet = function () {
     // 赛事结束（我已被淘汰，在大厅等最终排名）
     if (b.over) {
         D678N.finalOver = b.over;
+        // 天梯：把结算回来的分补进登录态，否则回「开启排位」界面显示的还是
+        // 打之前那个分
+        if (b.over.lad) D678N.applyLadResult(b.over.lad);
         b.over = null;
         this._page = 'ranks';
         this.refresh();
         return;
+    }
+
+    // 天梯中途退出：不会有 over / eliminated（退出的人不再收赛事消息），
+    // 但分已经结算了。停在当前页弹一句，让他知道扣了多少。
+    if (b.ladscore) {
+        var ls = b.ladscore;
+        b.ladscore = null;
+        this.notice('天梯分 ' + (ls.delta > 0 ? '+' : '') + ls.delta +
+                    '，当前 ' + ls.score + ' 分（' + ls.tier + '）');
+        this.refresh();
     }
 
     if (b.room) {
@@ -1267,17 +1614,27 @@ Scene_D678Net.prototype.pollNet = function () {
         this._roomInfo = r;
         D678N.Net.room = r.room;
         D678N.Net.mySeat = r.mySeat;
+        // 天梯匹配的总计时：记下服务器说的那个值和收到它的时刻，
+        // 两条消息之间用本地时钟补齐（见 drawLadMatching）
+        if (r.ladFill) {
+            this._ladFillMs = r.ladFill.elapsed || 0;
+            this._ladFillAt = Date.now();
+        }
         // 淘汰后停在名次页 / 排名页，别被房间消息拽回等待页 —— pushRoom 是
         // 发给所有座位的（包括已淘汰的），别人一掉线就会推一份，
-        // 不加这个判断淘汰画面会被冲掉
-        if (this._page !== 'waiting' &&
+        // 不加这个判断淘汰画面会被冲掉。
+        // 【榜页同理】在匹配中点开榜，别人一进房推一份 room 就把榜冲掉了
+        if (this._page !== 'waiting' && this._page !== 'board' &&
             this._page !== 'elim' && this._page !== 'ranks') {
             this._page = 'waiting';
         }
         // lobby 阶段恢复：没有盘面会来，收掉「正在恢复」显示正常的等待页。
         // 其余阶段继续挂着，等下面那份 resync 盘面把我们推进对局场景。
         if (this._resuming && r.phase === 'lobby') this._resuming = false;
-        this.refresh();
+        // 【在榜页时不重画】重画会把榜换成等待页。只跳过这一次重画 ——
+        // 下面「第一份盘面到了就进对局场景」那段必须照跑，否则匹配中开着榜
+        // 就永远进不去对局。
+        if (this._page !== 'board') this.refresh();
     }
 
     // 第一份盘面到了就进对局场景（盘面**留在队列里**，由那边取用）。
@@ -1369,7 +1726,7 @@ Scene_D678Net.prototype.onLadder = function () {
         this.refresh();
         D678N.Net.post('/api/lad/me', { token: tk }, function (r, code) {
             self._busy = false;
-            if (r && code === 200 && r.ok) D678N.lad = r;
+            if (r && code === 200 && r.ok) D678N.setLadFrom(r);
             else D678N.setLadToken('');   // 服务器重启过，令牌没了
             self.syncLadForm();
             self.refresh();
@@ -1435,7 +1792,7 @@ Scene_D678Net.prototype.onLadAuth = function () {
         }
         D678N.setLadToken(r.token);
         D678N.setLastAcc(r.acc);
-        D678N.lad = r;
+        D678N.setLadFrom(r);
         self._ladReg = false;
         self.syncLadForm();
         self.refresh();
@@ -1479,7 +1836,7 @@ Scene_D678Net.prototype.onLadReg = function () {
         // 注册成功直接就是登录态（服务器一并发了令牌），跳到起名那一步
         D678N.setLadToken(r.token);
         D678N.setLastAcc(r.acc);
-        D678N.lad = r;
+        D678N.setLadFrom(r);
         self._ladReg = false;
         self.syncLadForm();
         self.notice('注册成功，接下来设置游戏名');
@@ -1524,11 +1881,11 @@ Scene_D678Net.prototype.postLadName = function (name) {
         if (!r || code !== 200 || !r.ok) {
             self.notice((r && r.err) || '设置失败，服务器没响应');
             // 被拒时服务器会把当前状态一起回来（canRename 可能变了）
-            if (r && r.acc) D678N.lad = r;
+            if (r && r.acc) D678N.setLadFrom(r);
             self.refresh();
             return;
         }
-        D678N.lad = r;
+        D678N.setLadFrom(r);
         self.syncLadForm();
         self.refresh();
     });
@@ -1552,10 +1909,51 @@ Scene_D678Net.prototype.onLadLogout = function () {
     this.refresh();
 };
 
-// 排位赛还没做。给一句提示 —— 一个亮着的按钮点下去纯静默，看着像坏的。
+// 开启排位。服务器找一个还在攒人的天梯房，没有就建一个 ——
+// 同一个匹配窗口里点的真人会进同一桌（服务器那边的 findLadderRoom）。
 Scene_D678Net.prototype.onRank = function () {
-    this.notice('排位赛还没开放');
-    this.refresh();
+    if (!D678N.ladToken()) { this.notice('请先登录天梯账号'); this.refresh(); return; }
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/lad/match', { token: D678N.ladToken() }, function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200) {
+            self.notice((r && r.err) || '匹配失败，服务器没响应');
+            self.refresh();
+            return;
+        }
+        D678N.setSession({ sid: r.sid, room: r.room });
+        D678N.Net.mySeat = r.mySeat;
+        D678N.Net.connect(r.sid);
+        // 总计时以服务器那份为准（room 消息里的 ladFill.elapsed），
+        // 本地只在两条消息之间补齐 —— 见 drawLadMatching。
+        // 重复点匹配时服务器回的是原来那个房间，elapsed 从建房算起，对的。
+        self._ladFillMs = 0;
+        self._ladFillAt = 0;
+        self._page = 'waiting';
+        self.refresh();
+    });
+};
+
+// 排行榜。不要求登录 —— 匹配中也能看（你定的：等的时候有东西可做）。
+// 记住从哪一页来的，看完能回去。
+Scene_D678Net.prototype.onBoard = function () {
+    var self = this;
+    this._boardBack = this._page;
+    this._busy = true;
+    D678N.Net.post('/api/lad/board', { token: D678N.ladToken() || '' },
+    function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200) {
+            self.notice((r && r.err) || '排行榜读取失败');
+            self.refresh();
+            return;
+        }
+        self._board = r;
+        self._boardPage = 0;
+        self._page = 'board';
+        self.refresh();
+    });
 };
 
 // 匹配：服务器找一个未满未开始的锦标赛房，没有就建。不要房号 —— 朋友局
@@ -1600,14 +1998,28 @@ Scene_D678Net.prototype.onReady = function () {
 };
 
 Scene_D678Net.prototype.onBack = function () {
+    // 排行榜：回到进来时那一页。**绝不能顺手清会话** —— 匹配中点开榜再返回
+    // 要还在匹配里（服务器那边席位一直占着，清了就变成「界面回菜单但服务器
+    // 还在给我攒人」，开赛时没人接盘面）。
+    if (this._page === 'board') {
+        this._board = null;
+        this._page = this._boardBack || 'ladder';
+        this._boardBack = null;
+        this.refresh();
+        return;
+    }
     // 淘汰等待页 / 最终排名页：赛事跟我已经没关系了，直接清会话回子页。
     // 不发 /api/leave —— 服务器那边我早就是 left 了，再发一次没有意义。
     if (this._page === 'elim' || this._page === 'ranks') {
+        var wasLad = !!(D678N.finalOver && D678N.finalOver.ladder) ||
+                     !!(D678N.elim && D678N.elim.lad);
         D678N.elim = null;
         D678N.finalOver = null;
         D678N.Net.reset();
-        this._page = 'tourney';
+        // 天梯打完退回天梯页（想再排一局少点两下），锦标赛回锦标赛子页
+        this._page = wasLad ? 'ladder' : 'tourney';
         this._roomInfo = null;
+        if (wasLad) this.syncLadForm();
         this.refresh();
         return;
     }
@@ -1615,10 +2027,14 @@ Scene_D678Net.prototype.onBack = function () {
         // 已经建/进了房，退出要通知服务器（1v1 关房间，锦标赛只摘席位）
         if (D678N.Net.sid) D678N.Net.post('/api/leave', { sid: D678N.Net.sid }, null);
         var wasTourney = !!(this._roomInfo && this._roomInfo.mode === 'tourney');
+        var wasLadder = !!(this._roomInfo && this._roomInfo.ladder);
         D678N.Net.reset();
-        // 锦标赛退回子页而不是主菜单 —— 想再匹配一次少点一下
-        this._page = wasTourney ? 'tourney' : 'menu';
+        // 锦标赛退回子页而不是主菜单 —— 想再匹配一次少点一下。
+        // 天梯退回天梯页（那儿才有「开启排位」）。
+        this._page = wasLadder ? 'ladder' : (wasTourney ? 'tourney' : 'menu');
         this._roomInfo = null;
+        this._ladFillAt = 0; this._ladFillMs = 0;
+        if (wasLadder) this.syncLadForm();
         this.refresh();
         return;
     }

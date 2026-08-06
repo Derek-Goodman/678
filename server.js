@@ -88,6 +88,26 @@ const CFG = {
     // 不影响 1v1。轮次屏障下每轮耗时 = 最慢那一桌，所以这个值放大了 8 倍效果。
     tourneyTurnSec: Number(argOf('--tourney-turn-sec', 0)),
 
+    // 天梯的回合时限（秒）。比锦标赛的 30 秒短 —— 整场 33 轮，每轮省 10 秒
+    // 就是省 5 分钟（你定的）。
+    ladTurnSec: Number(argOf('--lad-turn-sec', 20)),
+
+    // 天梯假匹配的总时长范围（毫秒）。计数从 1/8 走到 8/8 用掉这么久。
+    //
+    // 【为什么故意留长】这段时间是真给真人留的窗口 —— 同一个窗口里点开启排位
+    // 的人会被塞进同一桌。55~90 秒是「等得住 + 有机会碰上真人」的折中（你定的）。
+    ladFillMinMs: Number(argOf('--lad-fill-min-ms', 55000)),
+    ladFillMaxMs: Number(argOf('--lad-fill-max-ms', 90000)),
+
+    // 天梯 AI 拟人延迟的缩放。**只给测试用** —— 一整场 33 轮、每步 1.8~16 秒，
+    // 回归测试等不起二十分钟。
+    //
+    // 【为什么是缩放而不是「设成 0」】设 0 等于把拟人延迟这条整个绕过去，
+    // 那么「延迟是随机的」「纯 AI 桌不瞬间结算」这些行为在测试里就永远验不到，
+    // 而它们恰恰是最容易写错的部分。缩放保留了全部分支和随机性，只是把
+    // 墙上时间按比例压缩。
+    ladThinkScale: Number(argOf('--lad-think-scale', 1)),
+
     // 掉线的人轮到他时用这个更短的时限（秒）。他不会来操作，让在线的那个人
     // 干等满 turnSec 没有意义 —— 而且 678core 里 standStreak>=2 才结算、
     // hit 会把它归零，所以在线方每要一张牌都要多买一个完整回合的等待。
@@ -306,10 +326,107 @@ function rollFillNames(need) {
     }
 }
 
+//=============================================================================
+// 天梯的 AI 拟人延迟
+//=============================================================================
+//
+// 现在的锦标赛是固定 900ms 一步 —— 8 个人里 7 个以毫秒级精度轮流出手，
+// 一眼就是机器。天梯要「像真人在思考」：多数步 2~5 秒，偶尔长考十几秒，
+// 每步之间的间隔都不一样（你定的）。
+//
+// 【档位是实测反解出来的】整场 33 轮（HP=100 下淘汰 7 个人的数学后果），
+// 均值 4.8 秒/步时整场约 20~24 分钟。你选了这一档而不是压到 2.3 秒的那档 ——
+// 延迟太低就不像真人了。
+//
+// 【长考上限 16 秒 vs 回合限时 20 秒】AI 想 16 秒是合法的：armTurnTimerT 对
+// AI 直接 return，不给它挂超时计时器，所以它不会把自己判超时。但玩家会看到
+// 对手思考的时间几乎等于自己的全部限时 —— 这是拟人感的代价，已跟你确认过。
+const LAD_DELAY = [
+    { w: 72, lo: 1800, hi: 5000  },   // 常规
+    { w: 21, lo: 5000, hi: 9000  },   // 稍慢
+    { w:  7, lo: 9000, hi: 16000 },   // 长考
+];
+const LAD_DELAY_TOT = LAD_DELAY.reduce((s, x) => s + x.w, 0);
+
+function ladThinkMs() {
+    let u = Math.random() * LAD_DELAY_TOT;
+    let ms = LAD_DELAY[LAD_DELAY.length - 1].hi;
+    for (const d of LAD_DELAY) {
+        if ((u -= d.w) < 0) { ms = d.lo + Math.random() * (d.hi - d.lo); break; }
+    }
+    return Math.max(1, Math.round(ms * CFG.ladThinkScale));
+}
+
+// 纯 AI 桌的假时长封顶（毫秒）。
+//
+// 【为什么需要】startRound 里两边都是 AI 的桌走 simulateMatch 当场算完 ——
+// 8 人一轮 4 桌，真人只占 1 桌，另外 3 桌**零耗时**完成。而 pushStateT 会把
+// 「本轮还有几桌在打」发给客户端（busyTables），于是天梯里看到的是：一开局
+// 另外 3 桌立刻全部打完，只剩自己在打，自己打完那一瞬间整轮就结束。
+//
+// 7 个 AI 全都有拟人延迟、但他们互相打却是 0 秒完成 —— 这个矛盾比 AI 秒出牌
+// 更刺眼。所以天梯下纯 AI 桌照样立刻算出结果（保证正确），但**推迟公布**。
+//
+// 封顶是为了不让它们成为轮次屏障的瓶颈：真人那桌中位 30 秒左右，AI 桌封在
+// 35 秒以内就基本不会拖慢整场，而 busyTables 仍然是逐桌递减的。
+const LAD_AI_TABLE_CAP_MS = 35000;
+
+// 一桌纯 AI 对局的「看起来打了多久」。按实际步数抽，所以步数多的桌确实更久。
+function ladFakeTableMs(steps) {
+    let ms = 0;
+    for (let i = 0; i < Math.max(1, steps); i++) ms += ladThinkMs();
+    // 封顶也要跟着缩放，否则测试里 ladThinkMs 被压到 2% 而封顶还是 35 秒 ——
+    // 那条封顶就永远不会触发，等于没测到
+    return Math.min(ms, LAD_AI_TABLE_CAP_MS * CFG.ladThinkScale);
+}
+
+//=============================================================================
+// 天梯假匹配
+//=============================================================================
+//
+// 界面上从 (1/8 匹配中) 走到 (8/8 匹配中) 然后开赛。这个计数是**假的** ——
+// 不真的一个一个把 AI 加进房（你定的）。真人在这段窗口里进来会占掉真实席位，
+// 计数照走。
+//
+// 【间隔按纯随机切分，不加保底】7 个切点直接在总时长上随机取。实测这样
+// p90 间隔 20 秒、最长能到 68 秒，5% 的间隔超过 25 秒 —— 也就是二十次里
+// 会有一次卡在某个数字上一分多钟。你说这正是真实游戏里常有的情况（等 1 分钟
+// 没人进来），所以保留；加了保底反而假。
+function ladRollFill() {
+    const lo = Math.max(1000, CFG.ladFillMinMs);
+    const hi = Math.max(lo + 1, CFG.ladFillMaxMs);
+    const total = Math.round(lo + Math.random() * (hi - lo));
+    // 要涨 7 次（1/8 是自己，涨到 8/8）。
+    //
+    // 【最后一次必须钉在总时长上】原来 7 个切点全是 [0,1) 均匀随机，于是最大
+    // 那个切点的期望只有 7/8 —— 实测抽到 72.2 秒的总时长，60.3 秒就开赛了。
+    // 那样实际匹配时长是 48~79 秒，不是定好的 55~90 秒。
+    // 前 6 个随机、第 7 个固定在 total，两头就都对得上。
+    const cuts = [];
+    for (let i = 0; i < 6; i++) cuts.push(Math.random());
+    cuts.sort((a, b) => a - b);
+    const at = cuts.map(c => Math.round(c * total));
+    at.push(total);
+    return { total: total, at: at };
+}
+
 // 每个房间的回合时限（秒）。锦标赛可以单独设，没设就沿用 turnSec。
+//
+// 【天梯必须在锦标赛之前判】天梯房的 mode 是 'ladder'，而它走的是整套
+// 锦标赛逻辑（startRound / checkRoundBarrier 那些函数都判 mode==='tourney'
+// 的地方要一并放行）。这里如果先判 tourney，天梯就会拿到 30 秒而不是 20 秒。
 function turnSecOf(room) {
+    if (room.mode === 'ladder') return CFG.turnSec ? CFG.ladTurnSec : 0;
     if (room.mode === 'tourney' && CFG.tourneyTurnSec) return CFG.tourneyTurnSec;
     return CFG.turnSec;
+}
+
+// 这个房间是不是走 8 人赛事那套（锦标赛 + 天梯）。
+// 【为什么要这个】原来通篇写 mode === 'tourney'，加了天梯之后每一处都要
+// 兼容两种 —— 漏一处的症状是「天梯房走 1v1 的分支」，而 1v1 只有 2 个座位，
+// 表现是各种下标越界。集中成一个判据，加第三种模式时也只改这里。
+function isTourneyLike(room) {
+    return room.mode === 'tourney' || room.mode === 'ladder';
 }
 
 //=============================================================================
@@ -580,7 +697,12 @@ function accSave() {
         const out = { v: 1, list: [] };
         for (const a of accounts.values()) {
             out.list.push({ acc: a.acc, pw: a.pw, name: a.name,
-                            renamedDay: a.renamedDay });
+                            renamedDay: a.renamedDay,
+                            // 天梯战绩。ladSeason 存的是「这个分属于哪个赛季」，
+                            // 少了它跨月重启会把上个赛季的分当本赛季的用
+                            ladScore: a.ladScore, ladSeason: a.ladSeason,
+                            ladGames: a.ladGames, ladSGames: a.ladSGames,
+                            ladRankSum: a.ladRankSum, ladChamps: a.ladChamps });
         }
         const tmp = ACC_FILE + '.tmp';
         try {
@@ -615,9 +737,19 @@ function accLoad() {
         const acc = chkAcc(a && a.acc);
         if (!acc) continue;
         const key = acc.toLowerCase();
+        // 天梯字段读回来要过一遍数值校验：文件是可能被手工改的，
+        // 一个 NaN 混进分数会顺着 Δ 公式污染整条链（NaN 参与比较永远 false，
+        // 地板兜不住），而且会写回盘上。
+        const num = (v, def) => (typeof v === 'number' && isFinite(v)) ? v : def;
         const rec = {
             acc: acc, pw: String(a.pw == null ? '' : a.pw), name: '',
             renamedDay: String(a.renamedDay || ''),
+            ladScore:   Math.max(LAD_FLOOR, Math.round(num(a.ladScore, LAD_BASE))),
+            ladSeason:  String(a.ladSeason || ''),
+            ladGames:   Math.max(0, Math.round(num(a.ladGames, 0))),
+            ladSGames:  Math.max(0, Math.round(num(a.ladSGames, 0))),
+            ladRankSum: Math.max(0, Math.round(num(a.ladRankSum, 0))),
+            ladChamps:  Math.max(0, Math.round(num(a.ladChamps, 0))),
         };
         // 名字要过一遍校验再认：规则以后收紧的话，老数据里不合规的那些
         // 就当没起过名，让他重新起一个
@@ -655,7 +787,462 @@ function accView(a) {
         name: a.name || '',
         // 今天还能不能改名。还没起过名时是「首次设置」，不算改名，所以也是 true
         canRename: !a.name || a.renamedDay !== dayKey(),
+        // 天梯分和段位（开启排位界面要显示）
+        score: ladScoreOf(a),
+        tier: ladTier(ladScoreOf(a)),
+        games: a.ladGames || 0,
+        champs: a.ladChamps || 0,
+        avgRank: (a.ladGames > 0) ? (a.ladRankSum / a.ladGames) : null,
+        season: ladSeason(nowSec()).label,
     };
+}
+
+//=============================================================================
+// 天梯计分
+//=============================================================================
+//
+// 【为什么是收敛式而不是纯累加】纯累加（第1名+30、第8名-10 那种）只要平均
+// 名次好于收支平衡点，分数就无上限地涨 —— 排行榜变成按在线时长排序，玩得多
+// 的人永远第一，新人永远追不上。这个盘子小，头名跑远了榜就死了。
+//
+// 收敛式带自动刹车：分越高期望值越大，同样的名次给的分越少，到某个点停住。
+// 两个水平一样的人，打 20 局和打 200 局最后落在同一个分段。
+//
+// 公式（N 人桌，名次 rank）：
+//     s = (N - rank) / (N - 1)          实得成绩，第 1 名 = 1，末名 = 0
+//     e = 1 / (1 + 10^((A - R) / 400))  期望成绩，A = 同桌其余人的平均分
+//     Δ = K × (s - e)
+// 收支平衡点正好在第 4.5 名（8 人桌的纯随机位置）—— 进前半区就赚，
+// 掉后半区就亏，玩家不看说明也懂。
+
+const LAD_BASE   = 1000;   // 新号起始分
+const LAD_FLOOR  = 500;    // 分数地板。掉穿是纯挫败，没有信息量
+const LAD_SCALE  = 400;    // Elo 尺度。放大 -> 榜的跨度变大
+const LAD_MINGAMES = 10;   // 上榜门槛（累计场次）
+const LAD_BOARD_N  = 100;  // 榜显示前多少名
+
+// K 值。定级期给大的（10 局就能落到大致正确的位置，不用爬几十局），
+// 高分区收紧（榜首不会天天换）。
+function ladK(score, games) {
+    if (games < LAD_MINGAMES) return 120;
+    if (score >= 1300) return 40;
+    return 60;
+}
+
+// 段位。线是按**实测分布**定的，不是拍脑袋 —— 详见 ladAiState 的注释。
+// 新号 1000 分落在「普通」的上沿：往上爬有三档，掉下去有一档。
+const LAD_TIERS = [
+    { min: 1220, name: '顶尖' },
+    { min: 1120, name: '高手' },
+    { min: 1020, name: '精通' },
+    { min:  900, name: '普通' },
+    { min:    0, name: '新手' },
+];
+function ladTier(score) {
+    for (let i = 0; i < LAD_TIERS.length; i++) {
+        if (score >= LAD_TIERS[i].min) return LAD_TIERS[i].name;
+    }
+    return LAD_TIERS[LAD_TIERS.length - 1].name;
+}
+
+//--- 赛季 ------------------------------------------------------------------
+// 北京时间的自然月：8 月赛季 = 8/1 00:00 ~ 8/31 23:59（你定的）。
+//
+// 【必须自己加时区偏移】服务器多半跑在 UTC（Zeabur 就是），直接用
+// getMonth() 会让赛季在北京时间早上 8 点才翻篇 —— 玩家 0 点看榜还是上个月。
+const LAD_TZ = 8 * 3600;
+
+function nowSec() { return Math.floor(Date.now() / 1000); }
+
+function ladSeason(sec) {
+    // 挪到北京时间再取年月：+8h 之后用 UTC 系列函数读，等价于按北京时间读
+    const d = new Date((sec + LAD_TZ) * 1000);
+    const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    return {
+        y: y, m: m,
+        startSec: Date.UTC(y, m, 1) / 1000 - LAD_TZ,       // 北京 1 日 00:00
+        nextSec:  Date.UTC(y, m + 1, 1) / 1000 - LAD_TZ,
+        key: y + '-' + (m + 1),
+        label: y + '年' + (m + 1) + '月赛季',
+    };
+}
+
+//--- 确定性哈希 ------------------------------------------------------------
+// FNV-1a **加 murmur3 的收尾混合**。
+//
+// 【收尾混合不能省】FNV 单独用时高位扩散很差，而 ladFrac 取的正好是高位
+// （除以 2^32）。少了这一步，'#k5' 和 '#k25' 这种只差一个字符的输入会给出
+// 相关的小数 —— Box-Muller 的两路取样一相关，每个 AI 的正态就带一个固定
+// 偏向。实测症状：某个 AI 的平均名次死钉在 6.00，基准 1178 的收敛到 751
+// （偏离 8 个标准差）。加上之后偏离回到 3 倍标准误以内。
+function ladH32(s) {
+    let x = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+        x ^= s.charCodeAt(i);
+        x = Math.imul(x, 16777619);
+    }
+    x ^= x >>> 16; x = Math.imul(x, 2246822507);
+    x ^= x >>> 13; x = Math.imul(x, 3266489909);
+    x ^= x >>> 16;
+    return x >>> 0;
+}
+function ladFrac(s) { return ladH32(s) / 4294967296; }
+
+//--- 基准分 -> 真收敛分 ----------------------------------------------------
+// 【为什么不能直接拿基准分当收敛点】名次被 clamp 到 1~8 再取整，高基准的 AI
+// 头部被截掉一截（目标名次 1.6 时正态的左尾全压在第 1 名上），实得成绩因此
+// 低于目标成绩，收敛点就落在基准之下。实测差值：
+//     基准 1200 -> 收敛 1175（-25）
+//     基准 1300 -> 收敛 1242（-58）
+//     基准 1420 -> 收敛 1297（-123）  <- 抬基准已经没用了
+// 所以 AI 的分数天花板是 1300 左右。段位「顶尖」如果定在 1350，那一档
+// 永远只有真人，AI 一个都进不去 —— 榜上看就是空的。
+//
+// 这里对 sd=1.9 的正态做数值积分算出截断后的实得成绩，再反解收敛分。
+// 赛季开局的分数用它，这样分数在赛季里是围绕它波动，不是单向往下掉。
+const LAD_RANK_SD = 1.9;
+const ladConvCache = new Map();
+function ladConv(base) {
+    if (ladConvCache.has(base)) return ladConvCache.get(base);
+    const e = 1 / (1 + Math.pow(10, (LAD_BASE - base) / LAD_SCALE));
+    const target = 8 - 7 * e;
+    let sum = 0, tot = 0;
+    for (let z = -6; z <= 6; z += 0.004) {
+        const w = Math.exp(-z * z / 2);
+        const r = Math.min(8, Math.max(1, Math.round(target + z * LAD_RANK_SD)));
+        sum += w * (8 - r) / 7;
+        tot += w;
+    }
+    const s = sum / tot;
+    const R = (s <= 0 || s >= 1) ? base
+            : Math.round(LAD_BASE + LAD_SCALE * Math.log10(s / (1 - s)));
+    ladConvCache.set(base, R);
+    return R;
+}
+
+//--- AI 的分数漂移 ---------------------------------------------------------
+// 你要的是「分数在随机时刻不停地动，像真有人在玩」。
+//
+// 【为什么是无状态的纯函数】不存任何漂移状态，分数是 f(名字, 时刻) ——
+// 从赛季起点确定性地重放一串虚拟对局。这样 Zeabur 上进程重启、多实例都不会
+// 让数字跳：同一时刻任何请求算出来都是同一个分。而且场次、平均名次、冠军
+// 次数跟着一起长，几个数字互相对得上，不会出现「分涨了但场次没动」。
+//
+// 【人格分两层】
+//   · core（不带赛季种子）—— 长期强弱，跨季稳定。少了它「谁强谁弱」每月洗牌，
+//     榜就没有熟脸了。
+//   · wob（带赛季种子，±70）—— 赛季浮动。少了它实测榜首连续三个月同一个 AI。
+//
+// 【基准区间 720~1280 是反推出来的】要让收敛中位落在 998 ≈ 真人的 1000 起点。
+// 原来用 880~1380，收敛中位 1117 —— 于是平均名次 4.5（纯随机水平）的真人会
+// 收敛到 1156 分，白拿 156 分还直接进「高手」。
+function ladPersona(name, seedKey) {
+    const core = 720 + Math.floor(ladFrac(name + '#b') * 561);          // 720~1280
+    const wob  = Math.round((ladFrac(name + '#w' + seedKey) - 0.5) * 140);
+    const base = Math.max(820, Math.min(1420, core + wob));
+    // 名义 rate。下面的作息筛会拒掉约 60%（LAD_HOURS 的平均值 ~0.40），
+    // 所以要先除回去，实际落地才是 3~14 局/天。
+    const rate = (3 + ladFrac(name + '#r' + seedKey) * 11) / 0.40;
+    return { base: base, core: core, start: ladConv(base), rate: rate,
+             phase: ladFrac(name + '#p' + seedKey) };
+}
+
+// 一天里各时段的活跃权重（北京时间 0 点起，每格 1 小时）。
+// 晚 8~11 点高峰，凌晨 3~6 点近乎没人 —— 全天均匀铺开的话凌晨四点也在打牌，
+// 那个一眼就假。
+const LAD_HOURS = [
+    0.30, 0.16, 0.08, 0.04, 0.03, 0.04,   //  0~5
+    0.10, 0.24, 0.34, 0.40, 0.44, 0.46,   //  6~11
+    0.52, 0.44, 0.42, 0.46, 0.50, 0.56,   // 12~17
+    0.66, 0.80, 1.00, 0.96, 0.74, 0.50,   // 18~23
+];
+
+// 第 k 局虚拟对局的时刻。每局自带 ±40% 抖动 —— 所以分数变动落在零散的随机
+// 时刻上，不是整点跳一次。
+function ladMatchAt(name, p, k, startSec, seedKey) {
+    const step = 86400 / p.rate;
+    const jit = (ladFrac(name + '#j' + seedKey + '_' + k) - 0.5) * 0.8;
+    return startSec + (k + p.phase + jit) * step;
+}
+
+// 这一局打不打得起来。均匀排好的时刻再过一道接受筛：凌晨那几格权重低，
+// 多数候选局被筛掉 —— 场次在夜里几乎不长，白天晚上长得快。
+// 保持无状态、可重放，代价只是 rate 被打了个折（已在 ladPersona 里补回）。
+function ladHappens(name, k, t, seedKey) {
+    const hr = Math.floor((((t + LAD_TZ) % 86400) + 86400) % 86400 / 3600);
+    return ladFrac(name + '#h' + seedKey + '_' + k) < LAD_HOURS[hr];
+}
+
+// 本局名次：围绕人格目标名次取正态样本，clamp 到 1~8。
+function ladRollRank(name, p, k, seedKey) {
+    const e = 1 / (1 + Math.pow(10, (LAD_BASE - p.base) / LAD_SCALE));
+    const target = 8 - 7 * e;
+    const u = ladFrac(name + '#k' + seedKey + '_' + k);
+    const v = ladFrac(name + '#k2' + seedKey + '_' + k);
+    // Box-Muller。u 可能是 0，加 1e-12 防 log(0)
+    const z = Math.sqrt(-2 * Math.log(u + 1e-12)) * Math.cos(2 * Math.PI * v);
+    return Math.min(8, Math.max(1, Math.round(target + z * LAD_RANK_SD)));
+}
+
+// AI 的「账号起点」。累计场次 / 冠军从这里数起 ——
+// 【为什么需要】只有分数按赛季重置，场次和冠军是累计的。否则赛季头一分钟
+// 榜上 115 行全是「0 场 / 0 冠军 / 均名次 —」，一眼假。
+// 冠军次数当累计数字看本来也更有意义（「这人拿过 163 次冠军」）。
+const LAD_AI_EPOCH = Date.UTC(2026, 5, 1) / 1000 - LAD_TZ;   // 北京 2026-06-01
+
+// 单个赛季内的重放。返回 {score, games, rankSum, champs}。
+// upto 截断到某个时刻（当前赛季用 now，历史赛季用赛季终点）。
+function ladReplaySeason(name, season, upto, startScore) {
+    const seedKey = season.key;
+    const p = ladPersona(name, seedKey);
+    let R = (startScore === undefined) ? p.start : startScore;
+    let games = 0, rankSum = 0, champs = 0;
+    for (let k = 0; k < 100000; k++) {
+        const t = ladMatchAt(name, p, k, season.startSec, seedKey);
+        if (t > upto) break;
+        if (!ladHappens(name, k, t, seedKey)) continue;
+        const r = ladRollRank(name, p, k, seedKey);
+        const s = (8 - r) / 7;
+        const e = 1 / (1 + Math.pow(10, (LAD_BASE - R) / LAD_SCALE));
+        let d = Math.round(ladK(R, games) * (s - e));
+        if (r === 1 && d < 1) d = 1;          // 赢了不涨分说不通
+        R = Math.max(LAD_FLOOR, R + d);
+        games++; rankSum += r;
+        if (r === 1) champs++;
+    }
+    return { score: R, games: games, rankSum: rankSum, champs: champs };
+}
+
+// 历史赛季的累计（场次 / 名次和 / 冠军）。**只在赛季翻篇时变**，所以可以
+// 永久缓存 —— 否则每次查榜都要从 2026-06 重放到现在，赛季越多越慢。
+const ladHistCache = new Map();   // '名字|赛季key' -> {games, rankSum, champs}
+function ladHistory(name, curSeason) {
+    const ck = name + '|' + curSeason.key;
+    const hit = ladHistCache.get(ck);
+    if (hit) return hit;
+    let games = 0, rankSum = 0, champs = 0;
+    let cur = LAD_AI_EPOCH;
+    // 一个月一个月往前推到当前赛季（不含）
+    let guard = 0;
+    while (cur < curSeason.startSec && guard++ < 600) {
+        const sn = ladSeason(cur);
+        const r = ladReplaySeason(name, sn, Math.min(sn.nextSec, curSeason.startSec));
+        games += r.games; rankSum += r.rankSum; champs += r.champs;
+        cur = sn.nextSec;
+    }
+    const out = { games: games, rankSum: rankSum, champs: champs };
+    ladHistCache.set(ck, out);
+    return out;
+}
+
+// 一个 AI 此刻的榜行。分数按赛季重置，场次 / 均名次 / 冠军是累计的。
+function ladAiState(name, now) {
+    const sn = ladSeason(now);
+    const cur = ladReplaySeason(name, sn, now);
+    const hist = ladHistory(name, sn);
+    const games = hist.games + cur.games;
+    const rankSum = hist.rankSum + cur.rankSum;
+    return {
+        name: name,
+        score: cur.score,
+        games: games,
+        champs: hist.champs + cur.champs,
+        avgRank: games > 0 ? rankSum / games : null,
+        ai: true,
+    };
+}
+
+//--- 真人的分 --------------------------------------------------------------
+// 账号记录上的天梯字段（accLoad / accSave 里跟着走）：
+//   ladScore     本赛季分数
+//   ladSeason    这个分属于哪个赛季（key）。对不上就先做软重置
+//   ladGames     累计场次（跨赛季，上榜门槛看它）
+//   ladRankSum   累计名次和（算平均排名）
+//   ladChamps    累计冠军次数
+//   ladSGames    本赛季场次（K 值的定级期看它）
+//
+// 【跨季软重置】新分 = (旧分 + 1000) / 2。月赛季下每月削一半差值：
+// 1300 分的人下月从 1150 起。清零太狠（一个月的努力全没），不重置又让
+// 赛季这个概念没意义。
+function ladScoreOf(a) {
+    const sn = ladSeason(nowSec());
+    if (a.ladSeason !== sn.key) {
+        // 惰性重置：读到的时候才算。定时任务会漏掉不活跃的号，而这个不会。
+        const old = (typeof a.ladScore === 'number') ? a.ladScore : LAD_BASE;
+        a.ladScore = Math.round((old + LAD_BASE) / 2);
+        a.ladSeason = sn.key;
+        a.ladSGames = 0;
+        accSave();
+    }
+    return a.ladScore;
+}
+
+// 一局结束后给真人算 Δ。
+//
+// 【同桌均分不能用「实际抽到谁的平均分」】D678.AI.profile() 里除超哥外所有 AI
+// 返回同一组参数（depth 2 / expand 2 / th 0.6 / noise 0.45）—— 榜上写 1280 的
+// 和写 750 的，打起来一模一样。用实际平均分的话，「抽到 7 个高分 AI」那局同样
+// 的名次会给更多分，而实际难度没有任何差别。那是计分本身的漏洞。
+//
+// 所以真人的 A 只看**超哥有几个**（真正影响难度的只有这个），以及同桌有几个
+// 真人（真人的分是真的，该算进去）。
+const LAD_AI_FIELD = 1035;   // 普通 AI 的等效分（实测 AI 榜的中位数）
+const LAD_GOD_FIELD = 1600;  // 超哥的等效分
+
+function ladFieldAvg(room, meSeat) {
+    const g = room.game;
+    let sum = 0, n = 0;
+    g.players.forEach((p, i) => {
+        if (meSeat && i === meSeat.pIdx) return;         // 不含自己
+        const st = room.seats.find(s => s && s.pIdx === i);
+        if (st && st.ladAcc) {
+            // 同桌的真人：用他真实的分
+            const a = accounts.get(st.ladAcc);
+            sum += a ? ladScoreOf(a) : LAD_BASE;
+        } else if (p.isGod) {
+            sum += LAD_GOD_FIELD;
+        } else {
+            sum += LAD_AI_FIELD;
+        }
+        n++;
+    });
+    return n > 0 ? sum / n : LAD_AI_FIELD;
+}
+
+// 结算：把这一局的名次算进账号。返回 {delta, score, tier, ...} 给客户端。
+function ladSettle(room, seat, rank, total) {
+    const a = seat.ladAcc ? accounts.get(seat.ladAcc) : null;
+    if (!a) return null;
+    const before = ladScoreOf(a);
+    const N = Math.max(2, total);
+    const s = (N - rank) / (N - 1);
+    const A = ladFieldAvg(room, seat);
+    const e = 1 / (1 + Math.pow(10, (A - before) / LAD_SCALE));
+    const sGames = a.ladSGames || 0;
+    let d = Math.round(ladK(before, sGames) * (s - e));
+    if (rank === 1 && d < 1) d = 1;
+    const after = Math.max(LAD_FLOOR, before + d);
+
+    a.ladScore   = after;
+    a.ladGames   = (a.ladGames || 0) + 1;
+    a.ladSGames  = sGames + 1;
+    a.ladRankSum = (a.ladRankSum || 0) + rank;
+    if (rank === 1) a.ladChamps = (a.ladChamps || 0) + 1;
+    accSave();
+    // 榜有 30 秒缓存。不在这里失效的话「打完一局去看榜」最多要等 30 秒才看到
+    // 新分数和新名次 —— 那正是玩家最想马上看一眼的时刻。
+    // 结算是低频事件，让它多算一次全榜（约 130ms）完全划得来。
+    ladBoardBust();
+
+    log('天梯结算 %s 第 %d/%d 名，%s%d -> %d 分',
+        a.name || a.acc, rank, N, (after - before >= 0 ? '+' : ''),
+        after - before, after);
+    return {
+        delta: after - before,
+        score: after,
+        tier: ladTier(after),
+        games: a.ladGames,
+        champs: a.ladChamps || 0,
+        avgRank: a.ladRankSum / a.ladGames,
+    };
+}
+
+// 把房间里所有还没结算的天梯座位按**末名**结算。
+//
+// 用在「房间要被销毁、但赛事还没走到 enterOverT」的时刻 —— 那条路上没有
+// 名次可言（赛事没打完），而且不按末名算就等于给掉线开了一道免罚门。
+//
+// 【为什么不用 rankOf 的真实名次】rankOf 是按存活者 HP 排的，领先时掉线会
+// 算出第 1 名 —— 那样「赢着的时候拔网线」就成了最优策略。和 /api/leave
+// 那条同一个口径：中途走人一律末名。
+function ladSettleAllLeft(room, why) {
+    if (!room || room.mode !== 'ladder' || !room.game) return;
+    const total = room.game.players.length;
+    room.seats.forEach(seat => {
+        if (!seat || !seat.ladAcc || seat.ladResult) return;
+        seat.ladResult = ladSettle(room, seat, total, total);
+        if (seat.ladResult) {
+            seat.ladResult.quit = true;
+            log('房间 %s %s %s -> 按末名结算', room.code, seat.name, why);
+            // 连接大概已经没了，发了也就发了（sendTo 自己判 seat.sse）
+            sendTo(seat, 'ladscore', seat.ladResult);
+        }
+    });
+}
+
+//--- 榜 --------------------------------------------------------------------
+// 真人行 + AI 行合并排序取前 100。整份榜算一次约 55ms（115 个 AI，赛季末），
+// 缓存 30 秒 —— 分数本来就是分钟级在动，30 秒的滞后看不出来。
+let ladBoardCache = null, ladBoardAt = 0;
+const LAD_BOARD_TTL = 30000;
+
+// 让榜的缓存立刻失效。结算后调（见 ladSettle），测试里直接改账号后也要调。
+function ladBoardBust() { ladBoardCache = null; ladBoardAt = 0; }
+
+function ladBoard() {
+    const now = Date.now();
+    if (ladBoardCache && now - ladBoardAt < LAD_BOARD_TTL) return ladBoardCache;
+    const t = nowSec();
+    const rows = [];
+    // AI
+    for (const nm of D678.LAD_AI_NAMES) rows.push(ladAiState(nm, t));
+    // 真人。门槛按**累计**场次算 —— 按赛季场次算的话月初全体「定级中」，
+    // 榜会空掉好几个小时。
+    for (const a of accounts.values()) {
+        if (!a.name) continue;                       // 还没起天梯名
+        const games = a.ladGames || 0;
+        if (games < LAD_MINGAMES) continue;
+        rows.push({
+            name: a.name, score: ladScoreOf(a), games: games,
+            champs: a.ladChamps || 0,
+            avgRank: games > 0 ? a.ladRankSum / games : null,
+            ai: false, acc: a.acc.toLowerCase(),
+        });
+    }
+    rows.sort((x, y) => (y.score - x.score) || x.name.localeCompare(y.name));
+    rows.forEach((r, i) => { r.rank = i + 1; });
+    ladBoardCache = { rows: rows, season: ladSeason(t).label };
+    ladBoardAt = now;
+    return ladBoardCache;
+}
+
+// 发给客户端的榜：前 100 行 + 自己那一行（可能在 100 名以外）。
+function ladBoardView(acc) {
+    const b = ladBoard();
+    const view = r => ({
+        rank: r.rank, name: r.name, score: r.score, tier: ladTier(r.score),
+        games: r.games, champs: r.champs,
+        // 平均排名保留 1 位小数（你定的，比如 2.3）
+        avgRank: (r.avgRank == null) ? null : Math.round(r.avgRank * 10) / 10,
+    });
+    const out = {
+        season: b.season,
+        total: b.rows.length,
+        rows: b.rows.slice(0, LAD_BOARD_N).map(view),
+        me: null,
+    };
+    if (acc) {
+        const key = acc.acc.toLowerCase();
+        const mine = b.rows.find(r => !r.ai && r.acc === key);
+        if (mine) {
+            out.me = view(mine);
+            out.me.onBoard = mine.rank <= LAD_BOARD_N;
+        } else {
+            // 没上榜：可能是场次不够（定级中），也可能是还没起名
+            const games = acc.ladGames || 0;
+            out.me = {
+                rank: null, name: acc.name || '', score: ladScoreOf(acc),
+                tier: ladTier(ladScoreOf(acc)), games: games,
+                champs: acc.ladChamps || 0,
+                avgRank: games > 0
+                    ? Math.round(acc.ladRankSum / games * 10) / 10 : null,
+                onBoard: false,
+                rating: games < LAD_MINGAMES,      // 定级中
+                need: Math.max(0, LAD_MINGAMES - games),
+            };
+        }
+    }
+    return out;
 }
 
 // 取客户端 IP。平台在前面架了反向代理，socket 上看到的是代理的地址，
@@ -884,8 +1471,15 @@ function maskViewT(room, bt, seat, snapPre) {
             funcUses: p.funcUses,
             funcs: (pIdx === mePIdx) ? p.funcs.slice(0) : null,
             funcCount: p.funcs.length,
-            // 客户端要靠这两个还原 AI 行为（超哥按超哥打）
-            isHuman: !!p.isHuman, isGod: !!p.isGod,
+            // 客户端要靠这两个还原 AI 行为（超哥按超哥打）。
+            //
+            // 【天梯下绝不发 isGod】天梯里超哥借用普通 AI 的名字，玩家不该知道
+            // 这局谁是超哥 —— 发下去的话打开 devtools 就能看出来，换名字整个
+            // 白做。核对过：客户端只在 678net.js 的 buildReplica 里把它存进副本，
+            // 联机对局里从不读它（读它的只有单机的教程对手筛选），所以不发是
+            // 安全的。缺字段时 buildReplica 那句 `!!info.isGod` 得到 false。
+            isHuman: !!p.isHuman,
+            isGod: (room.mode === 'ladder') ? undefined : !!p.isGod,
             // 排名列表的「胜/负」一栏（drawRankList -> lastText）。
             // prevLast 是上一轮的，那一轮全场都打完了，8 个人的都能发。
             // last 是本轮的，只发我这桌的两个人 —— 别人桌本轮打完没打完、
@@ -1014,7 +1608,9 @@ function withRoom(room, fn) {
 function newRoom(mode) {
     let code;
     do { code = rndId(4); } while (rooms.has(code));
-    const seatN = (mode === 'tourney') ? TOURNEY_SEATS : 2;
+    // 天梯和锦标赛一样是 8 席。少了这条天梯房只有 2 个座位 ——
+    // 症状是补 AI 时 addSeat 返回 null，8 人里只坐得下 2 个。
+    const seatN = (mode === 'tourney' || mode === 'ladder') ? TOURNEY_SEATS : 2;
     const room = {
         code: code,
         mode: mode || 'duel',
@@ -1113,6 +1709,9 @@ function dropRoom(room, why) {
     clearTimeout(room.turnTimer);
     clearTimeout(room.ackTimer);
     clearTimeout(room.roundTimer);
+    // 天梯假计数的定时器。漏掉的话房间销毁后 ladFillTick 还会跑，
+    // 对着已经从 rooms 里删掉的房间 pushRoom / startLadder
+    clearTimeout(room.ladFillTimer);
     // 锦标赛一轮有多桌，每桌两个定时器 —— 漏掉的话房间销毁后
     // 回调还会对着已删除的房间跑 pushStateT
     (room.battles || []).forEach(bt => {
@@ -1232,7 +1831,12 @@ function pushRoom(room) {
             // 「我点过准备没有」。界面靠它把按钮在准备/取消之间切。
             myReady: !!seat.ready,
             // 少于 2 人时点了准备也开不了赛，界面要明说在等人（否则像坏了）
+            // 天梯不用这条：它不靠「准备」开赛，满 8 人（假计数走完）就开
             needMore: room.mode === 'tourney' && room.phase === 'lobby' && taken < 2,
+            // 天梯的假匹配状态。客户端靠它画 (N/8 匹配中) 和总计时。
+            ladder: room.mode === 'ladder' || undefined,
+            ladFill: (room.mode === 'ladder' && room.phase === 'lobby')
+                ? ladFillView(room) : undefined,
             seats: room.seats.map(s => (s && !s.left) ? {
                 name: s.name, connected: s.connected, ready: !!s.ready,
             } : null),
@@ -1296,7 +1900,10 @@ function pushStateT(room, extra) {
         const busy = room.battles.filter(x => !x.done).length;
         sendTo(seat, 'state', Object.assign({
             seq: room.seq,
+            // 天梯也发 'tourney' —— 客户端的绘制层按它走 8 人赛那套，
+            // 一行都不用改。天梯特有的东西走下面的 ladder 字段。
             mode: 'tourney',
+            ladder: room.mode === 'ladder' || undefined,
             // 我那桌的编号。extra 里的 btId 是「这次事件属于哪一桌」，
             // 两者不等就说明这份 fresh / resolved 是别人桌的，客户端要忽略。
             myBtId: bt ? bt.id : -1,
@@ -1422,6 +2029,133 @@ function startTourney(room) {
     startRound(room);
 }
 
+//=============================================================================
+// 天梯房
+//=============================================================================
+
+// 找一个还在攒人的天梯房，没有就建一个。
+//
+// 【为什么共用同一个房】假匹配那 55~90 秒是真给真人留的窗口 —— 同一个窗口里
+// 点「开启排位」的人要进同一桌，否则真人永远碰不到真人（你定的：故意把时间
+// 留长，尽量匹配多一点真人）。
+function findLadderRoom() {
+    for (const r of rooms.values()) {
+        if (r.mode !== 'ladder' || r.phase !== 'lobby') continue;
+        // 假计数已经走满了的房不再收人（下一刻就要开赛）
+        if (r.ladFill && r.ladShown >= TOURNEY_SEATS) continue;
+        const taken = r.seats.filter(s => s && !s.left).length;
+        if (taken < TOURNEY_SEATS) return r;
+    }
+    return null;
+}
+
+// 天梯房的假匹配状态。ladShown 是界面上显示的人数（含自己）。
+function ladFillView(room) {
+    const real = room.seats.filter(s => s && !s.left).length;
+    return {
+        shown: Math.max(real, room.ladShown || 1),
+        total: TOURNEY_SEATS,
+        // 从建房那一刻算起的总耗时（毫秒）—— 界面上那个总计时
+        elapsed: Date.now() - (room.ladStartAt || Date.now()),
+    };
+}
+
+// 启动一个天梯房的假计数。
+//
+// 计数是假的（不真的一个一个把 AI 加进房），但**真人进来会占真实席位**，
+// 而且显示人数不会低于真实人数 —— 否则 3 个真人进来了界面还写 2/8。
+function ladStartFill(room) {
+    room.ladStartAt = Date.now();
+    room.ladShown = 1;
+    room.ladFill = ladRollFill();
+    room.ladFillIdx = 0;
+    ladFillTick(room);
+    log('房间 %s 天梯匹配开始，假计数总时长 %ss',
+        room.code, (room.ladFill.total / 1000).toFixed(1));
+}
+
+// 排下一次递增。到点了就 +1 并推一份房间信息；走满 8 个就开赛。
+function ladFillTick(room) {
+    clearTimeout(room.ladFillTimer);
+    if (room.phase !== 'lobby' || room.mode !== 'ladder') return;
+    const f = room.ladFill;
+    if (!f) return;
+    if (room.ladFillIdx >= f.at.length) {
+        // 计数走满 -> 开赛
+        room.ladShown = TOURNEY_SEATS;
+        pushRoom(room);
+        startLadder(room);
+        return;
+    }
+    const due = room.ladStartAt + f.at[room.ladFillIdx];
+    const wait = Math.max(0, due - Date.now());
+    room.ladFillTimer = setTimeout(() => {
+        if (room.phase !== 'lobby' || room.mode !== 'ladder') return;
+        room.ladFillIdx++;
+        // 真人可能已经进来把显示人数顶上去了，取大的那个
+        const real = room.seats.filter(s => s && !s.left).length;
+        room.ladShown = Math.max(real, (room.ladShown || 1) + 1);
+        if (room.ladShown > TOURNEY_SEATS) room.ladShown = TOURNEY_SEATS;
+        pushRoom(room);
+        ladFillTick(room);
+    }, wait);
+}
+
+// 开赛。真人占前面的 pIdx，其余用天梯名单补齐，再按概率挑 0~2 个挂超哥逻辑。
+function startLadder(room) {
+    clearTimeout(room.ladFillTimer);
+    const humans = room.seats.filter(s => s && !s.left);
+    if (humans.length === 0) { dropRoom(room, '天梯房里没有真人'); return; }
+    const need = TOURNEY_SEATS - humans.length;
+    // 避开所有真人的名字，免得榜和排名表里出现两个同名的人
+    const taken = humans.map(s => s.name);
+    let aiNames = D678.rollLadNames(need + taken.length);
+    aiNames = aiNames.filter(nm => taken.indexOf(nm) < 0).slice(0, need);
+
+    const savedHp = D678.START_HP;
+    D678.START_HP = CFG.startHp;
+    try {
+        const game = new D678.GameClass();
+        const players = [];
+        humans.forEach(s => {
+            const p = new D678.Player(players.length, s.name, true);
+            s.pIdx = players.length;
+            s.player = p;
+            players.push(p);
+        });
+        aiNames.forEach(nm => {
+            const p = new D678.Player(players.length, nm, false);
+            // 天梯名单里不会有「超哥」这个名字，所以构造函数判出来一定是 false。
+            // 下面按概率重新指定。
+            p.isGod = false;
+            players.push(p);
+        });
+        game.players = players;
+        room.game = game;
+
+        // 超哥：0 个 75% / 1 个 20% / 2 个 5%（你定的）。
+        // 【名字不变】被选中的 AI 照常显示自己的名字 —— 玩家看不出这局谁是超哥。
+        // 只能从 AI 里挑，真人不可能是超哥。
+        const godN = Math.min(D678.rollGodN(), aiNames.length);
+        const aiIdx = players.map((p, i) => i).filter(i => !players[i].isHuman);
+        const picked = D678.shuffle(aiIdx).slice(0, godN);
+        picked.forEach(i => { players[i].isGod = true; });
+        room.ladGodN = picked.length;
+        room.ladGodNames = picked.map(i => players[i].name);
+    } finally {
+        D678.START_HP = savedHp;
+    }
+
+    room.phase = 'battle';
+    dailyBump('online', humans.length);
+    // 超哥是谁只记在服务器日志里 —— 客户端永远收不到（见 maskViewT 的 isGod）
+    log('房间 %s 天梯开始：%d 真人 + %d AI，超哥 %d 个（%s）',
+        room.code, humans.length, aiNames.length, room.ladGodN,
+        room.ladGodNames.length ? room.ladGodNames.join('/') : '无');
+    pushRoom(room);
+    startRound(room);
+}
+
 // 摆好新一轮。纯 AI 的桌立刻算完，有真人的桌留着交互打。
 function startRound(room) {
     const g = room.game;
@@ -1447,6 +2181,38 @@ function startRound(room) {
         // 离开的人交给 simulateMatch 等于让 AI 替他打完这一场 —— 不行，
         // 他该是一路自动过牌。所以只有「双方都是 AI」才走这条快路。
         if (!seatA && !seatB && !pa.isHuman && !pb.isHuman) {
+            // 【天梯：算完但推迟公布】详见 LAD_AI_TABLE_CAP_MS 的注释 ——
+            // 立刻公布的话另外 3 桌零耗时完成，而这 7 个 AI 全都有拟人延迟，
+            // 「他们互相打是 0 秒」这个矛盾比 AI 秒出牌更刺眼。
+            if (room.mode === 'ladder') {
+                let steps = 0;
+                const raw = D678.AI.step;
+                D678.AI.step = function (b, si) { steps++; return raw.call(this, b, si); };
+                try {
+                    withRoom(room, () => { D678.simulateMatch(pa, pb); });
+                } finally {
+                    D678.AI.step = raw;
+                }
+                // 假桌也要进 battles，否则 busyTables 数不到它，
+                // 「本轮还有几桌在打」永远只算真人那桌。
+                const fake = {
+                    id: room.battles.length,
+                    pIdx: [ia, ib],
+                    b: null, done: false, resolveId: 0, preFuncs: null,
+                    isTie: false, turnTimer: null, turnDeadline: 0,
+                    turnStartAt: 0, turnGoneDeadline: 0, aiTimer: null,
+                    // 标记：这桌已经算完了，只是还没到公布时间
+                    fakeAI: true,
+                };
+                room.battles.push(fake);
+                fake.aiTimer = setTimeout(() => {
+                    if (room.phase !== 'battle') return;
+                    fake.done = true;
+                    pushStateT(room);
+                    checkRoundBarrier(room);
+                }, ladFakeTableMs(steps));
+                return;
+            }
             withRoom(room, () => { D678.simulateMatch(pa, pb); });
             return;
         }
@@ -1543,6 +2309,10 @@ function forceStand(room, bt, why) {
 
 // 轮到 AI（或轮到已离开的人）就自己走。延迟一下让人看清对手做了什么。
 function stepAIIfNeeded(room, bt) {
+    // 【天梯的假 AI 桌不能走这里】它没有 bt.b（结果早就算完了），而且它的
+    // aiTimer 挂的是「到点公布」那个回调 —— clearTimeout 会把公布取消掉，
+    // 那一桌就永远 done 不了，轮次屏障卡死。
+    if (bt.fakeAI) return;
     clearTimeout(bt.aiTimer);
     if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
     const pIdx = bt.pIdx[bt.b.turn];
@@ -1554,6 +2324,11 @@ function stepAIIfNeeded(room, bt) {
         return;
     }
     if (p.isHuman) return;
+
+    // 天梯：拟人延迟（多数 1.8~5 秒，偶尔长考到 16 秒，每步都不一样）。
+    // 锦标赛照旧固定 900ms —— 那是「让人看清对手做了什么」的节奏，
+    // 不是为了拟人（你定的，两套模式各管一摊）。
+    const wait = (room.mode === 'ladder') ? ladThinkMs() : CFG.aiStepMs;
 
     bt.aiTimer = setTimeout(() => {
         if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
@@ -1569,7 +2344,7 @@ function stepAIIfNeeded(room, bt) {
         armTurnTimerT(room, bt);
         pushStateT(room);
         stepAIIfNeeded(room, bt);
-    }, CFG.aiStepMs);
+    }, wait);
 }
 
 // 对手动作的文字提示：只发给同桌的另一个人
@@ -1746,9 +2521,19 @@ function checkRoundBarrier(room) {
         });
         outSeats.forEach(s => {
             const rank = rankOf(room, s.pIdx);
+            // 【天梯：被淘汰就是这一局的最终名次，当场结算】
+            // 不能等 enterOverT —— 淘汰的人 SSE 会被 releaseSeatConn 收掉，
+            // 那时候再发加减分他收不到。ladResult 存在座位上，enterOverT 和
+            // 重连都读它，保证同一局只算一次。
+            let ladR = null;
+            if (room.mode === 'ladder' && s.ladAcc && !s.ladResult) {
+                s.ladResult = ladSettle(room, s, rank, room.game.players.length);
+                ladR = s.ladResult;
+            }
             sendTo(s, 'eliminated', Object.assign({
                 rank: rank, total: room.game.players.length,
                 name: room.game.players[s.pIdx].name,
+                lad: ladR || undefined,
             }, eliminatedStats(room, s.pIdx)));
             log('房间 %s %s 被淘汰（第 %d 名），踢回大厅', room.code,
                 room.game.players[s.pIdx].name, rank);
@@ -1803,6 +2588,7 @@ function rankOf(room, pIdx) {
 function enterOverT(room) {
     room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
     clearTimeout(room.roundTimer);
+    clearTimeout(room.ladFillTimer);
     room.phase = 'over';
     const ranked = room.game.rankedPlayers();
     room.overInfo = ranked.map((p, i) => {
@@ -1822,14 +2608,24 @@ function enterOverT(room) {
     room.seats.forEach(seat => {
         if (!seat) return;
         const me = room.game.players[seat.pIdx];
+        const myRank = ranked.indexOf(me) + 1;
+        // 天梯：活到最后的人在这里结算。已经算过的（被淘汰 / 中途退出）
+        // 不再算第二次 —— ladResult 就是这道闸门。
+        if (room.mode === 'ladder' && seat.ladAcc && !seat.ladResult) {
+            seat.ladResult = ladSettle(room, seat, myRank, room.game.players.length);
+        }
         sendTo(seat, 'over', {
             mode: 'tourney',
             win: ranked[0] === me,
-            myRank: ranked.indexOf(me) + 1,
+            myRank: myRank,
             ranks: room.overInfo,
+            ladder: room.mode === 'ladder' || undefined,
+            lad: seat.ladResult || undefined,
         });
     });
-    log('房间 %s 锦标赛结束，冠军 %s', room.code, ranked[0] ? ranked[0].name : '?');
+    log('房间 %s %s结束，冠军 %s', room.code,
+        room.mode === 'ladder' ? '天梯' : '锦标赛',
+        ranked[0] ? ranked[0].name : '?');
 }
 
 function startDuel(room) {
@@ -2189,19 +2985,21 @@ function onDisconnect(room, seat) {
     //
     // 放在下面那条 peer 消息之前是故意的：peer 是 1v1 的「对手掉线了」提示，
     // 大厅里一屋子人收到它没有意义。
-    if (room.mode === 'tourney' && room.phase === 'lobby') {
+    if (isTourneyLike(room) && room.phase === 'lobby') {
         seat.ready = false;
         pushRoom(room);
         clearTimeout(seat.graceTimer);
         seat.graceTimer = setTimeout(() => {
             if (seat.connected) return;      // 回来了
             removeSeat(room, seat);
+            // 天梯房里真人全走了就没有开赛的意义 —— 那一桌会变成 8 个 AI
+            // 互相打给没人看。假计数的定时器也要一起停掉。
             if (!room.seats.some(s => s)) {
                 dropRoom(room, '大厅里没人了');
                 return;
             }
             pushRoom(room);
-            maybeStartTourney(room);
+            if (room.mode === 'tourney') maybeStartTourney(room);
         }, CFG.lobbyGraceSec * 1000);
         return;
     }
@@ -2223,7 +3021,7 @@ function onDisconnect(room, seat) {
     // 自己走了 —— 那是「最后一局打完之后离开」，不是掉线。这时候在对方屏上
     // 弹「对方掉线」是错的：这一场早就结束了，他掉不掉线都不影响任何东西
     // （你定的）。
-    if (room.mode !== 'tourney' && room.phase !== 'over') {
+    if (!isTourneyLike(room) && room.phase !== 'over') {
         const other = room.seats.find(s => s && s !== seat);
         // 不发倒计时 —— 界面上改成「已掉线 X 秒」+ 随时可点返回主菜单。
         // 催一个倒计时没意义：对方回不回来不是这边能控制的事。
@@ -2240,7 +3038,7 @@ function onDisconnect(room, seat) {
 
     // 锦标赛：一个人掉线不该毁掉整场赛事。缩短他那桌的回合、推一份新盘面，
     // 别人照常打；宽限期烧完转成「离开」（一路自动过牌，不再等他）。
-    if (room.mode === 'tourney') {
+    if (isTourneyLike(room)) {
         const bt = room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
         if (bt && room.phase === 'battle') {
             armTurnTimerT(room, bt);
@@ -2266,7 +3064,16 @@ function onDisconnect(room, seat) {
             }
             // 全部真人都走了就收房间
             if (!room.seats.some(s => s && !s.left && s.connected)) {
-                dropRoom(room, '锦标赛里所有真人都离开了');
+                // 【天梯：收房间之前必须结算】这条路原来直接 dropRoom 就 return，
+                // 跳过了 enterOverT —— 而结算在那里面。后果是可利用的：
+                // 打得差时直接关浏览器，宽限期满房间静默销毁，一分不扣；
+                // 而老实点「退出」的人按末名扣分。关标签页严格优于主动退出。
+                //
+                // 掉线永不回来在语义上就是中途退出，按末名算（和 /api/leave
+                // 同一个口径）。重连回来的人走不到这里（上面 seat.connected
+                // 那条就 return 了）。
+                ladSettleAllLeft(room, '掉线未回来');
+                dropRoom(room, '赛事里所有真人都离开了');
                 return;
             }
             pushStateT(room);
@@ -2298,13 +3105,13 @@ function onReconnect(room, seat) {
 
     // 和 onDisconnect 里那条一样，只在 1v1 发 —— 锦标赛里 find 挑中的多半
     // 不是同桌那个人，清框会清到别人头上，而该清的那个永远清不掉。
-    if (room.mode !== 'tourney') {
+    if (!isTourneyLike(room)) {
         const other = room.seats.find(s => s && s !== seat);
         if (other) sendTo(other, 'peer', { gone: false, name: seat.name });
     }
 
-    // 锦标赛：恢复他那桌的时限，补一份房间信息 + 盘面
-    if (room.mode === 'tourney') {
+    // 锦标赛 / 天梯：恢复他那桌的时限，补一份房间信息 + 盘面
+    if (isTourneyLike(room)) {
         pushRoom(room);
         if (room.phase === 'over' && room.overInfo) {
             const me = room.game.players[seat.pIdx];
@@ -2312,6 +3119,11 @@ function onReconnect(room, seat) {
             sendTo(seat, 'over', {
                 mode: 'tourney', win: ranked[0] === me,
                 myRank: ranked.indexOf(me) + 1, ranks: room.overInfo,
+                // 重连回来也要能看到自己的加减分（结算面板要显示）。
+                // seat.ladResult 是 enterOverT 那一刻算好存下的 —— 不能在这里
+                // 重算，那会把同一局的分算第二次。
+                ladder: room.mode === 'ladder' || undefined,
+                lad: seat.ladResult || undefined,
             });
             return;
         }
@@ -2424,7 +3236,11 @@ const server = http.createServer((req, res) => {
         // 1v1：两个人都连上了就开打。
         // 锦标赛不在这里开 —— 连上只是入座，要等各人点「准备」（/api/ready）。
         // 否则第 2 个人一连上就把还没到的人关在门外了。
-        if (room.mode !== 'tourney' && room.phase === 'lobby' &&
+        // 天梯也不在这里开 —— 它由假计数走完触发（ladFillTick）。
+        // 少了这条排除，天梯房第一个人一连上就会走 startDuel（2 席那套），
+        // 而天梯房有 8 席，seats.every 永远不成立倒是碰巧挡住了 —— 但那是
+        // 巧合，不是设计。写明白。
+        if (!isTourneyLike(room) && room.phase === 'lobby' &&
             room.seats.every(s => s && s.connected)) {
             startDuel(room);
         }
@@ -2523,7 +3339,7 @@ const server = http.createServer((req, res) => {
             const { room, seat } = found;
             // 锦标赛还要回「我在哪一桌、哪个 side」—— 只回 phase 的话
             // 刷新后不知道自己该看哪桌的牌面
-            const bt = (room.mode === 'tourney' && room.battles)
+            const bt = (isTourneyLike(room) && room.battles)
                 ? room.battles.find(x => !x.done && x.pIdx.indexOf(seat.pIdx) >= 0)
                 : null;
             json(res, 200, {
@@ -2557,7 +3373,11 @@ const server = http.createServer((req, res) => {
                 return json(res, 429, { err: '注册太频繁，等十秒再试' });
             }
             regCool.set(ip, Date.now());
-            const rec = { acc: acc, pw: pw, name: '', renamedDay: '' };
+            // 天梯字段给足初值。少了 ladSeason 的话第一次 ladScoreOf 会认为
+            // 「赛季对不上」，当场把 1000 软重置成 1000 —— 结果一样但会白写一次盘
+            const rec = { acc: acc, pw: pw, name: '', renamedDay: '',
+                          ladScore: LAD_BASE, ladSeason: ladSeason(nowSec()).key,
+                          ladGames: 0, ladSGames: 0, ladRankSum: 0, ladChamps: 0 };
             accounts.set(key, rec);
             accSave();
             const tk = newToken();
@@ -2593,6 +3413,69 @@ const server = http.createServer((req, res) => {
             const rec = accOfToken(body.token);
             if (!rec) return json(res, 401, { err: '登录已失效，请重新认证' });
             json(res, 200, Object.assign({ ok: true }, accView(rec)));
+        });
+        return;
+    }
+
+    //--- 天梯：排行榜 ------------------------------------------------------
+    // 不要求登录 —— 匹配中和没登录时都要能看榜（你定的：匹配时有东西可看）。
+    // 带了令牌就多回一行「我」，没带就只有前 100。
+    if (u === '/api/lad/board' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const rec = body.token ? accOfToken(body.token) : null;
+            json(res, 200, Object.assign({ ok: true }, ladBoardView(rec)));
+        });
+        return;
+    }
+
+    //--- 天梯：开启排位 ----------------------------------------------------
+    // **必须登录**（分要挂在账号上）而且必须已经起过天梯名 —— 榜上显示的是
+    // 天梯名，没名字的人上不了榜，让他先去起名。
+    //
+    // 同一个账号只能有一个排位会话：重复点会拿回原来那个房间的 sid，
+    // 而不是又开一桌（否则一个人能同时占好几桌，榜也会被自己刷）。
+    if (u === '/api/lad/match' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const rec = accOfToken(body.token);
+            if (!rec) return json(res, 401, { err: '请先登录天梯账号' });
+            if (!rec.name) return json(res, 400, { err: '请先设置天梯游戏名' });
+            const key = rec.acc.toLowerCase();
+
+            // 已经在某个天梯房里了 -> 回原来那个（刷新页面 / 重复点）
+            for (const r of rooms.values()) {
+                if (r.mode !== 'ladder') continue;
+                const mine = r.seats.find(s => s && !s.left && s.ladAcc === key);
+                if (mine) {
+                    return json(res, 200, {
+                        room: r.code, sid: mine.sid, mySeat: mine.index,
+                        mode: 'ladder', again: true,
+                    });
+                }
+            }
+
+            let room = findLadderRoom();
+            const fresh = !room;
+            if (!room) room = newRoom('ladder');
+            const seat = addSeat(room, rec.name);
+            if (!seat) {
+                if (fresh) dropRoom(room, '天梯房建好却坐不下人');
+                return json(res, 409, { err: '匹配失败，再点一次' });
+            }
+            // 结算要靠这个找账号。存小写 key 而不是对象引用 ——
+            // accounts 里的记录可能被 accLoad 换成新对象。
+            seat.ladAcc = key;
+            seat.ladResult = null;
+            // 新房才起假计数；进已有的房是搭别人的车（你定的：同窗口的真人同桌）
+            if (fresh) ladStartFill(room);
+            else pushRoom(room);
+            log('天梯匹配 %s 进房 %s（%s）', rec.name, room.code,
+                fresh ? '新开' : '搭车');
+            json(res, 200, {
+                room: room.code, sid: seat.sid, mySeat: seat.index,
+                mode: 'ladder',
+            });
         });
         return;
     }
@@ -2691,7 +3574,7 @@ const server = http.createServer((req, res) => {
             if (body.seq !== undefined && Number(body.seq) !== room.seq) {
                 return json(res, 200, { ok: false, stale: true });
             }
-            if (room.mode === 'tourney') {
+            if (isTourneyLike(room)) {
                 // 由座位查到自己那一桌 —— 绝不能拿 seat.index 当 side 用
                 const bt = room.battles.find(x =>
                     !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
@@ -2739,11 +3622,23 @@ const server = http.createServer((req, res) => {
             const found = body && seatOf(body.sid);
             // 锦标赛：一个人退出不该毁掉整场赛事。标成离开、把他那桌推下去，
             // 剩下的人照常打；真人全走了才收房间。
-            if (found && found.room.mode === 'tourney' &&
+            if (found && isTourneyLike(found.room) &&
                 found.room.phase !== 'lobby') {
                 const { room, seat } = found;
+                // 【天梯：中途退出按末名结算】rankOf 是按存活者 HP 排的，
+                // 领先时退出会显示第 1 名 —— 不挡的话「打得好就跑」是最优策略。
+                // 断线重连回来的不算退出（那条路走 graceTimer，不到这里）。
+                if (room.mode === 'ladder' && seat.ladAcc && !seat.ladResult) {
+                    const total = room.game ? room.game.players.length : 8;
+                    seat.ladResult = ladSettle(room, seat, total, total);
+                    if (seat.ladResult) {
+                        seat.ladResult.quit = true;
+                        sendTo(seat, 'ladscore', seat.ladResult);
+                    }
+                }
                 seat.left = true;
-                log('房间 %s %s 主动退出锦标赛', room.code, seat.name);
+                log('房间 %s %s 主动退出%s', room.code, seat.name,
+                    room.mode === 'ladder' ? '天梯（按末名结算）' : '锦标赛');
                 withRoom(room, () => { returnFuncsOfLeft(room); });
                 const bt = room.battles.find(x =>
                     !x.done && x.pIdx.indexOf(seat.pIdx) >= 0);
@@ -2754,16 +3649,20 @@ const server = http.createServer((req, res) => {
                     armTurnTimerT(room, bt);
                 }
                 if (!room.seats.some(s => s && !s.left && s.connected)) {
-                    dropRoom(room, '锦标赛里所有真人都离开了');
+                    // 这个人自己已经在上面结算过了。但同房**另一个掉线还没
+                    // 结算的人**会跟着房间一起被销毁 —— 他也得按末名算，
+                    // 否则「等队友退出」又是一道免罚门。
+                    ladSettleAllLeft(room, '房间随他人退出销毁');
+                    dropRoom(room, '赛事里所有真人都离开了');
                 } else {
                     pushStateT(room);
                     checkRoundBarrier(room);
                 }
                 return json(res, 200, { ok: true });
             }
-            // 锦标赛大厅：只摘他的席位，房间留给还在等的人。
+            // 锦标赛 / 天梯大厅：只摘他的席位，房间留给还在等的人。
             // 走 dropRoom 会把一屋子人一起赶回菜单 —— 8 人赛永远凑不起来。
-            if (found && found.room.mode === 'tourney' &&
+            if (found && isTourneyLike(found.room) &&
                 found.room.phase === 'lobby') {
                 const { room, seat } = found;
                 removeSeat(room, seat);
@@ -2771,7 +3670,7 @@ const server = http.createServer((req, res) => {
                     dropRoom(room, '大厅里没人了');
                 } else {
                     pushRoom(room);
-                    maybeStartTourney(room);   // 他一走可能正好凑成全员就绪
+                    if (room.mode === 'tourney') maybeStartTourney(room);
                 }
                 return json(res, 200, { ok: true });
             }
@@ -2804,6 +3703,9 @@ setInterval(() => {
     for (const room of Array.from(rooms.values())) {
         const anyone = room.seats.some(s => s && s.connected);
         if (!anyone && now - room.touched > CFG.idleMin * 60 * 1000) {
+            // 天梯房被当成「长时间无人」收掉时，里面可能还有没结算的人
+            // （所有人都掉线、宽限期那条路又没走到）。一样按末名算。
+            ladSettleAllLeft(room, '房间长时间无人');
             dropRoom(room, '长时间无人');
         }
     }
@@ -2828,7 +3730,15 @@ accLoad();
 // 所以测试没法从外面拿到盘面去构造边界场景（比如把手牌补满逼出随机弃牌）。
 // 只导出引用，不导出任何操作函数。daily 也导出，回归要断言计数。
 // accounts / ladTokens 给天梯回归用（要能直接改 renamedDay 模拟翻篇）。
-module.exports = { rooms, CFG, withRoom, visitors, daily, accounts, ladTokens };
+// 天梯计分的几个纯函数一起导出：赛季边界、段位线、Δ 公式、AI 漂移都要能
+// 单独断言 —— 只能通过 HTTP 验的话，测「北京时间 9/1 00:00 翻篇」就得
+// 改系统时钟。
+module.exports = {
+    rooms, CFG, withRoom, visitors, daily, accounts, ladTokens,
+    ladSeason, ladTier, ladConv, ladAiState, ladBoard, ladBoardView,
+    ladPersona, ladReplaySeason, ladFrac, ladK, ladBoardBust,
+    LAD_BASE, LAD_FLOOR, LAD_SCALE, LAD_MINGAMES, LAD_BOARD_N, LAD_TIERS,
+};
 
 server.listen(CFG.port, '0.0.0.0', () => {
     console.log('');
