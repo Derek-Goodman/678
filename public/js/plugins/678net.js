@@ -550,13 +550,22 @@ D678N.LadForm = {
 
     // canvas 在页面上的位置和缩放。RMMV 把画布等比缩放居中，
     // 所以 canvas 坐标要乘 scale 再加偏移才是页面坐标。
+    //
+    // 【为什么要加滚动量】getBoundingClientRect 给的是**视口**坐标，而输入框是
+    // position:absolute（相对文档）。手机上地址栏收起、软键盘弹出都会让页面
+    // 滚一段，只用 rect 的话输入框会整体偏离画上去的框 —— 看着在框里，
+    // 点下去却什么都没有。
     _geo: function () {
         if (typeof document === 'undefined') return null;
         var c = Graphics._canvas;
         if (!c || !c.getBoundingClientRect) return null;
         var r = c.getBoundingClientRect();
         if (!r.width) return null;
-        return { left: r.left, top: r.top, scale: r.width / Graphics.width };
+        var de = document.documentElement;
+        var sx = window.pageXOffset || (de && de.scrollLeft) || 0;
+        var sy = window.pageYOffset || (de && de.scrollTop) || 0;
+        return { left: r.left + sx, top: r.top + sy,
+                 scale: r.width / Graphics.width };
     },
 
     open: function (stage, reg, onEnter) {
@@ -575,23 +584,44 @@ D678N.LadForm = {
         for (var i = 0; i < lay.rows.length; i++) {
             var r = lay.rows[i];
             var el = document.createElement('input');
-            el.type = (r.key === 'pw' || r.key === 'pw2') ? 'text' : 'text';
-            // 【密码不遮】你定的：明着输入就行，不搞星号
+            // 【密码不遮】你定的：明着输入就行，不搞星号，所以三个框都是 text
+            el.type = 'text';
             el.placeholder = r.ph || '';
             el.maxLength = (r.key === 'name') ? 8 : 16;
             el.value = keep[r.key] || '';
             el.autocomplete = 'off';
             el.spellcheck = false;
+            // 账号是字母数字，手机键盘别自动把首字母顶成大写
+            if (r.key !== 'name') el.autocapitalize = 'off';
             el.style.cssText = 'position:absolute;box-sizing:border-box;' +
                 'background:rgba(0,0,0,0.55);color:#fff;' +
                 'border:2px solid rgba(255,235,170,0.55);border-radius:8px;' +
-                'outline:none;padding:0 10px;font-family:inherit;';
-            // RMMV 在 document 上收触摸和键盘。不掐住的话：点输入框会被当成
+                'outline:none;padding:0 10px;font-family:inherit;' +
+                // 【这三行是「点不动、选不中」的正解】RMMV 启动时给 body 抹了
+                // user-select:none（Graphics._disableTextSelection），子元素继承下来
+                // 之后：输入框拖不出选区、双击选不中词，WebKit 上连光标都落不进去。
+                // 所以这里显式要回来。
+                'user-select:text;-webkit-user-select:text;-ms-user-select:text;' +
+                '-moz-user-select:text;-webkit-touch-callout:default;' +
+                'pointer-events:auto;touch-action:manipulation;';
+            // RMMV 在 document 上收触摸、指针和键盘。不掐住的话：点输入框会被当成
             // 点画布（可能触发按钮），打字会同时驱动游戏输入。
-            ['touchstart', 'touchend', 'mousedown', 'mouseup', 'keyup']
+            // click / dblclick / contextmenu 也掐 —— 双击选词和右键粘贴不该漏给游戏。
+            ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup',
+             'pointerdown', 'click', 'dblclick', 'contextmenu', 'keyup']
                 .forEach(function (ev) {
                     el.addEventListener(ev, function (e) { e.stopPropagation(); });
                 });
+            // 上面掐住了冒泡，个别 WebKit 版本就不再自动给焦点了（body 上那个
+            // user-select:none 也会掺一脚）。自己补一次，别让人点了没光标。
+            ['mousedown', 'touchstart'].forEach(function (ev) {
+                el.addEventListener(ev, function (e) {
+                    var t = e.currentTarget || el;
+                    if (document.activeElement !== t) {
+                        try { t.focus(); } catch (err) {}
+                    }
+                });
+            });
             el.addEventListener('keydown', function (e) {
                 e.stopPropagation();
                 if (e.keyCode === 13 && onEnter) onEnter();
@@ -631,7 +661,9 @@ D678N.LadForm = {
             el.style.top    = Math.round(g.top  + r.y * g.scale) + 'px';
             el.style.width  = Math.round(r.w * g.scale) + 'px';
             el.style.height = Math.round(r.h * g.scale) + 'px';
-            el.style.fontSize = Math.max(12, Math.round(26 * g.scale)) + 'px';
+            // 下限 16 不是排版口味 —— iOS Safari 对小于 16px 的输入框会在聚焦时
+            // 自动放大整个页面，画布跟着被顶飞，人就不知道自己在哪一栏了
+            el.style.fontSize = Math.max(16, Math.round(26 * g.scale)) + 'px';
         }
     },
 
