@@ -1796,7 +1796,71 @@ function computeStats() {
         loose++;
     }
 
-    return { online: seated + loose, playing: playing, waiting: waiting };
+    // 【天梯在场的人要算进在线总数】不加的话界面上会出现
+    // 「在线 1 人 · 28 人天梯对局中」—— 在天梯打的人当然也在线，
+    // 两个数摆在一起自相矛盾。
+    //
+    // playing（对局中）不加天梯那批：天梯单独一行显示，加进去就是重复计数。
+    const ladN = ladPlayingCount();
+    return {
+        online: seated + loose + ladN,
+        playing: playing,
+        waiting: waiting,
+        ladPlaying: ladN,
+    };
+}
+
+// 此刻有多少人在天梯对局中。
+//
+// 【这个数是从漂移模型推出来的，不是编的】AI 的虚拟对局时刻本来就是确定性
+// 算出来的（ladMatchAt + 作息筛），所以「上一场开在多久之前」是可算的：
+// 落在一局时长以内的就还在打。于是这个数天然跟着作息走 —— 晚上八九点二十几个，
+// 凌晨三四点个位数，和榜上分数在动的那批人是同一批。
+//
+// 一局按 18 分钟算（实测中位数：60 场模拟里真人第 28 轮出局、每轮 36 秒）。
+const LAD_GAME_MS = 18 * 60 * 1000;
+
+let ladPlayCache = -1, ladPlayAt = 0;
+function ladPlayingCount() {
+    const now = Date.now();
+    // 30 秒缓存。这个数分钟级才有变化，而 /api/stats 是每 5 秒一次心跳 ——
+    // 不缓存的话每次心跳都要把 115 个 AI 的当季对局重放一遍。
+    if (ladPlayCache >= 0 && now - ladPlayAt < 30000) {
+        return ladPlayCache + ladRealPlaying();
+    }
+    const t = Math.floor(now / 1000);
+    const sn = ladSeason(t);
+    const seedKey = sn.key;
+    let n = 0;
+    for (const nm of D678.LAD_AI_NAMES) {
+        const p = ladPersona(nm, seedKey);
+        // 从当季起点往后找最后一场不晚于现在的对局。步长是固定的，
+        // 所以可以直接从 now 附近倒着找几步，不用整季重放。
+        const step = 86400 / p.rate;
+        const kNow = Math.floor((t - sn.startSec) / step);
+        for (let k = kNow + 2; k >= 0 && k >= kNow - 4; k--) {
+            const at = ladMatchAt(nm, p, k, sn.startSec, seedKey);
+            if (at > t) continue;
+            if (!ladHappens(nm, k, at, seedKey)) continue;
+            // 最近一场开在多久之前
+            if ((t - at) * 1000 < LAD_GAME_MS) n++;
+            break;      // 只看最近那一场
+        }
+    }
+    ladPlayCache = n;
+    ladPlayAt = now;
+    return n + ladRealPlaying();
+}
+
+// 真的在天梯房里打的真人。加进去，免得「我自己正在打，界面却说 0 人在天梯」。
+function ladRealPlaying() {
+    let n = 0;
+    for (const room of rooms.values()) {
+        if (room.mode !== 'ladder') continue;
+        if (room.phase === 'lobby' || room.phase === 'over') continue;
+        n += room.seats.filter(s => s && !s.left && s.connected).length;
+    }
+    return n;
 }
 
 //=============================================================================
@@ -1898,6 +1962,21 @@ function pushStateT(room, extra) {
         const meSide = bt ? (bt.pIdx[0] === seat.pIdx ? 0 : 1) : -1;
         // 本轮还有几桌在打（等待画面用）
         const busy = room.battles.filter(x => !x.done).length;
+        // 还在打的那几桌是谁跟谁（等待画面要显示成「AA vs BB」一行一桌）。
+        //
+        // 【为什么要发这个】原来只发 busyTables（一个数字），客户端靠
+        // players[i].inBattle 自己凑名字 —— 凑出来的是一串平铺的名字，
+        // 分不出谁跟谁打，而且轮空的人压根收不到 waitingRound，
+        // 那一屏什么都没有。
+        //
+        // 【不算泄漏】配对本身是公开信息：轮结果页本来就会列出全场每一桌的
+        // 胜负。这里只给「谁跟谁」，不给任何牌面、点数、谁赢了。
+        const pairsBusy = room.battles.filter(x => !x.done).map(x => ({
+            a: room.game.players[x.pIdx[0]].name,
+            b: room.game.players[x.pIdx[1]].name,
+            // 我自己那桌标一下，客户端高亮
+            mine: x.pIdx.indexOf(seat.pIdx) >= 0 || undefined,
+        }));
         sendTo(seat, 'state', Object.assign({
             seq: room.seq,
             // 天梯也发 'tourney' —— 客户端的绘制层按它走 8 人赛那套，
@@ -1914,9 +1993,16 @@ function pushStateT(room, extra) {
             players: v.players,
             bye: v.bye,
             // 我这桌打完了（或者本轮压根没我的桌）但本轮还没结束 ——
-            // 客户端据此停在轮次等待屏
-            waitingRound: (!bt || btDone) && !v.bye && busy > 0,
+            // 客户端据此停在轮次等待屏。
+            //
+            // 【轮空的人也要停在这一屏】原来这里有 `&& !v.bye`，于是轮空那一轮
+            // 玩家看不到「谁在对局」—— 他既没有自己的牌桌，又被排除在等待屏
+            // 之外，那一屏是空的（你报的第 2 条）。轮空本来就是「这一轮没我的
+            // 事，等别人打完」，正该看这一屏。
+            waitingRound: (!bt || btDone) && busy > 0,
             busyTables: busy,
+            // 还在打的那几桌（「AA vs BB」一行一桌）
+            busyPairs: pairsBusy,
             log: bt ? maskLogT(bt, meSide) : null,
             // 打完的桌 turnDeadline 是上一手留下的旧值，别让客户端拿它倒计时
             turnLeft: (bt && !btDone && bt.turnDeadline)
@@ -2267,7 +2353,23 @@ function armTurnTimerT(room, bt) {
         bt.turnTimer = setTimeout(() => forceStand(room, bt, '离开'), 0);
         return;
     }
-    if (isAI) return;
+    // AI 回合：不挂计时器（它不会超时），但**要给一个只用于显示的 deadline**。
+    //
+    // 【为什么】pushStateT 的 turnLeft 是从 bt.turnDeadline 算的，原来这里直接
+    // return，于是对方回合时 turnDeadline 停在 0、客户端拿到 turnLeft=0，
+    // 倒计时整个不画 —— 玩家看着对面干等，不知道还要等多久，也不知道界面
+    // 是不是卡住了。锦标赛下 AI 900ms 就走完，看不出来；天梯的拟人延迟
+    // 最长 16 秒，这个空白很明显。
+    //
+    // 【为什么不挂真的计时器】AI 一定会在延迟到点后行动（stepAIIfNeeded），
+    // 挂一个超时计时器只会和它抢：万一 AI 的长考比 tsec 还长，会被自己判
+    // 超时判过牌。所以这里只写 deadline，不 setTimeout。
+    // AI 提前走完时倒计时停在中途（比如显示 17 就跳到我的回合），
+    // 这和真人对手提前出牌是一样的观感。
+    if (isAI) {
+        bt.turnDeadline = bt.turnStartAt + tsec * 1000;
+        return;
+    }
 
     // 挂机降速，和 1v1 的 armTurnTimer 同一套（详见那边的注释）：
     // 判据是「上个回合被自动判过牌」，不是「此刻掉线」——

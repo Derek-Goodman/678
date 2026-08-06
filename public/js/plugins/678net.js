@@ -804,7 +804,18 @@ Scene_D678Net.prototype.drawOnline = function () {
     if (s.waiting > 0) parts.push(s.waiting + ' 个房间等人');
     // 有人在等就标绿：这时候点「加入房间」马上能开一局
     var col = s.waiting > 0 ? LC.green : (s.online > 1 ? LC.text : LC.gray);
+    // 【天梯那一段单独一行、用红色】房间那段是绿的（有人在等），
+    // 两段同色分不出哪个是天梯（你定的用红色）。
+    // 也单独一行 —— 挤在同一行里三段话太长，720 宽会顶到两边。
+    // 【行距要按 size + 10 算】this.txt 的绘制高度是 size + 10，
+    // 20 号字占 30 高 —— 按 20 算间距会重叠 7 像素。
+    // 名字条到 282、菜单按钮从 380 起，中间够放两行 30 高的字。
+    var hasLad = (s.ladPlaying > 0);
     this.txt('● ' + parts.join(' · '), 0, ONLINE_Y, W, 20, col, 'center');
+    if (hasLad) {
+        this.txt(s.ladPlaying + ' 人天梯对局中', 0, ONLINE_Y + 32, W, 20,
+                 LC.red, 'center');
+    }
 };
 
 //--- 绘制 ------------------------------------------------------------------
@@ -880,13 +891,25 @@ Scene_D678Net.prototype.refresh = function () {
     //
     // 【为什么天梯名和玩家名不共用】登录天梯顺带改掉朋友局的名字说不通，
     // 退出天梯后名字还锁着每天一次更说不通。所以两套各管一摊。
+    // 【天梯的页面要显示天梯名，不是多人游戏名】名字条原来只在 _page==='ladder'
+    // 时认天梯名。天梯打完一局落到 ranks / elim 页时 isLad 是 false，于是上方
+    // 显示的是多人游戏昵称 —— 而这一页的名次和战绩全是按天梯名算的，
+    // 看着就成了「叫 B 的人拿了第 3 名，而排名表里第 3 名写着 A」（你报的第 4 条）。
+    //
+    // 判据：天梯页本身，或者这一局是天梯局（结算数据上带 ladder / lad 标记）。
+    var ladGame = !!(D678N.finalOver && D678N.finalOver.ladder) ||
+                  !!(D678N.elim && D678N.elim.lad) ||
+                  !!(this._roomInfo && this._roomInfo.ladder);
     var isLad = (this._page === 'ladder');
+    var showLadName = isLad ||
+        (ladGame && (this._page === 'ranks' || this._page === 'elim' ||
+                     this._page === 'waiting'));
     var lad = D678N.lad;
-    var nm = isLad ? (lad ? (lad.name || '') : '') : D678N.savedName();
+    var nm = showLadName ? (lad ? (lad.name || '') : '') : D678N.savedName();
     var px = Math.round(W / 2 - BTN_W / 2), py = 186;
     var ph = isLad ? 124 : 96;
     this.panel(px, py, BTN_W, ph);
-    this.txt(isLad ? '天梯游戏名' : '玩家名',
+    this.txt(showLadName ? '天梯游戏名' : '玩家名',
              px + 24, py + 12, 200, 18, LC.gray, 'left');
 
     var mw = 96, mh = 56;
@@ -901,7 +924,7 @@ Scene_D678Net.prototype.refresh = function () {
     // 天梯页：登录了才给改名按钮（没登录时下面就是登录表单，那才是当务之急）。
     // 其余页只有多人首界面能改。
     var canRename = isLad ? !!lad : (this._page === 'menu');
-    this.txt(nm || (isLad ? (lad ? '未设置' : '未登录') : '未设置'),
+    this.txt(nm || (showLadName ? (lad ? '未设置' : '未登录') : '未设置'),
              px + 24, py + 40,
              (canRename ? mx - px - 40 : BTN_W - 48), 32,
              nm ? LC.text : LC.gray, 'left');
@@ -1022,10 +1045,13 @@ Scene_D678Net.prototype.drawLadder = function () {
                           cb: this.ladBtnCb(b.key) });
     }
 
-    this.drawRankBtn(lay.py + lay.ph + 28, false);
+    var rankY = lay.py + lay.ph + 28;
+    this.drawRankBtn(rankY, false);
     // 没登录也给榜按钮 —— 让人先看到「这里有个榜、上面有一堆人」，
-    // 比一个点不动的灰按钮更能说明登录之后有什么
-    this.drawBoardBtn(lay.py + lay.ph + 28 + BTN_H + 14);
+    // 比一个点不动的灰按钮更能说明登录之后有什么。
+    // 未登录时「开启排位」下方还有一行说明灰字（BTN_H + 6 起、16 高，
+    // 到 BTN_H + 22），所以榜按钮要让到 BTN_H + 30 之后。
+    this.drawBoardBtn(rankY + BTN_H + 30);
 };
 
 // 登录且有名字了：段位 + 天梯分，然后「开启排位」「排行榜」「退出登录」
@@ -1100,7 +1126,11 @@ Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
     this._bmp.drawText('开启排位', x, y + (BTN_H - 40) / 2 + (press ? 2 : 0),
                        BTN_W, 40, 'center');
     if (!lit) {
-        this.txt('认证登录并设置游戏名后可用', x, y + BTN_H - 4, BTN_W, 16,
+        // 【灰字要在按钮下方，不能压在按钮里】原来是 y + BTN_H - 4，
+        // 那是按钮底边**往上** 4 像素 —— 字压在按钮内侧，而且字底
+        // （y+90）离榜按钮顶（y+92）只剩 2 像素，看着是糊在一起的
+        // （你报的第 5 条）。改成按钮下方 6 像素起。
+        this.txt('认证登录并设置游戏名后可用', x, y + BTN_H + 6, BTN_W, 16,
                  LC.gray, 'center');
         return;
     }
@@ -1189,7 +1219,10 @@ Scene_D678Net.prototype.drawBoard = function () {
     }
 
     //--- 表头 -------------------------------------------------------------
-    var hy = top + 78;
+    // 【表头和榜身的框要留够间距】原来表头在 top+78、榜身框从 top+100 起，
+    // 而 this.txt 的实际绘制高度是 size+10（=28）—— 表头字底压到 top+106，
+    // 比框顶低 6 像素，看着就是灰字和框叠在一起（你报的第 6 条）。
+    var hy = top + 76;
     this.txt('名次', c.rank.x,  hy, c.rank.w,  18, LC.gray, 'center');
     this.txt('段位', c.tier.x,  hy, c.tier.w,  18, LC.gray, 'center');
     this.txt('玩家', c.name.x,  hy, c.name.w,  18, LC.gray, 'left');
@@ -1199,8 +1232,9 @@ Scene_D678Net.prototype.drawBoard = function () {
     this.txt('冠军', c.champ.x, hy, c.champ.w, 18, LC.gray, 'right');
 
     //--- 榜身 -------------------------------------------------------------
-    var y0 = hy + 28, rowH = 26;
-    this.panel(32, y0 - 6, W - 64, BOARD_ROWS * rowH + 12);
+    // 框顶要在表头字底（hy + 28）之下
+    var y0 = hy + 40, rowH = 26;
+    this.panel(32, y0 - 8, W - 64, BOARD_ROWS * rowH + 14);
     var pg = this._boardPage || 0;
     var rows = d.rows || [];
     var myName = (d.me && d.me.name) || '';
@@ -2207,6 +2241,9 @@ Scene_D678.prototype.netApply = function (m) {
     D678.Game = g;
 
     this._netBusyTables = m.busyTables || 0;
+    // 还在打的那几桌是谁跟谁（服务器算好的，一桌一条 {a, b, mine}）。
+    // 等待画面按「AA vs BB」一行一桌画 —— 见 netStillPairs。
+    if (m.busyPairs !== undefined) this._netBusyPairs = m.busyPairs || [];
     // 服务器算好的「我这桌完了，本轮还没结束」。轮结果页靠它决定
     // 提示语写「其他玩家还在对局」还是「点击任意位置继续」。
     if (m.waitingRound !== undefined) this._netWaitRound = !!m.waitingRound;
@@ -3083,14 +3120,21 @@ Scene_D678.prototype.refresh = function () {
 // 还在对局的其他玩家（锦标赛，轮结果页用）。
 // 服务器每个玩家都带 inBattle，buildReplica 接了下来。
 // 排除自己 —— 我已经在看轮结果页了，把自己列进「还在对局」很怪。
+// 【已废弃，留着不删】原来靠 players[i].inBattle 凑一串名字，画出来是平铺的
+// 「甲、乙、丙、丁」—— 分不出谁跟谁打。现在服务器直接发配对（busyPairs），
+// 走 netStillPairs。这个函数还留着是因为 678.js:2119 用
+// `this.netStillPlaying` 的存在性判断「这是不是联机锦标赛」。
 Scene_D678.prototype.netStillPlaying = function () {
-    var g = D678.Game;
-    if (!g || !g.players) return [];
-    var out = [];
-    for (var i = 1; i < g.players.length; i++) {
-        if (g.players[i].inBattle) out.push(g.players[i].name);
-    }
-    return out;
+    var p = this.netStillPairs();
+    return p.map(function (x) { return x.a + ' vs ' + x.b; });
+};
+
+// 还在打的那几桌。一条一桌 {a, b, mine}。
+//
+// 服务器发的 busyPairs 优先；没有（老服务器 / 还没收到）就退回 inBattle 凑，
+// 那时候只能两两配不出来，返回空让界面少画一块而不是画错。
+Scene_D678.prototype.netStillPairs = function () {
+    return this._netBusyPairs || [];
 };
 
 Scene_D678.prototype.netDrawOverlay = function () {

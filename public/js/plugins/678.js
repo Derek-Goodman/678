@@ -2116,18 +2116,29 @@ Scene_D678.prototype.refresh = function () {
         // 锦标赛：我这桌打完了、本轮还没结束时，在框上方点明在等什么，
         // 并在报表下面列出还在打的人（你定的，复用这个页面不另做）。
         // 只有联机锦标赛有这两行 —— 单机和 1v1 的 netStillPlaying 返回空。
-        if (this._net && this._netWaitRound && this.netStillPlaying) {
+        if (this._net && this._netWaitRound && this.netStillPairs) {
             this.txt(bmp, '其他玩家还在对局', 0, 238, LY.SW, 24, COL.gold, 'center');
-            var still = this.netStillPlaying();
-            if (still.length) {
-                this.txt(bmp, '对局中：', 66, 400, 120, 20, COL.gray);
-                // 名字最长 16 显示宽度 × 最多 7 人，一行放不下，按两行折
-                var half = Math.ceil(still.length / 2);
-                this.txt(bmp, still.slice(0, half).join('、'),
-                    170, 400, 470, 20, COL.aqua);
-                if (still.length > half) {
-                    this.txt(bmp, still.slice(half).join('、'),
-                        170, 424, 470, 20, COL.aqua);
+            // 一行一桌，横排「AA  vs  BB」。
+            //
+            // 【为什么不是一串名字】原来把所有还在打的人平铺成「甲、乙、丙、丁」，
+            // 名字长度不一时看着很乱，而且分不出谁跟谁打（你报的第 3 条）。
+            // 现在按桌走：左边名字右对齐、vs 居中定宽、右边名字左对齐 ——
+            // 名字再长短不齐，vs 那一列也永远对得整整齐齐。
+            var pairs = this.netStillPairs();
+            if (pairs.length) {
+                this.txt(bmp, '对局中', 0, 386, LY.SW, 20, COL.gray, 'center');
+                // 三列：左名 / vs / 右名。vs 钉在屏幕中线上。
+                var cx = LY.SW / 2, nameW = 200, vsW = 56;
+                for (var pi = 0; pi < pairs.length; pi++) {
+                    var pr = pairs[pi], py = 414 + pi * 26;
+                    // 自己那桌用金色（轮空时不会有 mine，全是灰白）
+                    var pcol = pr.mine ? COL.gold : COL.aqua;
+                    this.txt(bmp, pr.a, cx - vsW / 2 - nameW, py, nameW, 20,
+                        pcol, 'right');
+                    this.txt(bmp, 'vs', cx - vsW / 2, py, vsW, 20,
+                        COL.gray, 'center');
+                    this.txt(bmp, pr.b, cx + vsW / 2, py, nameW, 20,
+                        pcol, 'left');
                 }
             }
         }
