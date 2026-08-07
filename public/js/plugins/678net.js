@@ -113,6 +113,60 @@ D678N.visitorToken = function () {
 D678N.stats = null;
 
 //=============================================================================
+// 标题上那行「天梯模式对局中人数」的数
+//=============================================================================
+//
+// 【这个数是造的，和 stats 里那些不是一回事】（2026-08-07 你定的）
+// stats.online / ladPlaying / aiPlaying 全是真数，而且只有 GM 看得见
+// （见 drawOnline 和服务器的 computeStats）。这一行是给**所有玩家**看的门面数，
+// 量级差两个数量级：GM 同时看到「1 人在线 · 12 个 AI 模拟对局」和这行的
+// 「对局中人数：687」，两个数没有任何关系，别当成同一个东西的两种口径。
+//
+// 【为什么纯客户端算、不问服务器】标题画面在连服务器之前就要显示这行字，
+// 而且单机 exe / 服务器没起 / 断网的时候也得有 —— 走接口的话这些情况下
+// 就是一片空白。代价是不同时区的人同一时刻看到的数不一样，没人会去对比，
+// 而且用本地时钟反而让「深夜人少」符合看的人自己的作息。
+//
+// 【曲线形状】凌晨 3~5 点最低（250 上下），下午明显比上午多（你定的），
+// 真峰值在晚 21 点（980）—— 和服务器 LAD_HOURS 那份作息表同向，那边也是
+// 20 点权重最高。峰值压在 1000 以内（你定的：不一定要过千）。
+var LAD_FAKE_HOURS = [
+    420, 330, 280, 255, 250, 268,   //  0~5   后半夜见底
+    320, 400, 430, 480, 520, 560,   //  6~11  早上爬起来
+    600, 620, 655, 675, 690, 700,   // 12~17 下午高于上午
+    760, 850, 900, 980, 830, 560,   // 18~23 晚 21 点峰值
+];
+
+// 20 秒一桶的确定性抖动。用哈希而不是 Math.random —— 同一分钟内反复调
+// （标题每 30 帧查一次）必须得到同一个数，否则数字会每半秒乱跳一次。
+function ladFakeWobble(bucket) {
+    var h = 2166136261;
+    var s = 'w' + bucket;
+    for (var i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = (h * 16777619) >>> 0;
+    }
+    return (h >>> 8) / 16777216;      // 0~1
+}
+
+// 此刻「天梯模式对局中」的人数。
+D678N.ladFakePlaying = function (now) {
+    var d = now ? new Date(now) : new Date();
+    var hr = d.getHours(), mi = d.getMinutes();
+    // 整点锚点之间按分钟线性插值，所以一整天是缓慢起伏的，不是每小时跳一档
+    var a = LAD_FAKE_HOURS[hr];
+    var b = LAD_FAKE_HOURS[(hr + 1) % 24];
+    var base = a + (b - a) * (mi / 60);
+    // ±1.2% 的抖动，20 秒换一次 —— 让它看着是活的
+    var bucket = Math.floor(d.getTime() / 20000);
+    var w = 1 + (ladFakeWobble(bucket) - 0.5) * 0.024;
+    var n = Math.round(base * w);
+    if (n < 200) n = 200;
+    if (n > 1000) n = 1000;
+    return n;
+};
+
+//=============================================================================
 // 天梯登录态
 //=============================================================================
 //
@@ -829,9 +883,14 @@ Scene_D678Net.prototype.updateStats = function () {
 // 【只有 GM 看得见】（2026-08-07 你定的）非 GM 拿不到 D678N.stats
 // （pingStats 里 gm 为假就置 null），所以这里 !s 直接不画。
 //
-// 【数字一律是真的】原来 online 里掺了 AI 模拟对局的假人数。现在只有 GM 看，
-// 冲了假数反而看不出「到底有没有人在玩」，所以 online / ladPlaying 都是真人，
-// AI 模拟数单独一段（灰色）摆在第二行。
+// 【这两行的数字一律是真的】原来 online 里掺了 AI 模拟对局的假人数。现在只有
+// GM 看，冲了假数反而看不出「到底有没有人在玩」，所以 online / ladPlaying 都是
+// 真人，AI 模拟数单独一段（灰色）摆在第二行。
+//
+// 【别和标题上那行红字搞混】标题画面「天梯模式对局中人数：N」是**造的门面数**
+// （2026-08-07 你定的，见 D678N.ladFakePlaying），给所有玩家看、量级 200~1000。
+// 这两行是运营数字、只给 GM、量级个位到几十。GM 会同时看到两个数，它们之间
+// 没有任何换算关系 —— 一个是门面，一个是实情，故意分开的。
 Scene_D678Net.prototype.drawOnline = function () {
     var W = Graphics.width;
     var s = D678N.stats;
@@ -1279,6 +1338,18 @@ Scene_D678Net.prototype.drawBoard = function () {
     var pg = this._boardPage || 0;
     var rows = d.rows || [];
     var myName = (d.me && d.me.name) || '';
+    if (!rows.length) {
+        // 【赛季初的空窗】上榜门槛看的是**本赛季**场次（2026-08-07 你定的：
+        // 每赛季重新爬一次才有动力），所以每月 1 号头十几个小时确实一个人都
+        // 没满 10 局 —— 实测 9/1 当天 0 行、第 1 天 49 行、第 3 天满。
+        // 空着一个框比说清楚更像坏了，所以画两行灰字。
+        var cy = y0 + (BOARD_ROWS * rowH) / 2 - 34;
+        this.txt('新赛季刚开始，所有人都在定级中', 32, cy, W - 64, 22,
+                 LC.gray, 'center');
+        // 10 这个数和上面「不足 10 局显示定级中」的注释同一个来源
+        // （服务器的 LAD_MINGAMES）。客户端没有这个常量，沿用本文件的惯例写死。
+        this.txt('（满 10 局上榜）', 32, cy + 34, W - 64, 20, LC.gray, 'center');
+    }
     for (var i = 0; i < BOARD_ROWS; i++) {
         var r = rows[pg * BOARD_ROWS + i];
         if (!r) break;
@@ -3430,6 +3501,17 @@ Scene_Title.prototype.create = function () {
     this._dailyShown = '';
     this.drawDailyCounts();
 
+    // 「多人游戏」下方那行红字。单独一层，和本日计数同一个理由：
+    // title.js 的 _btnBmp 有 _btnCache 那道「没变化就不重画」的优化，
+    // 往里画会被它整块刷掉。
+    this._ladLineBmp = new Bitmap(Graphics.width, Graphics.height);
+    this._ladLineSprite = new Sprite(this._ladLineBmp);
+    this._ladLineSprite.z = 101;
+    this.addChild(this._ladLineSprite);
+    this._ladLineShown = -1;
+    this._ladLineTick = 0;
+    this.drawLadPlayingLine();
+
     // 每次回到标题都问一次（打完一局回来数字就是新的），
     // 之后每 10 秒刷一次 —— 比大厅那个 5 秒的心跳松一档，标题不需要那么灵敏。
     D678N.dailyFetch();
@@ -3445,6 +3527,56 @@ Scene_Title.prototype.update = function () {
         D678N.dailyFetch();
     }
     this.drawDailyCounts();
+    // 半秒查一次够了 —— 那个数 20 秒才换一桶
+    if (++this._ladLineTick >= 30) {
+        this._ladLineTick = 0;
+        this.drawLadPlayingLine();
+    }
+};
+
+// 「天梯模式对局中人数：N」。红色小字，画在「多人游戏」按钮下方的间隙里。
+//
+// 【y 从按钮算，不写死】title.js 的按钮是底部锚定、按命令数排版的
+// （createTitleButtons），命令项以后有增减，写死的 y 就会跑到按钮上。
+// 所以直接找 symbol==='d678net' 那个按钮，画在它的下边缘之下。
+// title.js 没加载时（_btns 不存在）兜一个按同样规则算的估值。
+Scene_Title.prototype.drawLadPlayingLine = function () {
+    if (!this._ladLineBmp) return;
+    var n = D678N.ladFakePlaying();
+    if (n === this._ladLineShown) return;      // 没变化不重画
+    this._ladLineShown = n;
+
+    var bmp = this._ladLineBmp;
+    bmp.clear();
+
+    var y = null, gap = 34;
+    var btns = this._btns;
+    if (btns && btns.length) {
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].symbol !== 'd678net') continue;
+            var b = btns[i];
+            y = b.y + b.h;
+            // 到下一个按钮之间的净空。最后一个按钮下方按 BTN_BOTTOM 估。
+            var next = btns[i + 1];
+            gap = next ? (next.y - y) : 34;
+            break;
+        }
+    }
+    if (y === null) {
+        // title.js 没接管标题（或命令表还没建）：按 3 个按钮 + 34 间隙估。
+        // 顶边 = 1280 - 70 - (3*74 + 2*34) = 920，多人游戏是第 2 个
+        // （920 + 108 = 1028），它的下边缘 1028 + 74 = 1102。
+        var y0 = Graphics.height - 70 - (3 * 74 + 2 * 34);
+        y = y0 + (74 + 34) + 74;
+        gap = 34;
+    }
+
+    // 传 gap 当绘制高度，drawText 会在这道间隙里垂直居中
+    bmp.fontSize = 17;
+    bmp.textColor = '#ff6b6b';
+    bmp.outlineColor = 'rgba(0,0,0,0.85)';
+    bmp.outlineWidth = 4;
+    bmp.drawText('天梯模式对局中人数：' + n, 0, y, Graphics.width, gap, 'center');
 };
 
 Scene_Title.prototype.drawDailyCounts = function () {

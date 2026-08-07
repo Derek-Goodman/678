@@ -1010,7 +1010,7 @@ const LAD_BASE   = 1000;   // 新号起始分
 const LAD_FLOOR  = 500;    // 分数地板。掉穿是纯挫败，没有信息量
 const LAD_SCALE  = 400;    // Elo 尺度。放大 -> 榜的跨度变大
 const LAD_MINGAMES = 10;   // 上榜门槛（累计场次）
-const LAD_BOARD_N  = 50;   // 榜显示前多少名（AI 名单 46 个，目标规模 40~50）
+const LAD_BOARD_N  = 100;  // 榜显示前多少名（AI 名单 115 个，撑得满）
 
 // K 值。定级期给大的（10 局就能落到大致正确的位置，不用爬几十局），
 // 高分区收紧（榜首不会天天换）。
@@ -1263,6 +1263,10 @@ function ladAiState(name, now) {
         name: name,
         score: cur.score,
         games: games,
+        // 【本赛季场次】上榜门槛看这个，不是 games（2026-08-07 你定的：每赛季
+        // 重新爬一次才有动力）。games 仍是生涯累计 —— 榜上「场次」那一列和
+        // avgRank 用它，那是「这人打过多少局」，跨季不该清零。
+        sGames: cur.games,
         champs: hist.champs + cur.champs,
         avgRank: games > 0 ? rankSum / games : null,
         ai: true,
@@ -1388,7 +1392,7 @@ function ladSettleAllLeft(room, why) {
 }
 
 //--- 榜 --------------------------------------------------------------------
-// 真人行 + AI 行合并排序取前 100。整份榜算一次约 55ms（115 个 AI，赛季末），
+// 真人行 + AI 行合并排序取前 LAD_BOARD_N。整份榜算一次约 55ms（115 个 AI，
 // 缓存 30 秒 —— 分数本来就是分钟级在动，30 秒的滞后看不出来。
 let ladBoardCache = null, ladBoardAt = 0;
 const LAD_BOARD_TTL = 30000;
@@ -1409,16 +1413,27 @@ function ladBoard() {
     // 所以现在 AI 也得爬过 10 场，榜是跟着时间自己长满的。
     for (const nm of D678.LAD_AI_NAMES) {
         const st = ladAiState(nm, t);
-        if (st.games >= LAD_MINGAMES) rows.push(st);
+        if (st.sGames >= LAD_MINGAMES) rows.push(st);
     }
-    // 真人。门槛按**累计**场次算 —— 按赛季场次算的话月初全体「定级中」，
-    // 榜会空掉好几个小时。
+    // 真人。门槛按**本赛季**场次算（2026-08-07 你定的）。
+    //
+    // 【这里原来是累计场次】理由写的是「按赛季场次算的话月初全体定级中，榜会
+    // 空掉好几个小时」。现在反过来接受那个代价 —— 每赛季重新爬一次正是动力
+    // 来源。实测 9/1：当天 0 行、第 1 天 49 行、第 3 天满 115。空榜那段窗口
+    // 客户端画一行「新赛季刚开始，所有人都在定级中」（见 678net.js 的 drawBoard）。
+    //
+    // 【必须先调 ladScoreOf 再读 ladSGames】ladScoreOf 里有跨季惰性重置，
+    // 它才会把 ladSGames 归零。反过来的话月初第一次查榜读到的是**上赛季的
+    // 残值** —— 上个月打满 10 局的人会直接上榜，这道门槛等于没有。
+    // 原来的代码正是先读 ladGames 后调 ladScoreOf（累计场次不受重置影响，
+    // 所以那时候没事），换成赛季字段后这个顺序就是 bug。
     for (const a of accounts.values()) {
         if (!a.name) continue;                       // 还没起天梯名
+        const score = ladScoreOf(a);                 // 先触发跨季重置
+        if ((a.ladSGames || 0) < LAD_MINGAMES) continue;
         const games = a.ladGames || 0;
-        if (games < LAD_MINGAMES) continue;
         rows.push({
-            name: a.name, score: ladScoreOf(a), games: games,
+            name: a.name, score: score, games: games,
             champs: a.ladChamps || 0,
             avgRank: games > 0 ? a.ladRankSum / games : null,
             ai: false, acc: a.acc.toLowerCase(),
@@ -1454,16 +1469,22 @@ function ladBoardView(acc) {
             out.me.onBoard = mine.rank <= LAD_BOARD_N;
         } else {
             // 没上榜：可能是场次不够（定级中），也可能是还没起名
+            //
+            // 【定级看赛季场次】和 ladBoard 同一道门槛（2026-08-07 改）。
+            // 同样必须先调 ladScoreOf 触发跨季重置，再读 ladSGames ——
+            // 否则月初「还差几局」会按上赛季的场次算出 0。
+            const score = ladScoreOf(acc);
+            const sGames = acc.ladSGames || 0;
             const games = acc.ladGames || 0;
             out.me = {
-                rank: null, name: acc.name || '', score: ladScoreOf(acc),
-                tier: ladTier(ladScoreOf(acc)), games: games,
+                rank: null, name: acc.name || '', score: score,
+                tier: ladTier(score), games: games,
                 champs: acc.ladChamps || 0,
                 avgRank: games > 0
                     ? Math.round(acc.ladRankSum / games * 10) / 10 : null,
                 onBoard: false,
-                rating: games < LAD_MINGAMES,      // 定级中
-                need: Math.max(0, LAD_MINGAMES - games),
+                rating: sGames < LAD_MINGAMES,      // 定级中
+                need: Math.max(0, LAD_MINGAMES - sGames),
             };
         }
     }
@@ -2026,10 +2047,14 @@ function computeStats() {
         loose++;
     }
 
-    // 【2026-08-07：一律真数】原来 online 里加了 ladPlayingCount()（AI 模拟
-    // 对局的假人数），ladPlaying 发的也是那个假数。现在这几行只有 GM 看得见
-    // （见 /api/stats 的门禁），假数就没有存在的理由了 —— GM 要看的是真实
-    // 运营情况，冲了假人数反而看不出「到底有没有人在玩」。
+    // 【2026-08-07：这个接口一律真数】原来 online 里加了 ladPlayingCount()
+    // （AI 模拟对局的假人数），ladPlaying 发的也是那个假数。现在这几行只有
+    // GM 看得见（见 /api/stats 的门禁），假数就没有存在的理由了 —— GM 要看的
+    // 是真实运营情况，冲了假人数反而看不出「到底有没有人在玩」。
+    //
+    // 【门面数在客户端，不在这里】标题画面那行「天梯模式对局中人数：N」
+    // （200~1000，给所有玩家看）是客户端按本地时钟算的，压根不走这个接口 ——
+    // 见 678net.js 的 D678N.ladFakePlaying。所以这里不需要、也不该掺假数。
     //
     // ladPlaying = 真的在天梯房里打的真人（ladRealPlaying）。
     // aiPlaying  = AI 模拟对局数，单独一个字段，只给 GM 看运营。
