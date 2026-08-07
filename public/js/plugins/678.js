@@ -523,8 +523,11 @@ Scene_D678.prototype.drawHpBar = function () {
         x + w + 12, 20, 180, 24, COL.gold);
     this.txt(bmp, this._showList ? '▲ 收起' : '▼ 排名', 590, 22, 110, 22, COL.blue);
     this._hits.push({ x: 12, y: 10, w: 696, h: 56, cb: this.onToggleList.bind(this) });
+    // 【宽度只给 210】这一行右边是联机下的「思考时间 x/ys」（678net.js 的
+    // drawHpBar 包装），原来声明 400 宽（26~426）会直接压到它身上。
+    // 实际字形宽度：「第 35 轮   存活 8 人」约 209 像素，210 够用不截断。
     this.txt(bmp, '第 ' + D678.Game.round + ' 轮   存活 ' + D678.Game.alivePlayers().length + ' 人',
-        26, 72, 400, 20, COL.gray);
+        26, 72, 210, 20, COL.gray);
 };
 
 Scene_D678.prototype.drawBattle = function (b) {

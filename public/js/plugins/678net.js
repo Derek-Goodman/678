@@ -764,6 +764,11 @@ Scene_D678Net.prototype.create = function () {
     this._statsWait = 1;      // 1 = 下一帧就问一次，别等满 5 秒
     this._statsFail = false;  // 服务器没有 /api/stats（老版本）
     this._ladReg = false;     // 天梯登录表单是不是展开成注册态（多一栏确认密码）
+    // 天梯匹配总计时上次画出来的秒数。-1 = 还没画过（下一帧就重画一次）。
+    // updateLadClock 靠它判断「秒数变了没」，见那边注释。
+    this._ladClockShown = -1;
+    this._ladFillMs = 0;
+    this._ladFillAt = 0;
 
     var W = Graphics.width, H = Graphics.height;
     var bg = new Bitmap(W, H);
@@ -1448,16 +1453,9 @@ Scene_D678Net.prototype.drawLadMatching = function (info) {
     this.txt('（' + f.shown + '/' + f.total + ' 匹配中）', 0, 300, W, 56,
              LC.text, 'center');
 
-    // 总计时。服务器每条 room 消息带 elapsed，两条之间用本地时钟补齐 ——
-    // 否则数字只在服务器推消息时才跳（假计数最长能隔一分钟不动），看着像卡住。
-    //
-    // _ladFillMs / _ladFillAt 是「服务器说过的那个值」和「收到它的时刻」，
-    // 在 pollNet 收 room 消息时记下。当前值 = 那个值 + 从那时起走了多久。
-    var ms = f.elapsed || 0;
-    if (this._ladFillAt) {
-        ms = Math.max(ms, (this._ladFillMs || 0) + (Date.now() - this._ladFillAt));
-    }
-    var sec = Math.floor(ms / 1000);
+    // 总计时。算法收在 ladFillSec()（updateLadClock 每秒靠它判断该不该重画，
+    // 两处必须用同一份）。
+    var sec = this.ladFillSec();
     this.txt('已匹配 ' + Math.floor(sec / 60) + ':' +
              ('0' + (sec % 60)).slice(-2), 0, 372, W, 30, LC.gray, 'center');
 
@@ -1737,7 +1735,50 @@ Scene_D678Net.prototype.update = function () {
     }
     this.pollNet();
     this.updateStats();
+    this.updateLadClock();
     this.updateInput();
+};
+
+// 天梯匹配页的总计时要每秒自己走一遍（你报的）。
+//
+// 【为什么原来会卡住】drawLadMatching 里那段本地补齐（_ladFillMs +
+// 从收到起走了多久）算得是对的，但**没人触发重画** —— refresh() 只在收到
+// 消息、点按钮这些时刻调。于是「已匹配 0:07」一直停着，直到下一个假人进来
+// 推一份 room 消息才跳一大截。看起来就是「时间一段一段地变」。
+//
+// 【为什么不每帧 refresh】refresh() 要重画整屏（含 100 行的榜、进度条），
+// 60fps 全量重画白烧。和对局里的 netTickClock 同一套办法：只在**显示出来的
+// 那个秒数**变了的时候重画。
+Scene_D678Net.prototype.updateLadClock = function () {
+    var info = this._roomInfo;
+    if (this._page !== 'waiting' || this._resuming || !info || !info.ladder) {
+        this._ladClockShown = -1;
+        return;
+    }
+    var sec = this.ladFillSec();
+    if (sec !== this._ladClockShown) {
+        this._ladClockShown = sec;
+        this.refresh();
+    }
+};
+
+// 匹配已经过了几秒。服务器每条 room 消息带 elapsed，两条之间用本地时钟补齐
+// —— 否则数字只在服务器推消息时才跳（假计数最长能隔一分钟不动）。
+//
+// _ladFillMs / _ladFillAt 是「服务器说过的那个值」和「收到它的时刻」，
+// 在 pollNet 收 room 消息时记下。当前值 = 那个值 + 从那时起走了多久。
+//
+// 【收在一个函数里】drawLadMatching 要用它画，updateLadClock 要用它判断
+// 该不该重画 —— 两处算法必须是同一份，各写一遍就会出现「画的是 8 秒、
+// 判断用的是 7 秒」这种自己跟自己不同步。
+Scene_D678Net.prototype.ladFillSec = function () {
+    var info = this._roomInfo;
+    var f = (info && info.ladFill) || null;
+    var ms = (f && f.elapsed) || 0;
+    if (this._ladFillAt) {
+        ms = Math.max(ms, (this._ladFillMs || 0) + (Date.now() - this._ladFillAt));
+    }
+    return Math.floor(ms / 1000);
 };
 
 Scene_D678Net.prototype.pollNet = function () {
@@ -3274,8 +3315,15 @@ Scene_D678.prototype.drawHpBar = function () {
             this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
                 408, 72, 300, 20, col, 'right');
         }
-        // 我的思考池（天梯）。放在第二行中段 —— 左边「第 X 轮 存活 N 人」
-        // 实测到 x≈180 为止，右边倒计时右对齐从 x≈595 起，这一段是空的。
+        // 我的思考池（天梯）。紧贴在倒计时**左边**，右对齐（你定的）。
+        //
+        // 【为什么是右对齐而不是从固定 x 左对齐】原来在 x=200 左对齐，
+        // 而左边「第 X 轮   存活 N 人」8 人局能画到 x≈235 —— 两串字直接叠在
+        // 一起。右对齐到倒计时左侧之后，这一行的排布是：
+        //   26~235  第 X 轮 存活 N 人
+        //   250~400 思考时间 x/ys（右对齐，最长「思考时间 15/60s」约 152 像素）
+        //   408~708 你的回合 / 等对方 Ns（右对齐）
+        // 中间两段各留 15 像素以上的空隙，三段都不重叠。
         //
         // 【为什么自己的画在这里而不是画面下方】这一行本来就是「我的时间」
         // 那一行（回合倒计时在同一行右侧），两个数挨着才看得出「回合时限
@@ -3283,7 +3331,7 @@ Scene_D678.prototype.drawHpBar = function () {
         var mb = this.netBankSec(0);
         if (mb && mb.pool > 0) {
             this.txt(bmp, '思考时间 ' + mb.turn + '/' + mb.pool + 's',
-                200, 72, 200, 20, mb.active ? LC.red : LC.gray, 'left');
+                250, 72, 150, 20, mb.active ? LC.red : LC.gray, 'right');
         }
     }
 };

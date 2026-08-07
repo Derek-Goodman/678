@@ -2455,8 +2455,9 @@ function pushStateT(room, extra) {
             // 一致 —— 客户端不用再判方向。
             //
             // turn 是**当前行动方**这个回合可动用的量（另一方没在用池子）。
-            // 真人是 armTurnTimerT 算好的 bankTurnMs，AI 是它这一步计划里
-            // 真实要花的 cost —— 两边都存在 bt.bankTurnMs 上，口径一致。
+            // 真人和 AI 都是 armTurnTimerT 算好的 bankTurnMs = min(单回合上限,
+            // 池子)，口径完全一致 —— AI 那边曾经发的是「这一步实际要花多少」
+            // （常规步 0），于是「对方思考时间 0/60s」成了 AI 的标记，见那边注释。
             bank: (room.mode === 'ladder' && bt && !btDone && meSide >= 0) ? {
                 left: [ladBankLeft(room, bt.pIdx[meSide]),
                        ladBankLeft(room, bt.pIdx[1 - meSide])],
@@ -2874,16 +2875,30 @@ function armTurnTimerT(room, bt) {
     // 原来是 stepAIIfNeeded 里才抽，那时 deadline 已经发出去了 —— 客户端
     // 会按「可能用满 15 秒」推算池子，等 AI 只想了 12 秒就走完，下一帧池子
     // 又跳回去一截。所以抽好存在 bt.aiPlan 上，stepAIIfNeeded 直接用。
-    // 【两侧的 deadline 口径必须一致】turnDeadline 一律只到「回合时限」为止，
+    // 【两侧的 deadline 口径必须一致】turnDeadline 一律是**完整的回合时限**，
     // 超出的那一段走 turnHardDeadline。这样客户端两边用同一套算法画：
-    // 先正常倒数到 0，再接着画思考池。AI 这边如果把整段延迟塞进 turnDeadline，
-    // 玩家会看到对手的倒计时从 13 秒开始 —— 比自己的 10 秒还长，一眼假。
+    // 先正常倒数到 0，再接着画思考池。
+    //
+    // 【为什么不能写 min(延迟, 回合时限)】那样倒计时的起点就等于 AI 这一步
+    // 抽到的思考时长：抽到 2.2 秒，玩家看到「等对方 3s」然后它正好数到 0 出手。
+    // 实测一局的起点是 7,5,5,3,10,10,5,2,5,10 秒，而真人恒定 10 秒 ——
+    // 倒计时起点逐回合变、且预告了它要想多久，一眼看得出对面是 AI。
+    // 原来的 min 只封住了上界（防「对手倒计时比我长」），下界漏了。
+    //
+    // AI 提前走完时倒计时停在中途，这和真人对手提前出牌是同一个观感。
     if (isAI) {
         if (!bt.aiPlan) bt.aiPlan = ladAiPlan(room, pIdx);
-        const base = Math.min(bt.aiPlan.delay, tsec * 1000);
-        bt.turnDeadline = bt.turnStartAt + base;
+        bt.turnDeadline = bt.turnStartAt + tsec * 1000;
+        // 硬截止 = 它真实什么时候落子（可能比回合时限长，那截吃思考池）。
+        // AI 不挂计时器，所以这个值没人读，留着是为了排查时看得出计划；
+        // 它**不发给客户端**（发的是上面那个完整时限）。
         bt.turnHardDeadline = bt.turnStartAt + bt.aiPlan.delay;
-        bt.bankTurnMs = bt.aiPlan.cost;
+        // 【发的是额度，不是这一步的花费】和真人同一个口径 min(单回合上限, 池子)。
+        // 原来发 aiPlan.cost —— 常规步 cost=0，客户端画出「对方思考时间 0/60s」，
+        // 而真人那一行恒定 15/60。一个还没开始想的对手额度显示 0，
+        // 这个数不可能出现在真人身上，是第二处泄露。
+        // 真正的扣费走 stepAIIfNeeded 里的 plan.cost，跟这个显示值无关。
+        bt.bankTurnMs = ladBankTurnMs(room, pIdx);
         return;
     }
 
@@ -4466,6 +4481,12 @@ module.exports = {
     ladAiPlayingCount, ladRealPlaying, aiNetRoll, aiNetOf, setAiNetForce, GM_ACC,
     LAD_BASE, LAD_FLOOR, LAD_SCALE, LAD_MINGAMES, LAD_BOARD_N, LAD_TIERS,
     LAD_LAUNCH, LAD_AI_GONE_P, LAD_AI_LEFT_P,
+    // 思考池 / 回合计时那一套。_test_ladbank.js 全靠这些名字 ——
+    // 少了任何一个它会以 `SRV.xxx is not a function` 整个挂掉（30 条断言
+    // 一条都不跑），而挂掉的样子和「功能坏了」看起来一样。
+    LAD_DELAY, LAD_DELAY_NOBANK, LAD_BANK_MS, LAD_BANK_TURN_MS,
+    ladThinkMs, ladBankCost, ladBankLeft, ladBankSpend, ladBankTurnMs,
+    ladAiPlan, armTurnTimerT, applyActionT, turnSecOf, goneSecOf,
 };
 
 server.listen(CFG.port, '0.0.0.0', () => {
