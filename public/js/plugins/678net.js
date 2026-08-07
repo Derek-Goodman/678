@@ -2343,6 +2343,8 @@ Scene_D678.prototype.create = function () {
     this._netPreApplied = 0;     // 已套用过发牌前快照的结算编号（同一次不重套）
     this._netTurnLeft = 0;       // 回合剩余毫秒（收到时的快照）
     this._netTurnAt   = 0;
+    this._netBank     = null;    // 思考池快照 {left:[我,对手], turn}（天梯）
+    this._netBankAt   = 0;
     this._netAckCool  = 0;       // 点「继续」后的冷却帧，防误触
     this._netAckSentAt = 0;      // 上次发 ack 的时刻（等太久时提示可重发）
     this._netPeerGoneMs = 0;     // 对手已掉线多久
@@ -2486,6 +2488,13 @@ Scene_D678.prototype.netApply = function (m) {
     if (m.turnLeft !== undefined) {
         this._netTurnLeft = m.turnLeft;
         this._netTurnAt = Date.now();
+    }
+
+    // 思考池（天梯）。和 turnLeft 同一套：存收到时的快照 + 收到的时刻，
+    // 本地推算，不碰服务器时钟。
+    if (m.bank !== undefined) {
+        this._netBank = m.bank || null;
+        this._netBankAt = Date.now();
     }
 
     // 对手掉线状态由每份盘面带过来，比 peer 消息可靠（重连后也能对上）
@@ -2840,6 +2849,49 @@ Scene_D678.prototype.netTurnSec = function () {
     if (!this._netTurnLeft || !this._netTurnAt) return -1;
     return Math.max(0, Math.ceil((this._netTurnLeft - (Date.now() - this._netTurnAt)) / 1000));
 };
+
+// 思考池的两个数（天梯）。返回 {turn, pool, active} —— turn 是本回合还能想
+// 几秒，pool 是整场还剩几秒，两个一起减（你定的：15/60 -> 12/57 -> 5/50）。
+// active 为 true 表示回合时限已经烧完、正在动用池子。
+//
+// 【为什么两个数一起减】它们是同一段时间的两种口径：本回合已经想了 3 秒，
+// 那么本回合的额度和整场的总量都各少 3 秒。分开减（比如池子只在回合结束时
+// 才扣）会让玩家看到「想了 10 秒，池子一动不动」，反而像坏了。
+//
+// si 是要看哪一侧：0 = 我，1 = 对手（服务器按 [我, 对手] 发，见 pushStateT）。
+Scene_D678.prototype.netBankSec = function (si) {
+    var bk = this._netBank;
+    if (!bk || !bk.left) return null;
+    var pool = bk.left[si] || 0;
+    var acting = (si === this._netBankSide());
+
+    // 【本回合额度不能直接用 bk.turn】那个数只属于当前行动方。给非行动方
+    // 画的话，对手回合时我这一行会显示**对手的**额度 —— 两行数字一样，
+    // 看起来像自己的池子在对手回合被扣。非行动方按 min(上限, 池子) 自己算。
+    var turnMs = acting ? (bk.turn || 0)
+                        : Math.min(bk.cap || 0, pool);
+
+    var over = 0;
+    if (acting && turnMs > 0) {
+        // 「回合时限烧完之后又过了多久」。两个快照来自同一条消息
+        // （见 onState 里 turnLeft / bank 相邻那两段），所以用同一个起点算。
+        over = (Date.now() - (this._netBankAt || Date.now()))
+             - (this._netTurnLeft || 0);
+        if (over < 0) over = 0;
+        if (over > turnMs) over = turnMs;
+    }
+    return {
+        turn: Math.max(0, Math.ceil((turnMs - over) / 1000)),
+        pool: Math.max(0, Math.ceil((pool - over) / 1000)),
+        active: over > 0,
+    };
+};
+
+// 现在轮到哪一侧（镜像后 0 永远是我）。没有牌面时返回 -1。
+Scene_D678.prototype._netBankSide = function () {
+    var b = this._battle;
+    return (b && !b.finished) ? b.turn : -1;
+};
 // 每秒重画一次就够，不必每帧
 Scene_D678.prototype.netTickClock = function () {
     var show = -1;
@@ -2848,6 +2900,14 @@ Scene_D678.prototype.netTickClock = function () {
     if (this._netPeerGone) {
         var ms = (this._netPeerGoneMs || 0) + (Date.now() - (this._netPeerGoneAt || Date.now()));
         show = (show >= 0 ? show * 1000 : 0) + Math.floor(ms / 1000);
+    }
+    // 【思考池也要进这个指纹】netTurnSec 在池子那一段恒等于 0 —— 只看它的话
+    // 「思考时间 12/57」画出来就再也不动了，玩家会以为界面卡住。
+    // 把两侧的秒数一起混进去，任一个变了就重画。
+    if (this._phase === 'battle' && this._netBank) {
+        var mb = this.netBankSec(0), ob = this.netBankSec(1);
+        if (mb) show = show * 1000 + mb.turn * 100 + (mb.pool % 100);
+        if (ob) show = show * 1000 + ob.turn * 100 + (ob.pool % 100);
     }
     if (show !== this._netClockShown) {
         this._netClockShown = show;
@@ -3214,7 +3274,35 @@ Scene_D678.prototype.drawHpBar = function () {
             this.txt(bmp, (mine ? '你的回合 ' : '等对方 ') + left + 's',
                 408, 72, 300, 20, col, 'right');
         }
+        // 我的思考池（天梯）。放在第二行中段 —— 左边「第 X 轮 存活 N 人」
+        // 实测到 x≈180 为止，右边倒计时右对齐从 x≈595 起，这一段是空的。
+        //
+        // 【为什么自己的画在这里而不是画面下方】这一行本来就是「我的时间」
+        // 那一行（回合倒计时在同一行右侧），两个数挨着才看得出「回合时限
+        // 烧完了，现在开始吃池子」这个交接。
+        var mb = this.netBankSec(0);
+        if (mb && mb.pool > 0) {
+            this.txt(bmp, '思考时间 ' + mb.turn + '/' + mb.pool + 's',
+                200, 72, 200, 20, mb.active ? LC.red : LC.gray, 'left');
+        }
     }
+};
+
+//--- 对手的思考池 ----------------------------------------------------------
+// 画在对手 HP 那一行下面（y=130 那行高 30，到 160 为止；对手手牌从
+// OPP_CARD_Y=190 起），这一段是空的。
+//
+// 【为什么要显示对方的】天梯下 AI 长考可以到 15 秒，超过回合时限 10 秒。
+// 只画回合倒计时的话它会归零然后干等好几秒 —— 看起来像卡死。把对方的池子
+// 画出来，那几秒就有了解释。
+var _dBattle = Scene_D678.prototype.drawBattle;
+Scene_D678.prototype.drawBattle = function (b) {
+    _dBattle.call(this, b);
+    if (!this._net || !b || b.finished) return;
+    var ob = this.netBankSec(1);
+    if (!ob || ob.pool <= 0) return;
+    this.txt(this._uiBmp, '对方思考时间 ' + ob.turn + '/' + ob.pool + 's',
+        0, 160, D678.LY.SW, 18, ob.active ? LC.orange : LC.gray, 'center');
 };
 
 //--- 绘制：掉线 / 离开的标注 ------------------------------------------------

@@ -98,11 +98,11 @@ const CFG = {
 
     // 天梯里「挂机过之后」的回合时限（秒）。
     //
-    // 【为什么天梯要单独一个】全局的 goneTurnSec 是 10 秒，而天梯的正常回合
-    // 现在也是 10 秒 —— 共用的话降速这件事在天梯里等于没发生（10 降到 10）。
-    // 那条降速本来是为了「对手掉线时在线的人别干等」，天梯里 AI 掉线率 5%、
-    // 一局 33 轮，是最需要它的地方。所以天梯降到 5 秒（你定的）。
-    ladGoneTurnSec: Number(argOf('--lad-gone-turn-sec', 5)),
+    // 【2026-08-07 从 5 秒改回 10 秒 = 不降速】（你定的）10 秒本来就够短，
+    // 掉线的人回来发现回合只剩一半太苛刻。默认值等于 ladTurnSec，所以天梯
+    // 里降速这件事不再发生；写 --lad-gone-turn-sec 5 可以调回来。
+    // 详见 goneSecOf 的注释。
+    ladGoneTurnSec: Number(argOf('--lad-gone-turn-sec', 10)),
 
     // 天梯假匹配的总时长范围（毫秒）。计数从 1/8 走到 8/8 用掉这么久。
     //
@@ -348,30 +348,132 @@ function rollFillNames(need) {
 //
 // 【2026-08-07 整体压到 1~9 秒】原来是 1.8~16 秒、均值 4.8 秒/步，整场
 // 20~24 分钟。回合时限同时从 20 秒压到 10 秒，16 秒的长考就越界了 ——
-// 长考上限必须留在回合时限之内（理由见下）。现在均值约 3.0 秒/步。
+// 长考上限必须留在回合时限之内（那时还没有思考池）。
 //
 // 【三档的权重没动】72 / 21 / 7 是原来实测反解出来的形状：绝大多数步是
-// 「随手就出」，少数犹豫一下，偶尔卡住想很久。只把三档的区间按新上限压缩，
-// 分布的形状保持不变 —— 那个形状才是拟人感的来源，不是具体秒数。
+// 「随手就出」，少数犹豫一下，偶尔卡住想很久。分布的形状才是拟人感的来源，
+// 不是具体秒数。
 //
-// 【长考上限 9 秒 vs 回合限时 10 秒】AI 想 9 秒是合法的：armTurnTimerT 对
-// AI 直接 return，不给它挂超时计时器，所以它不会把自己判超时。留 1 秒余量是
-// 为了让「对手几乎用完了时间」仍然看得出是在思考而不是卡住。
-// 改 ladTurnSec 的时候记得回来看这一档。
+// 【2026-08-07 长考档拉到 15 秒，常规 / 稍慢两档不动】（你定的）
+// 有了思考池之后，超过回合时限的那一截有地方扣，长考不再需要留在 10 秒内。
+//
+// 只拉最上面那 7%：整场均值 3.44 -> 3.65 秒/步，时长几乎不变（约 16.5 分钟）。
+// 【为什么不整体等比拉到 1~15】那样常规档变成 1~6.25 秒，均值 5.28 秒/步、
+// 整场 24 分钟 —— 比 2026-08-07 压缩之前还长，而多出来的时间几乎全在
+// 10 秒线以下，压根不走思考池（池子只盖得住超出回合时限的那一截）。
+// 「常规步也跟着变慢」不是要的效果，要的是长考更长。
 const LAD_DELAY = [
-    { w: 72, lo: 1000, hi: 4000 },   // 常规
-    { w: 21, lo: 4000, hi: 6500 },   // 稍慢
-    { w:  7, lo: 6500, hi: 9000 },   // 长考
+    { w: 72, lo: 1000, hi:  4000 },   // 常规
+    { w: 21, lo: 4000, hi:  6500 },   // 稍慢
+    { w:  7, lo: 6500, hi: 15000 },   // 长考（会吃思考池）
 ];
-const LAD_DELAY_TOT = LAD_DELAY.reduce((s, x) => s + x.w, 0);
 
-function ladThinkMs() {
-    let u = Math.random() * LAD_DELAY_TOT;
-    let ms = LAD_DELAY[LAD_DELAY.length - 1].hi;
-    for (const d of LAD_DELAY) {
+// 思考池空了之后的档位：整个分布必须落在回合时限之内，否则 AI 会一直被
+// 判超时过牌。上限 9 秒 = ladTurnSec 留 1 秒余量，让「几乎用完时间」
+// 仍然看得出是在思考而不是卡住。
+const LAD_DELAY_NOBANK = [
+    { w: 72, lo: 1000, hi: 4000 },
+    { w: 21, lo: 4000, hi: 6500 },
+    { w:  7, lo: 6500, hi: 9000 },
+];
+
+//--- 思考池 ----------------------------------------------------------------
+// 天梯专属：每人整场独享一份累计思考时间（你定的）。回合时限烧完之后可以
+// 继续动用它，单回合最多动用 LAD_BANK_TURN_MS，池子空了就只剩每回合 10 秒。
+//
+// 【为什么单回合要另设上限】只有总量的话，一个人可以在某一步上耗掉整池
+// 60 秒 —— 轮次屏障下同轮另外三桌全在等他，那 60 秒里别人只看得到一个
+// 倒计时。15 秒的上限把单回合最长封在 10+15=25 秒。
+//
+// 真人和 AI 用同一份口径（都是 60 秒 / 单回合 15 秒），这样玩家看到对手那份
+// x/60 在掉的时候，它和自己那份是同一种东西。
+const LAD_BANK_MS      = 60000;
+const LAD_BANK_TURN_MS = 15000;
+
+// 测试缩放只作用在 AI 的拟人延迟上（ladThinkScale），真人的回合时限和池子
+// 都是真实墙上时间。所以 AI 扣池子时要把「压缩过的超时」还原回真实量，
+// 否则 --lad-think-scale 0.02 下 AI 每步只扣几毫秒，池子永远见不到底 ——
+// 「池子空了换 1~9 秒那档」那条分支就永远测不到。
+function ladUnscale(ms) {
+    const k = CFG.ladThinkScale || 1;
+    return k > 0 ? ms / k : ms;
+}
+
+function ladRollDelay(bands) {
+    const tot = bands.reduce((s, x) => s + x.w, 0);
+    let u = Math.random() * tot;
+    let ms = bands[bands.length - 1].hi;
+    for (const d of bands) {
         if ((u -= d.w) < 0) { ms = d.lo + Math.random() * (d.hi - d.lo); break; }
     }
-    return Math.max(1, Math.round(ms * CFG.ladThinkScale));
+    return ms;
+}
+
+// 一步的拟人延迟（已按 ladThinkScale 缩放）。bankLeftMs 是这个 AI 还剩多少
+// 思考池，单位是真实毫秒；不传 = 不关心扣费（当作池子充足）。
+//
+// 【池子空了要换档而不是截断】截断的话所有长考都恰好停在回合时限上，
+// 一眼看得出是撞了什么线；换成 1~9 秒那档，观感是「这个对手后半场出手变快了」
+// —— 真人时间快用完时正是这样。
+function ladThinkMs(bankLeftMs) {
+    const hasBank = (bankLeftMs === undefined) || bankLeftMs > 0;
+    let raw = ladRollDelay(hasBank ? LAD_DELAY : LAD_DELAY_NOBANK);
+    if (hasBank && bankLeftMs !== undefined) {
+        // 池子不够支撑这次长考：能想到的最长 = 回合时限 + 剩下的池子
+        // （单回合还有 15 秒的上限）。这一步会把池子扣到 0，下一步走 NOBANK 档。
+        const cap = CFG.ladTurnSec * 1000
+                  + Math.min(bankLeftMs, LAD_BANK_TURN_MS);
+        raw = Math.min(raw, cap);
+    }
+    return Math.max(1, Math.round(raw * CFG.ladThinkScale));
+}
+
+// 这一步延迟要从池子里扣多少（真实毫秒）。只有超出回合时限的那一截才扣。
+function ladBankCost(delayMs) {
+    const over = ladUnscale(delayMs) - CFG.ladTurnSec * 1000;
+    return over > 0 ? Math.min(over, LAD_BANK_TURN_MS) : 0;
+}
+
+// 池子存在哪：真人存座位（跟着重连走），AI 存 room.ladBank（AI 没有座位 ——
+// 和 room.aiNet 同一个理由，见那边的注释）。两种都按 pIdx 取，调用方不用分。
+//
+// 【非天梯一律返回 0】1v1 / 锦标赛 / 单机没有思考池这回事，读到 0 的话
+// armTurnTimerT 那边算出来的 deadline 就等于原来的行为，不用到处加模式判断。
+function ladBankLeft(room, pIdx) {
+    if (!room || room.mode !== 'ladder') return 0;
+    const seat = room.seats.find(s => s && s.pIdx === pIdx);
+    if (seat) {
+        if (typeof seat.ladBank !== 'number') seat.ladBank = LAD_BANK_MS;
+        return Math.max(0, seat.ladBank);
+    }
+    if (!room.ladBank) room.ladBank = {};
+    if (typeof room.ladBank[pIdx] !== 'number') room.ladBank[pIdx] = LAD_BANK_MS;
+    return Math.max(0, room.ladBank[pIdx]);
+}
+
+function ladBankSpend(room, pIdx, ms) {
+    if (!room || room.mode !== 'ladder' || !(ms > 0)) return;
+    const left = ladBankLeft(room, pIdx);
+    const next = Math.max(0, left - ms);
+    const seat = room.seats.find(s => s && s.pIdx === pIdx);
+    if (seat) seat.ladBank = next;
+    else room.ladBank[pIdx] = next;
+}
+
+// 这个回合最多能动用多少池子（真实毫秒）。单回合上限和剩余总量取小的那个。
+function ladBankTurnMs(room, pIdx) {
+    return Math.min(LAD_BANK_TURN_MS, ladBankLeft(room, pIdx));
+}
+
+// AI 这一步的计划：{delay, cost}。delay 是已缩放的等待毫秒，cost 是这一步
+// 要从池子里扣掉多少（真实毫秒）。
+//
+// 【为什么要先抽好再等】客户端显示的思考池必须和 AI 真实的思考时长一致，
+// 详见 armTurnTimerT 里 aiPlan 那段注释。
+function ladAiPlan(room, pIdx) {
+    if (room.mode !== 'ladder') return { delay: CFG.aiStepMs, cost: 0 };
+    const delay = ladThinkMs(ladBankLeft(room, pIdx));
+    return { delay: delay, cost: ladBankCost(delay) };
 }
 
 // 纯 AI 桌的假时长封顶（毫秒）。
@@ -391,13 +493,33 @@ function ladThinkMs() {
 // 回合时限 20→10 秒、AI 延迟上限 16→9 秒之后，真人桌中位从 30 秒左右降到
 // 15~18 秒，35 秒的封顶就反过来成了瓶颈。改 ladTurnSec 或 LAD_DELAY 的时候
 // 都要回来重算这一条。
-const LAD_AI_TABLE_CAP_MS = 20000;
+//
+// 【2026-08-07 长考档拉到 15 秒后抬到 24 秒】实测一桌平均 5.0 步、均值
+// 3.65 秒/步 -> 假桌均值约 18.3 秒，20 秒的封顶会削掉相当一部分右尾，
+// 「步数多的桌确实更久」在那一段就消失了。24 秒留出余量，同时仍然压在
+// 真人桌（AI 长考 + 真人可能动用思考池）的中位附近，不至于反过来成为
+// 轮次屏障的瓶颈。
+const LAD_AI_TABLE_CAP_MS = 24000;
 
 // 一桌纯 AI 对局的「看起来打了多久」。按实际步数抽，所以步数多的桌确实更久。
-function ladFakeTableMs(steps) {
+//
+// stepsBySide 是 [side0 步数, side1 步数]，pIdxBySide 是这两侧的 pIdx ——
+// 【纯 AI 桌也要扣思考池】（你定的）一个 AI 整场约 35 桌，只在跟真人同桌时
+// 扣的话它整场只碰到真人约 5 次，池子几乎不动，玩家看到的那份 x/60 一整场
+// 都是满的。扣了才有机会看到对手池子见底。
+function ladFakeTableMs(room, pIdxBySide, stepsBySide) {
     let ms = 0;
-    for (let i = 0; i < Math.max(1, steps); i++) ms += ladThinkMs();
-    // 封顶也要跟着缩放，否则测试里 ladThinkMs 被压到 2% 而封顶还是 35 秒 ——
+    for (let si = 0; si < 2; si++) {
+        const pIdx = pIdxBySide[si];
+        const n = Math.max(0, stepsBySide[si] | 0);
+        for (let i = 0; i < n; i++) {
+            const d = ladThinkMs(ladBankLeft(room, pIdx));
+            ms += d;
+            ladBankSpend(room, pIdx, ladBankCost(d));
+        }
+    }
+    if (ms === 0) ms = ladThinkMs();      // 一步都没走（双方都冻结）也要有点时长
+    // 封顶也要跟着缩放，否则测试里 ladThinkMs 被压到 2% 而封顶还是 24 秒 ——
     // 那条封顶就永远不会触发，等于没测到
     return Math.min(ms, LAD_AI_TABLE_CAP_MS * CFG.ladThinkScale);
 }
@@ -615,12 +737,16 @@ function turnSecOf(room) {
     return CFG.turnSec;
 }
 
-// 挂机 / 掉线之后那个更短的回合时限（秒）。天梯单独一档（5 秒），
-// 别处沿用全局的 goneTurnSec（10 秒）。
+// 挂机 / 掉线之后那个更短的回合时限（秒）。别处沿用全局的 goneTurnSec
+// （10 秒）；天梯**不降速**，掉线和挂机的回合都是完整的 ladTurnSec。
 //
-// 【为什么要包一层】原来 armTurnTimerT 里两处直接写 `CFG.goneTurnSec || tsec`。
-// 天梯的正常回合压到 10 秒之后，那个表达式在天梯里等于「10 降到 10」——
-// 降速静默失效，而且没有任何报错。口径集中在这里，加模式时只改这一处。
+// 【天梯为什么不降速】（2026-08-07 你定的）正常回合已经压到 10 秒，
+// 再降到 5 秒对掉线的人太苛刻 —— 他可能只是网卡了一下，回来发现回合只剩
+// 一半。10 秒本来就够短，代价是 AI 掉线那 15~45 秒里同桌的人每回合等
+// 10 秒而不是 5 秒（一次掉线多等 5~15 秒）。
+//
+// ladGoneTurnSec 这个参数因此在天梯里不再起作用，保留它是为了能从命令行
+// 调回降速（写 --lad-gone-turn-sec 5 就恢复原来的行为）。
 //
 // 兜底 `|| tsec` 保留：goneTurnSec 被设成 0 时表示「不降速」，
 // 那就该退回这个房间的正常时限，而不是变成 0 秒立刻判过牌。
@@ -2322,6 +2448,25 @@ function pushStateT(room, extra) {
             // 打完的桌 turnDeadline 是上一手留下的旧值，别让客户端拿它倒计时
             turnLeft: (bt && !btDone && bt.turnDeadline)
                 ? Math.max(0, bt.turnDeadline - Date.now()) : 0,
+            // 思考池（天梯）。客户端据此在回合时限烧完后接着画「思考时间 x/y」。
+            //
+            // 【两边都发】玩家要能看到对手那份在掉（你定的）。镜像后自己
+            // 永远是 side 0，所以这里也按 [我, 对手] 的顺序发，和 v.b.sides
+            // 一致 —— 客户端不用再判方向。
+            //
+            // turn 是**当前行动方**这个回合可动用的量（另一方没在用池子）。
+            // 真人是 armTurnTimerT 算好的 bankTurnMs，AI 是它这一步计划里
+            // 真实要花的 cost —— 两边都存在 bt.bankTurnMs 上，口径一致。
+            bank: (room.mode === 'ladder' && bt && !btDone && meSide >= 0) ? {
+                left: [ladBankLeft(room, bt.pIdx[meSide]),
+                       ladBankLeft(room, bt.pIdx[1 - meSide])],
+                turn: bt.bankTurnMs || 0,
+                // 【单回合上限也要发】客户端给**非行动方**算「他轮到时能想
+                // 几秒」用的是 min(cap, 池子)，不能拿上面那个 turn ——
+                // turn 只属于当前行动方，画到另一侧就成了「对手的额度显示在
+                // 我这一行」。写死 15000 在客户端等于把常量抄了两份。
+                cap: LAD_BANK_TURN_MS,
+            } : undefined,
             // 超过 MAX_FUNC 被随机弃掉的那几张（多人模式不再手动挑牌）
             autoDiscarded: seat.autoDiscarded,
         }, extra || {}));
@@ -2592,7 +2737,8 @@ function startRound(room) {
             // 立刻公布的话另外 3 桌零耗时完成，而这 7 个 AI 全都有拟人延迟，
             // 「他们互相打是 0 秒」这个矛盾比 AI 秒出牌更刺眼。
             if (room.mode === 'ladder') {
-                let steps = 0;
+                // 按侧分开数：思考池是每个 AI 各自一份，扣费要扣到人头上
+                const stepsBySide = [0, 0];
                 const raw = D678.AI.step;
                 // 【冻结的一方要强制过牌】掉线 / 离开的 AI 在纯 AI 桌上也不能
                 // 正常打 —— 否则界面上是「这人显示离开，血却一点没掉、还赢了」，
@@ -2600,12 +2746,13 @@ function startRound(room) {
                 // 和它在真人桌上的行为一致（forceStand）。
                 const frozenA = aiFrozen(room, ia), frozenB = aiFrozen(room, ib);
                 D678.AI.step = function (b, si) {
-                    steps++;
                     // simulateMatch 里 pa 是 side 0、pb 是 side 1（new Battle(pa, pb)）
                     if ((si === 0 && frozenA) || (si === 1 && frozenB)) {
+                        // 冻结的一方不算「在思考」，不计步、不扣池子
                         b.act(si, 'stand');
                         return { side: si, action: 'stand', msg: '对方过牌' };
                     }
+                    stepsBySide[si]++;
                     return raw.call(this, b, si);
                 };
                 try {
@@ -2621,6 +2768,8 @@ function startRound(room) {
                     b: null, done: false, resolveId: 0, preFuncs: null,
                     isTie: false, turnTimer: null, turnDeadline: 0,
                     turnStartAt: 0, turnGoneDeadline: 0, aiTimer: null,
+                    turnHardDeadline: 0, bankTurnMs: 0, bankCharged: 0,
+                    aiPlan: null,
                     // 标记：这桌已经算完了，只是还没到公布时间
                     fakeAI: true,
                 };
@@ -2630,7 +2779,7 @@ function startRound(room) {
                     fake.done = true;
                     pushStateT(room);
                     checkRoundBarrier(room);
-                }, ladFakeTableMs(steps));
+                }, ladFakeTableMs(room, [ia, ib], stepsBySide));
                 return;
             }
             withRoom(room, () => { D678.simulateMatch(pa, pb); });
@@ -2650,6 +2799,11 @@ function startRound(room) {
             turnStartAt: 0,
             turnGoneDeadline: 0,
             aiTimer: null,
+            // 思考池（天梯）：硬截止 = turnDeadline + 本回合可动用的池子
+            turnHardDeadline: 0,
+            bankTurnMs: 0,
+            bankCharged: 0,
+            aiPlan: null,
         };
         withRoom(room, () => { bt.b = new D678.Battle(pa, pb, false); });
         room.battles.push(bt);
@@ -2690,8 +2844,11 @@ function armTurnTimerT(room, bt) {
     // 【掉线的 AI 要挂真计时器】下面的 AI 分支只写 turnDeadline 不 setTimeout
     // （怕和 AI 长考抢，详见那段注释）。但掉线的 AI 压根不会行动
     // （stepAIIfNeeded 直接 return），没有真计时器就永远卡在这个回合。
-    // 挂上之后它和真人掉线走完全同一条路：倒计时烧完 -> 判过牌 -> 挂 idled
-    // -> 下一个回合缩到 goneSecOf（天梯 5 秒）。
+    // 挂上之后它和真人掉线走完全同一条路：倒计时烧完 -> 判过牌。
+    //
+    // 【掉线不动用思考池】（你定的）掉线的人没在思考，池子留着给他回来用。
+    // 天梯下掉线和挂机的回合都是完整 tsec（10 秒），不再降速 —— goneSecOf
+    // 在天梯里返回的就是 tsec 本身，见那边的注释。
     if (isAI && aiFrozen(room, pIdx)) {
         const gsec = room.game.players[pIdx].aiIdled ? goneSecOf(room, tsec) : tsec;
         bt.turnDeadline = bt.turnStartAt + gsec * 1000;
@@ -2705,31 +2862,57 @@ function armTurnTimerT(room, bt) {
     // return，于是对方回合时 turnDeadline 停在 0、客户端拿到 turnLeft=0，
     // 倒计时整个不画 —— 玩家看着对面干等，不知道还要等多久，也不知道界面
     // 是不是卡住了。锦标赛下 AI 900ms 就走完，看不出来；天梯的拟人延迟
-    // 最长 16 秒，这个空白很明显。
+    // 最长 15 秒，这个空白很明显。
     //
     // 【为什么不挂真的计时器】AI 一定会在延迟到点后行动（stepAIIfNeeded），
-    // 挂一个超时计时器只会和它抢：万一 AI 的长考比 tsec 还长，会被自己判
-    // 超时判过牌。所以这里只写 deadline，不 setTimeout。
-    // 天梯下长考上限 9 秒、回合 10 秒，本来就留了余量，但这条不能靠那个余量
-    // ——ladTurnSec 是可以从命令行调小的。
-    // AI 提前走完时倒计时停在中途（比如显示 17 就跳到我的回合），
-    // 这和真人对手提前出牌是一样的观感。
+    // 挂一个超时计时器只会和它抢：AI 的长考现在**本来就可能比 tsec 长**
+    // （长考档上限 15 秒 > 回合 10 秒，超出部分吃思考池），挂计时器会把它
+    // 自己判超时。所以这里只写 deadline，不 setTimeout。
+    // AI 提前走完时倒计时停在中途，这和真人对手提前出牌是一样的观感。
+    //
+    // 【延迟要在这里就抽好】客户端画的思考池要和 AI 真实的思考时长一致。
+    // 原来是 stepAIIfNeeded 里才抽，那时 deadline 已经发出去了 —— 客户端
+    // 会按「可能用满 15 秒」推算池子，等 AI 只想了 12 秒就走完，下一帧池子
+    // 又跳回去一截。所以抽好存在 bt.aiPlan 上，stepAIIfNeeded 直接用。
+    // 【两侧的 deadline 口径必须一致】turnDeadline 一律只到「回合时限」为止，
+    // 超出的那一段走 turnHardDeadline。这样客户端两边用同一套算法画：
+    // 先正常倒数到 0，再接着画思考池。AI 这边如果把整段延迟塞进 turnDeadline，
+    // 玩家会看到对手的倒计时从 13 秒开始 —— 比自己的 10 秒还长，一眼假。
     if (isAI) {
-        bt.turnDeadline = bt.turnStartAt + tsec * 1000;
+        if (!bt.aiPlan) bt.aiPlan = ladAiPlan(room, pIdx);
+        const base = Math.min(bt.aiPlan.delay, tsec * 1000);
+        bt.turnDeadline = bt.turnStartAt + base;
+        bt.turnHardDeadline = bt.turnStartAt + bt.aiPlan.delay;
+        bt.bankTurnMs = bt.aiPlan.cost;
         return;
     }
 
-    // 挂机降速，和 1v1 的 armTurnTimer 同一套（详见那边的注释）：
-    // 判据是「上个回合被自动判过牌」，不是「此刻掉线」——
-    // 掉线那个回合仍然给满 tsec，烧完判过牌之后下一个回合才降下来
-    // （天梯 5 秒，别处 10 秒，见 goneSecOf）。
+    // 真人：回合时限 tsec，烧完之后还能动用思考池（天梯专属）。
+    //
+    // 【挂机 / 掉线不给池子】（你定的）掉线的人没在思考，池子留着给他回来用；
+    // 挂机（上个回合被判过牌）同样不给 —— 不然一个挂机的人每个回合都要
+    // 烧掉 10+15=25 秒，同轮另外三桌全在等他。挂机的人正常操作一次就
+    // 清掉 idled，池子立刻恢复可用。
+    //
+    // 天梯下 goneSecOf 返回的就是 tsec（10 秒，不降速，你定的），所以
+    // sec 这一行在天梯里恒等于 tsec；别处仍然是 10 秒降速那套。
     const short = !!(seat && seat.idled);
     const sec = short ? goneSecOf(room, tsec) : tsec;
 
+    const canBank = !short && !!(seat && seat.connected);
+    const bankTurn = canBank ? ladBankTurnMs(room, pIdx) : 0;
+
     bt.turnDeadline = bt.turnStartAt + sec * 1000;
+    // 真正判过牌的时刻。池子为 0 时和 turnDeadline 相同。
+    bt.turnHardDeadline = bt.turnDeadline + bankTurn;
+    bt.bankTurnMs = bankTurn;
 
     // 二选一的待选：窗口 = min(pick2Sec, 回合剩余)，超时随机选。
     // 跟 1v1 的 armTurnTimer 同一套语义，详见那边的注释。
+    //
+    // 【二选一不给动用思考池】窗口按 turnDeadline 算，不看 turnHardDeadline。
+    // 取 min 本来就是为了不让这张牌变成偷时间的手段，让它能额外多拿 15 秒
+    // 正好是反过来。
     if (bt.b.pending2) {
         const leftMs = bt.turnDeadline - now;
         const wait = Math.max(0, Math.min(CFG.pick2Sec * 1000, leftMs));
@@ -2747,8 +2930,12 @@ function armTurnTimerT(room, bt) {
     }
     bt.pick2Deadline = 0;
 
-    bt.turnTimer = setTimeout(() => forceStand(room, bt, short ? '挂机' : '超时'),
-        Math.max(0, bt.turnDeadline - now));
+    // 判过牌挂在硬截止上（回合时限 + 本回合可动用的池子）。
+    // 池子那一段烧完时要把它扣掉 —— 玩家确实用掉了那段时间。
+    bt.turnTimer = setTimeout(() => {
+        if (bt.bankTurnMs > 0) ladBankSpend(room, pIdx, bt.bankTurnMs);
+        forceStand(room, bt, short ? '挂机' : (bt.bankTurnMs > 0 ? '思考时间用尽' : '超时'));
+    }, Math.max(0, bt.turnHardDeadline - now));
 }
 
 function forceStand(room, bt, why) {
@@ -2786,14 +2973,24 @@ function stepAIIfNeeded(room, bt) {
     }
     if (aiFrozen(room, pIdx)) return;
 
-    // 天梯：拟人延迟（多数 1.8~5 秒，偶尔长考到 16 秒，每步都不一样）。
+    // 天梯：拟人延迟（多数 1~4 秒，偶尔长考到 15 秒，每步都不一样）。
+    // 超过回合时限的那一截吃思考池；池子空了长考档退到 9 秒（见 ladThinkMs）。
     // 锦标赛照旧固定 900ms —— 那是「让人看清对手做了什么」的节奏，
     // 不是为了拟人（你定的，两套模式各管一摊）。
-    const wait = (room.mode === 'ladder') ? ladThinkMs() : CFG.aiStepMs;
+    //
+    // 计划是 armTurnTimerT 抽好的（客户端的 deadline 用的是同一个数）。
+    // 万一没有（非天梯、或者被别的路径绕过），当场补一个。
+    if (!bt.aiPlan) bt.aiPlan = ladAiPlan(room, pIdx);
+    const plan = bt.aiPlan;
+    const wait = (room.mode === 'ladder') ? plan.delay : CFG.aiStepMs;
 
     bt.aiTimer = setTimeout(() => {
         if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
         const si = bt.b.turn;
+        // 【扣在真的想完之后】计划在 armTurnTimerT 里就抽好了，但那时还没
+        // 真的等 —— 对局中途被打断（平局重发、房间销毁）的话那一步没发生，
+        // 不该扣。扣在这里，口径是「想完了才付钱」。
+        if (plan.cost > 0) ladBankSpend(room, bt.pIdx[si], plan.cost);
         let ev = null;
         withRoom(room, () => { ev = D678.AI.step(bt.b, si); });
         if (ev && ev.msg) pushEventT(room, bt, si, ev.msg);
@@ -2801,7 +2998,11 @@ function stepAIIfNeeded(room, bt) {
         if (bt.b.result && bt.b.result.tie) { resolveTable(room, bt, true); return; }
         if (bt.b.finished) { resolveTable(room, bt, false); return; }
 
-        if (bt.b.turn !== si) { bt.turnStartAt = 0; bt.turnGoneDeadline = 0; }
+        // 换人（或同一人接着走）都要重抽下一步的计划
+        bt.aiPlan = null;
+        if (bt.b.turn !== si) {
+            bt.turnStartAt = 0; bt.turnGoneDeadline = 0; bt.bankCharged = 0;
+        }
         armTurnTimerT(room, bt);
         pushStateT(room);
         stepAIIfNeeded(room, bt);
@@ -2880,13 +3081,37 @@ function applyActionT(room, bt, side, action, forced) {
 
     if (!ok) return { ok: false, err: err };
 
+    // 【思考池扣费】真人用掉的池子 = 从回合起点到此刻超出回合时限的那一截。
+    //
+    // 三个坑，所以口径写在这里而不是别处：
+    //   · 必须在动作**合法之后**扣 —— 上面 `if (!ok) return` 那条路回合没走完、
+    //     turnStartAt 不变，在它之前扣的话一次非法点击就白扣一笔。
+    //   · 必须在下面 turnStartAt 归零之前扣。
+    //   · 一个回合里可能有多个动作（功能牌 endTurn=false），所以记账用
+    //     bt.bankCharged 存「这个回合已经扣过多少」，每次只补差额。
+    //   · forced 不走这里 —— 超时判过牌时 armTurnTimerT 的计时器已经按整段
+    //     bankTurnMs 扣过了，再扣一次就是双倍。
+    if (!forced && actorT && bt.turnStartAt && bt.bankTurnMs > 0) {
+        const over = Date.now() - bt.turnStartAt - turnSecOf(room) * 1000;
+        const want = Math.max(0, Math.min(over, bt.bankTurnMs));
+        const delta = want - (bt.bankCharged || 0);
+        if (delta > 0) {
+            ladBankSpend(room, actorPIdx, delta);
+            bt.bankCharged = want;
+        }
+    }
+
     if (forced) msg = (msg || '') + '（超时）';
     pushEventT(room, bt, side, msg);
 
     if (b.result && b.result.tie) { resolveTable(room, bt, true); return { ok: true, fail: failNote }; }
     if (b.finished) { resolveTable(room, bt, false); return { ok: true, fail: failNote }; }
 
-    if (b.turn !== turnBefore) { bt.turnStartAt = 0; bt.turnGoneDeadline = 0; }
+    if (b.turn !== turnBefore) {
+        bt.turnStartAt = 0; bt.turnGoneDeadline = 0;
+        bt.aiPlan = null;               // 换人：下一步的拟人延迟要重抽
+        bt.bankCharged = 0;             // 思考池记账也跟着回合走
+    }
     armTurnTimerT(room, bt);
     pushStateT(room, repick ? { repick: repick } : null);
     stepAIIfNeeded(room, bt);
@@ -2929,6 +3154,8 @@ function resolveTable(room, bt, isTie) {
             });
             bt.turnStartAt = 0;
             bt.turnGoneDeadline = 0;
+            bt.aiPlan = null;           // 重发是新的一手，延迟重抽
+            bt.bankCharged = 0;
             armTurnTimerT(room, bt);
             pushStateT(room, { fresh: true, redealt: true, btId: bt.id });
             stepAIIfNeeded(room, bt);

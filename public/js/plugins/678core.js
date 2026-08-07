@@ -875,6 +875,18 @@ D678.cmpScore = function (x, y) {
     return 0;
 };
 
+// 平局加伤：翻倍制。第 1 次平 +1，第 2 次 +2，第 3 次 +4，之后 8 / 16 / 32…
+//
+// 【为什么收成一个函数】doResolve 和 AI.resolveUtil 各要算一次，原来两处
+// 分别写 `b.redeals || 0`。改成翻倍之后两处只要有一处漏改，AI 就会按错的
+// 伤害估值 —— 那种偏差不会报错，只表现为「AI 在平过几次之后打得莫名其妙」。
+//
+// n 是已经平过几次（redeals）。0 次平局不加伤。
+D678.tieBonusOf = function (n) {
+    n = n || 0;
+    return n <= 0 ? 0 : Math.pow(2, n - 1);
+};
+
 // 是否可以要牌（明牌合计 >= 21 不可要牌）。
 // 【注意这里始终看明牌合计，不受 规则暗牌 影响】它是「还能不能动」的闸门，
 // 也是整场对局的长度上限。
@@ -1404,21 +1416,26 @@ D678_Battle.prototype.doResolve = function () {
     // 例：此前已败 5 次，本局平过 2 次、对方满点、自己爆牌
     //     -> 1 + 2 + 5 + 1 + 1 = 10
     //
-    // 【平局加伤】每平一次，这一场的底伤 +1（你定的）：干净一局输是 -1，
-    // 平过一次再输就是 -2，以此类推。redeals 是本次拼点已经重发过几次，
-    // 也就是已经平了几次 —— 新 Battle 会归零，所以惩罚只在这一场里累积。
-    // 单机、1v1、锦标赛共用这一份规则，AI 的估值（AI.resolveUtil）也跟着加。
+    // 【平局加伤】翻倍制（你定的）：平 1 次 +1、2 次 +2、3 次 +4，之后 8/16/32…
+    // 干净一局输是 -1，平过一次再输是 -2，平过三次再输是 -5。
+    // redeals 是本次拼点已经重发过几次，也就是已经平了几次 —— 新 Battle 会
+    // 归零，所以惩罚只在这一场里累积。
+    // 单机、1v1、锦标赛、天梯共用这一份规则，AI 的估值（AI.resolveUtil）
+    // 也走同一个 D678.tieBonusOf。
     var items = 1;
     if (info.busts[lose]) items++;
     if (info.maxes[win]) items++;
-    var tieBonus = this.redeals || 0;
+    var tieBonus = D678.tieBonusOf(this.redeals);
     var dmg = items + L.losses + tieBonus;
     info.dmg = dmg;
     info.items = items;
     info.tieBonus = tieBonus;
     // 分出胜负这一帧也要显示平局次数（解释伤害是怎么来的）。
-    // 平局那一帧走上面的分支，两边都叫 tieCount，客户端一视同仁。
-    info.tieCount = tieBonus;
+    //
+    // 【这里发的是次数不是加伤】翻倍之后两者不再相等（平 3 次 = 加伤 4）。
+    // 客户端拿它画「平局✖N」，要的是次数；原来两者相等所以直接复用了
+    // tieBonus，现在必须分开。
+    info.tieCount = this.redeals || 0;
     info.prevLosses = L.losses;
 
     W.wins++;
@@ -1645,10 +1662,11 @@ D678.AI.resolveUtil = function (b, si, mt, ot) {
     }
     if (win === 0) return 0;                    // 平局重发，视为中性
     var meP = b.sides[si].p, opP = b.sides[1 - si].p;
-    // 平局加伤：本次拼点每平一次，底伤 +1（doResolve 里的 tieBonus）。
-    // 这里必须跟着加 —— 不加的话平过几次之后 AI 会低估赌注，
-    // 该保守的时候还在赌爆牌。
-    var tieBonus = b.redeals || 0;
+    // 平局加伤：翻倍制（doResolve 里的 tieBonus，同一个 D678.tieBonusOf）。
+    // 这里必须跟着算 —— 不算的话平过几次之后 AI 会低估赌注，
+    // 该保守的时候还在赌爆牌。翻倍之后这个偏差比原来的线性大得多：
+    // 平 3 次时真实加伤是 4，按 0 估值等于把一个 -5 的局面当成 -1。
+    var tieBonus = D678.tieBonusOf(b.redeals);
     var items, dmg, v;
     if (win > 0) {
         items = 1 + (bo ? 1 : 0) + (mm ? 1 : 0);
