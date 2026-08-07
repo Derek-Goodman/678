@@ -90,7 +90,19 @@ const CFG = {
 
     // 天梯的回合时限（秒）。比锦标赛的 30 秒短 —— 整场 33 轮，每轮省 10 秒
     // 就是省 5 分钟（你定的）。
-    ladTurnSec: Number(argOf('--lad-turn-sec', 20)),
+    //
+    // 【2026-08-07 从 20 秒压到 10 秒】配套把 AI 拟人延迟的上限从 16 秒压到
+    // 9 秒（见 LAD_DELAY）。这两个值是绑在一起的：AI 的长考上限必须留在回合
+    // 时限之内，否则玩家看着对手思考的时间就等于自己的全部限时。
+    ladTurnSec: Number(argOf('--lad-turn-sec', 10)),
+
+    // 天梯里「挂机过之后」的回合时限（秒）。
+    //
+    // 【为什么天梯要单独一个】全局的 goneTurnSec 是 10 秒，而天梯的正常回合
+    // 现在也是 10 秒 —— 共用的话降速这件事在天梯里等于没发生（10 降到 10）。
+    // 那条降速本来是为了「对手掉线时在线的人别干等」，天梯里 AI 掉线率 5%、
+    // 一局 33 轮，是最需要它的地方。所以天梯降到 5 秒（你定的）。
+    ladGoneTurnSec: Number(argOf('--lad-gone-turn-sec', 5)),
 
     // 天梯假匹配的总时长范围（毫秒）。计数从 1/8 走到 8/8 用掉这么久。
     //
@@ -331,20 +343,25 @@ function rollFillNames(need) {
 //=============================================================================
 //
 // 现在的锦标赛是固定 900ms 一步 —— 8 个人里 7 个以毫秒级精度轮流出手，
-// 一眼就是机器。天梯要「像真人在思考」：多数步 2~5 秒，偶尔长考十几秒，
+// 一眼就是机器。天梯要「像真人在思考」：多数步几秒，偶尔长考久一点，
 // 每步之间的间隔都不一样（你定的）。
 //
-// 【档位是实测反解出来的】整场 33 轮（HP=100 下淘汰 7 个人的数学后果），
-// 均值 4.8 秒/步时整场约 20~24 分钟。你选了这一档而不是压到 2.3 秒的那档 ——
-// 延迟太低就不像真人了。
+// 【2026-08-07 整体压到 1~9 秒】原来是 1.8~16 秒、均值 4.8 秒/步，整场
+// 20~24 分钟。回合时限同时从 20 秒压到 10 秒，16 秒的长考就越界了 ——
+// 长考上限必须留在回合时限之内（理由见下）。现在均值约 3.0 秒/步。
 //
-// 【长考上限 16 秒 vs 回合限时 20 秒】AI 想 16 秒是合法的：armTurnTimerT 对
-// AI 直接 return，不给它挂超时计时器，所以它不会把自己判超时。但玩家会看到
-// 对手思考的时间几乎等于自己的全部限时 —— 这是拟人感的代价，已跟你确认过。
+// 【三档的权重没动】72 / 21 / 7 是原来实测反解出来的形状：绝大多数步是
+// 「随手就出」，少数犹豫一下，偶尔卡住想很久。只把三档的区间按新上限压缩，
+// 分布的形状保持不变 —— 那个形状才是拟人感的来源，不是具体秒数。
+//
+// 【长考上限 9 秒 vs 回合限时 10 秒】AI 想 9 秒是合法的：armTurnTimerT 对
+// AI 直接 return，不给它挂超时计时器，所以它不会把自己判超时。留 1 秒余量是
+// 为了让「对手几乎用完了时间」仍然看得出是在思考而不是卡住。
+// 改 ladTurnSec 的时候记得回来看这一档。
 const LAD_DELAY = [
-    { w: 72, lo: 1800, hi: 5000  },   // 常规
-    { w: 21, lo: 5000, hi: 9000  },   // 稍慢
-    { w:  7, lo: 9000, hi: 16000 },   // 长考
+    { w: 72, lo: 1000, hi: 4000 },   // 常规
+    { w: 21, lo: 4000, hi: 6500 },   // 稍慢
+    { w:  7, lo: 6500, hi: 9000 },   // 长考
 ];
 const LAD_DELAY_TOT = LAD_DELAY.reduce((s, x) => s + x.w, 0);
 
@@ -367,9 +384,14 @@ function ladThinkMs() {
 // 7 个 AI 全都有拟人延迟、但他们互相打却是 0 秒完成 —— 这个矛盾比 AI 秒出牌
 // 更刺眼。所以天梯下纯 AI 桌照样立刻算出结果（保证正确），但**推迟公布**。
 //
-// 封顶是为了不让它们成为轮次屏障的瓶颈：真人那桌中位 30 秒左右，AI 桌封在
-// 35 秒以内就基本不会拖慢整场，而 busyTables 仍然是逐桌递减的。
-const LAD_AI_TABLE_CAP_MS = 35000;
+// 封顶是为了不让它们成为轮次屏障的瓶颈：AI 桌要封在「真人那桌的中位耗时」
+// 附近，否则轮次屏障等的就不再是真人而是这些假桌。
+//
+// 【2026-08-07 从 35 秒降到 20 秒】这个值是跟着真人桌的节奏定的，不是独立的。
+// 回合时限 20→10 秒、AI 延迟上限 16→9 秒之后，真人桌中位从 30 秒左右降到
+// 15~18 秒，35 秒的封顶就反过来成了瓶颈。改 ladTurnSec 或 LAD_DELAY 的时候
+// 都要回来重算这一条。
+const LAD_AI_TABLE_CAP_MS = 20000;
 
 // 一桌纯 AI 对局的「看起来打了多久」。按实际步数抽，所以步数多的桌确实更久。
 function ladFakeTableMs(steps) {
@@ -387,7 +409,7 @@ function ladFakeTableMs(steps) {
 // 天梯的整个前提是「让人以为在跟真人打」。8 个人打一整局没有一个掉线、没有
 // 一个中途走人，本身就是个破绽 —— 真人局里这两件事经常发生。所以给 AI 掷骰：
 //
-//   掉线  5%   30~45 秒随机，期间不能做任何动作，回合计时器照常烧完自动过牌，
+//   掉线  5%   15~45 秒随机，期间不能做任何动作，回合计时器照常烧完自动过牌，
 //              到点自己回来接着打
 //   离开  2%   再也不回来，一路自动过牌挨打到血空被淘汰
 //
@@ -406,7 +428,10 @@ function ladFakeTableMs(steps) {
 // 一行都不用改。
 const LAD_AI_GONE_P = 0.05;     // 每个 AI 每局掉线的概率
 const LAD_AI_LEFT_P = 0.02;     // 每个 AI 每局直接离开的概率
-const LAD_AI_GONE_MIN_MS = 30000;
+// 掉线时长的下界从 30 秒放宽到 15 秒（2026-08-07 你定的）。回合时限压到 10 秒
+// 之后，30 秒起步的掉线固定要烧掉 3 个以上回合，短掉线（「网卡了一下就回来」）
+// 这一档整个不存在。15 秒起就能出现「只错过一两个回合」的掉线。
+const LAD_AI_GONE_MIN_MS = 15000;
 const LAD_AI_GONE_MAX_MS = 45000;
 
 // 测试用的强制口：null = 按概率抽，'gone' / 'left' / 'ok' = 钉死。
@@ -583,11 +608,25 @@ function ladRollFill() {
 //
 // 【天梯必须在锦标赛之前判】天梯房的 mode 是 'ladder'，而它走的是整套
 // 锦标赛逻辑（startRound / checkRoundBarrier 那些函数都判 mode==='tourney'
-// 的地方要一并放行）。这里如果先判 tourney，天梯就会拿到 30 秒而不是 20 秒。
+// 的地方要一并放行）。这里如果先判 tourney，天梯就会拿到 30 秒而不是 10 秒。
 function turnSecOf(room) {
     if (room.mode === 'ladder') return CFG.turnSec ? CFG.ladTurnSec : 0;
     if (room.mode === 'tourney' && CFG.tourneyTurnSec) return CFG.tourneyTurnSec;
     return CFG.turnSec;
+}
+
+// 挂机 / 掉线之后那个更短的回合时限（秒）。天梯单独一档（5 秒），
+// 别处沿用全局的 goneTurnSec（10 秒）。
+//
+// 【为什么要包一层】原来 armTurnTimerT 里两处直接写 `CFG.goneTurnSec || tsec`。
+// 天梯的正常回合压到 10 秒之后，那个表达式在天梯里等于「10 降到 10」——
+// 降速静默失效，而且没有任何报错。口径集中在这里，加模式时只改这一处。
+//
+// 兜底 `|| tsec` 保留：goneTurnSec 被设成 0 时表示「不降速」，
+// 那就该退回这个房间的正常时限，而不是变成 0 秒立刻判过牌。
+function goneSecOf(room, tsec) {
+    if (room.mode === 'ladder') return CFG.ladGoneTurnSec || tsec;
+    return CFG.goneTurnSec || tsec;
 }
 
 // 这个房间是不是走 8 人赛事那套（锦标赛 + 天梯）。
@@ -1715,6 +1754,17 @@ function maskViewT(room, bt, seat, snapPre) {
             name: p.name, hp: p.hp, alive: p.alive,
             wins: p.wins, losses: p.losses, maxPoint: p.maxPoint,
             funcUses: p.funcUses,
+            // 【淘汰顺序，排名表按它排】少了这个字段客户端副本里所有死人的
+            // outAt 都是 0，rankedPlayers 的 `b.outAt - a.outAt` 对每一对死人
+            // 都返回 0 —— sort 是稳定的，于是死人区退化成 players 数组的原序，
+            // 也就是 viewOrder 给的 pIdx 升序。症状：已经淘汰的人名次会随着
+            // 后面有人被淘汰而变动，而且最早淘汰的可能排在后淘汰的上面
+            // （你报的）。服务器的最终排名和淘汰页是另一条路（直接读
+            // room.game，outAt 是真值），所以那两处一直是对的 —— 只有对局中
+            // 途看的那张排名表在骗人，这也是它能活到现在的原因。
+            //
+            // 不算信息泄漏：淘汰顺序是玩家每轮都看得见的公开信息。
+            outAt: p.outAt || 0,
             funcs: (pIdx === mePIdx) ? p.funcs.slice(0) : null,
             funcCount: p.funcs.length,
             // 客户端要靠这两个还原 AI 行为（超哥按超哥打）。
@@ -2641,9 +2691,9 @@ function armTurnTimerT(room, bt) {
     // （怕和 AI 长考抢，详见那段注释）。但掉线的 AI 压根不会行动
     // （stepAIIfNeeded 直接 return），没有真计时器就永远卡在这个回合。
     // 挂上之后它和真人掉线走完全同一条路：倒计时烧完 -> 判过牌 -> 挂 idled
-    // -> 下一个回合缩到 goneTurnSec。
+    // -> 下一个回合缩到 goneSecOf（天梯 5 秒）。
     if (isAI && aiFrozen(room, pIdx)) {
-        const gsec = room.game.players[pIdx].aiIdled ? (CFG.goneTurnSec || tsec) : tsec;
+        const gsec = room.game.players[pIdx].aiIdled ? goneSecOf(room, tsec) : tsec;
         bt.turnDeadline = bt.turnStartAt + gsec * 1000;
         bt.turnTimer = setTimeout(() => forceStand(room, bt, 'AI 掉线'),
             Math.max(0, bt.turnDeadline - now));
@@ -2660,6 +2710,8 @@ function armTurnTimerT(room, bt) {
     // 【为什么不挂真的计时器】AI 一定会在延迟到点后行动（stepAIIfNeeded），
     // 挂一个超时计时器只会和它抢：万一 AI 的长考比 tsec 还长，会被自己判
     // 超时判过牌。所以这里只写 deadline，不 setTimeout。
+    // 天梯下长考上限 9 秒、回合 10 秒，本来就留了余量，但这条不能靠那个余量
+    // ——ladTurnSec 是可以从命令行调小的。
     // AI 提前走完时倒计时停在中途（比如显示 17 就跳到我的回合），
     // 这和真人对手提前出牌是一样的观感。
     if (isAI) {
@@ -2669,9 +2721,10 @@ function armTurnTimerT(room, bt) {
 
     // 挂机降速，和 1v1 的 armTurnTimer 同一套（详见那边的注释）：
     // 判据是「上个回合被自动判过牌」，不是「此刻掉线」——
-    // 掉线那个回合仍然给满 tsec，烧完判过牌之后下一个回合才降到 10 秒。
+    // 掉线那个回合仍然给满 tsec，烧完判过牌之后下一个回合才降下来
+    // （天梯 5 秒，别处 10 秒，见 goneSecOf）。
     const short = !!(seat && seat.idled);
-    const sec = short ? (CFG.goneTurnSec || tsec) : tsec;
+    const sec = short ? goneSecOf(room, tsec) : tsec;
 
     bt.turnDeadline = bt.turnStartAt + sec * 1000;
 
@@ -2779,8 +2832,8 @@ function applyActionT(room, bt, side, action, forced) {
     const actorT = room.seats.find(s => s && s.pIdx === actorPIdx);
     if (actorT && !(forced && action.type === 'pick2')) actorT.idled = !!forced;
     // 掉线的 AI 没有座位，挂机标记记在 player 上 —— armTurnTimerT 靠它把
-    // 第二个回合起缩到 goneTurnSec，和真人掉线同一套（不缩的话 30~45 秒的
-    // 掉线只烧得掉一个回合，看着不像掉线像是在长考）
+    // 第二个回合起缩到 goneSecOf，和真人掉线同一套（不缩的话 15~45 秒的
+    // 掉线只烧得掉一两个回合，看着不像掉线像是在长考）
     if (!actorT && !(forced && action.type === 'pick2')) {
         const ap = room.game.players[actorPIdx];
         if (ap && !ap.isHuman) ap.aiIdled = !!forced;

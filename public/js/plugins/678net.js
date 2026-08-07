@@ -452,6 +452,10 @@ D678N.buildReplica = function (players, round, startHp) {
         p.losses   = info.losses;
         p.maxPoint = info.maxPoint;
         p.funcUses = info.funcUses || 0;
+        // 淘汰顺序。rankedPlayers 拿它给死人排名（越早淘汰名次越靠后），
+        // 漏了它死人区就按座位号排 —— 名次不锁死，最早淘汰的可能排在上面。
+        // 1v1 不发这个字段（两个人的排名表没意义），缺了得到 0，行为不变。
+        p.outAt = info.outAt || 0;
         // 自己的功能牌是真 id；对手只知道张数，用占位补齐长度
         // （drawOppName 只读 .length，不会去看内容）
         p.funcs = info.funcs ? info.funcs.slice(0) : new Array(info.funcCount).fill(null);
@@ -473,7 +477,11 @@ D678N.buildReplica = function (players, round, startHp) {
     });
     g.round    = round || 1;
     g.pool     = [];
-    g.outCount = 0;
+    // 已淘汰人数 = 最大的 outAt。原来钉死 0，和上面抄下来的 outAt 对不上；
+    // 客户端不会自己淘汰人（服务器权威），但让这两个值自洽比留个矛盾好。
+    g.outCount = g.players.reduce(function (m, p) {
+        return Math.max(m, p.outAt || 0);
+    }, 0);
     g.finished = false;
     g.result   = null;
     if (startHp) D678.START_HP = startHp;   // 血条分母
@@ -1162,26 +1170,40 @@ Scene_D678Net.prototype.drawLadReady = function () {
     this.txt('账号 ' + (lad.acc || ''), px + 24, 384, BTN_W - 48, 20,
              LC.gray, 'left');
 
-    // 段位 + 天梯分（你定的：开启排位界面也要显示）。
-    // 这两个值跟着 /api/lad/me 和结算回来的数据走，见 D678N.setLadFrom。
+    // 段位 + 天梯分 + 战绩（你定的：开启排位界面也要显示）。
+    // 这些值跟着 /api/lad/me 和结算回来的数据走，见 D678N.setLadFrom。
+    //
+    // 【两行，不是一行】原来四样东西挤在一个 58 高的面板里、共用一条基线：
+    // 段位画在 px+20 起宽 110，分数画在 px+130 起宽 120，而战绩那行是
+    // **右对齐画在 px+20 起宽 380 的框里** —— 那个框整个盖住了前两个。
+    // 右对齐的字从右边往左长，场次 / 均排名 / 冠军三样都有的时候左边缘会伸到
+    // 分数上面去，于是「分」和场次糊在一起（你报的字叠在一起）。
+    // 现在第一行只放段位 + 分数，战绩单独一行，两行都左对齐、各自占满宽度，
+    // 谁变长都不会再撞。
     var sy = 410;
-    this.panel(px, sy, BTN_W, 58);
+    var PH = 92;                        // 两行：14 起段位，56 起战绩
+    this.panel(px, sy, BTN_W, PH);
     var tier = lad.tier || '—';
-    this.txt(tier, px + 20, sy + 16, 110, 28, TIER_COL[tier] || LC.text, 'left');
+    this.txt(tier, px + 20, sy + 14, 110, 28, TIER_COL[tier] || LC.text, 'left');
     this.txt(lad.score == null ? '' : (lad.score + ' 分'),
-             px + 130, sy + 18, 120, 24, LC.gold, 'left');
-    // 场次和平均排名一起摆出来 —— 分数是抽象数字，均排名才是能自我对照的
-    var sub = [];
-    if (lad.games) sub.push(lad.games + ' 场');
-    if (lad.avgRank != null) sub.push('均 ' + Number(lad.avgRank).toFixed(1) + ' 名');
-    if (lad.champs) sub.push(lad.champs + ' 冠');
-    this.txt(sub.join(' · '), px + 20, sy + 18, BTN_W - 40, 20, LC.gray, 'right');
+             px + 136, sy + 16, 140, 24, LC.gold, 'left');
+    // 【总是画全四样】原来 `if (lad.games)` 这种写法在 0 场 / 0 冠时整项消失，
+    // 新账号只看得到段位和分数。你要的是四样都显示，所以 0 也画出来 ——
+    // 「0 冠」本身就是信息。平均排名没打过时没有意义，那一项显示 '—'。
+    var sub = [
+        '总场次 ' + (lad.games || 0),
+        '均排名 ' + (lad.avgRank == null ? '—' : Number(lad.avgRank).toFixed(1)),
+        '冠军 ' + (lad.champs || 0),
+    ].join('　·　');
+    this.txt(sub, px + 20, sy + 56, BTN_W - 40, 20, LC.gray, 'left');
 
-    this.drawRankBtn(sy + 74, true);
-    this.drawBoardBtn(sy + 74 + BTN_H + 16);
+    // 面板下方留 16 —— 和原来 58 高时的间距一致
+    var ry = sy + PH + 16;
+    this.drawRankBtn(ry, true);
+    this.drawBoardBtn(ry + BTN_H + 16);
 
     var bw = 200, bh = 54;
-    var bx = px + BTN_W - bw, by = sy + 74 + BTN_H + 16 + 62 + 16;
+    var bx = px + BTN_W - bw, by = ry + BTN_H + 16 + 62 + 16;
     var press = (this._press === 110);
     drawBtn(this._bmp, bx, by, bw, bh, press, press);
     this._bmp.fontSize = 22;
