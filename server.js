@@ -1010,7 +1010,7 @@ const LAD_BASE   = 1000;   // 新号起始分
 const LAD_FLOOR  = 500;    // 分数地板。掉穿是纯挫败，没有信息量
 const LAD_SCALE  = 400;    // Elo 尺度。放大 -> 榜的跨度变大
 const LAD_MINGAMES = 10;   // 上榜门槛（累计场次）
-const LAD_BOARD_N  = 100;  // 榜显示前多少名
+const LAD_BOARD_N  = 50;   // 榜显示前多少名（AI 名单 46 个，目标规模 40~50）
 
 // K 值。定级期给大的（10 局就能落到大致正确的位置，不用爬几十局），
 // 高分区收紧（榜首不会天天换）。
@@ -1127,6 +1127,18 @@ function ladConv(base) {
 // 【基准区间 720~1280 是反推出来的】要让收敛中位落在 998 ≈ 真人的 1000 起点。
 // 原来用 880~1380，收敛中位 1117 —— 于是平均名次 4.5（纯随机水平）的真人会
 // 收敛到 1156 分，白拿 156 分还直接进「高手」。
+//
+// 【start 一律是 1000，不是收敛分】base 只决定这个 AI **打得多好**（喂给
+// ladRollRank 的目标名次），不再直接当分数发下去。
+//
+// 原来 start = ladConv(base)，等于每个 AI 开局就白拿一个 766~1302 的分。
+// 配 400~800 场时还自洽，但场次夹到 LAD_LAUNCH 之后只剩个位数 —— 于是出现
+// 「5 场 1302 分、均名次 1.2」这种行：比该场次全胜的上限（1218）还高 84 分，
+// 真人怎么打都到不了。实测 115 行里有 5 行数学上不可能，你一眼看出来的就是它。
+//
+// 现在所有人从 1000 出发，靠重放一局一局爬。强弱照样分得开（base 决定名次
+// 分布，分数跟着名次走），代价是上线头几天榜挤在 1000 附近 —— 那是对的，
+// 因为天梯就是刚开。
 function ladPersona(name, seedKey) {
     const core = 720 + Math.floor(ladFrac(name + '#b') * 561);          // 720~1280
     const wob  = Math.round((ladFrac(name + '#w' + seedKey) - 0.5) * 140);
@@ -1134,7 +1146,7 @@ function ladPersona(name, seedKey) {
     // 名义 rate。下面的作息筛会拒掉约 60%（LAD_HOURS 的平均值 ~0.40），
     // 所以要先除回去，实际落地才是 3~14 局/天。
     const rate = (3 + ladFrac(name + '#r' + seedKey) * 11) / 0.40;
-    return { base: base, core: core, start: ladConv(base), rate: rate,
+    return { base: base, core: core, start: LAD_BASE, rate: rate,
              phase: ladFrac(name + '#p' + seedKey) };
 }
 
@@ -1181,12 +1193,12 @@ function ladRollRank(name, p, k, seedKey) {
 // 一路重放到今天，于是 AI 的场次累到了 400~800 场。天梯 2026-08-06 才真的
 // 开放，「刚上线就有人打了 700 局」一眼假（你报的）。
 //
-// 【为什么不用清零】分数不需要时间累积（ladConv 算出来的收敛值），所以就算
-// 场次只有个位数，榜上照样是 760~1300 散开的、有强弱层次。要的正是这个：
-// 榜看着是活的，但没人有夸张的场次。
+// 【分数也从这条线起算】以前这里写的是「分数不需要时间累积」—— 那时 start 是
+// 收敛分，个位数场次也能挂 1300。现在 start 一律 1000（见 ladPersona），
+// 分数和场次同一条时间线：场次少就意味着分还没爬开，两个数字互相对得上。
 //
 // 【往后不用再动】重放是 f(名字, 时刻)，场次自己跟着真实时间长：上线第 1 天
-// 中位 9 场，第 2 天 19 场，第 7 天 67 场。
+// 中位 9 场，第 2 天 19 场，第 7 天 67 场。分数跟着一起慢慢散开。
 const LAD_LAUNCH = Date.UTC(2026, 7, 6) / 1000 - LAD_TZ;   // 北京 2026-08-06
 
 // 单个赛季内的重放。返回 {score, games, rankSum, champs}。
@@ -1389,13 +1401,15 @@ function ladBoard() {
     if (ladBoardCache && now - ladBoardAt < LAD_BOARD_TTL) return ladBoardCache;
     const t = nowSec();
     const rows = [];
-    // AI。**一场没打的不进榜**（你定的）——「0 场 / 0 冠军 / 均名次 —」这种行
-    // 摆在榜上一眼假。所以榜是跟着上线时间自己长满的：上线头几个小时只有
-    // 十几行，一天后 100 行满。不套真人那道 10 场门槛（LAD_MINGAMES），
-    // 那是「定级中不上榜」的规则，AI 没有定级这回事。
+    // AI。**和真人同一道 10 场门槛**（你定的）。不满 10 场的 AI 就是「定级中」，
+    // 不进榜 —— 榜上每一行都是打够 10 场的，跟真人一个口径。
+    //
+    // 原来是 games > 0 就进榜，理由是「AI 没有定级这回事」。但那会让榜上出现
+    // 3 场就挂高分的行，而真人打满 10 场定级完才 1000 出头 —— 两套尺子。
+    // 所以现在 AI 也得爬过 10 场，榜是跟着时间自己长满的。
     for (const nm of D678.LAD_AI_NAMES) {
         const st = ladAiState(nm, t);
-        if (st.games > 0) rows.push(st);
+        if (st.games >= LAD_MINGAMES) rows.push(st);
     }
     // 真人。门槛按**累计**场次算 —— 按赛季场次算的话月初全体「定级中」，
     // 榜会空掉好几个小时。
@@ -2049,7 +2063,7 @@ let ladPlayCache = -1, ladPlayAt = 0;
 function ladAiPlayingCount() {
     const now = Date.now();
     // 30 秒缓存。这个数分钟级才有变化，而 /api/stats 是每 5 秒一次心跳 ——
-    // 不缓存的话每次心跳都要把 115 个 AI 的当季对局重放一遍。
+    // 不缓存的话每次心跳都要把整份 LAD_AI_NAMES 的当季对局重放一遍。
     if (ladPlayCache >= 0 && now - ladPlayAt < 30000) return ladPlayCache;
     const t = Math.floor(now / 1000);
     const sn = ladSeason(t);
