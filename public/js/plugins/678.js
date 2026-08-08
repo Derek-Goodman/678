@@ -42,17 +42,21 @@
  *
  *  【三张改判定方式的规则牌】胜负一律走 Battle.scoreOf + D678.cmpScore
  *  这一对函数（678core.js），不要在别处另写一份比较逻辑：
- *    · 规则牛牛   任意几张凑成 10 的倍数，余下的和的个位即成绩，越大越好
- *                （10 点为牛牛=满点；凑不出算无牛，成绩 0）。本规则下没有爆牌。
+ *    · 规则牛牛   恰好 3 或 4 张凑成 10 的倍数，余下的和的个位即成绩，越大越好
+ *                （10 点为牛牛=满点；凑不出算无牛，成绩 0；全部牌凑牛无剩余
+ *                 为有牛没点，成绩 0.5）。本规则下没有爆牌。
  *    · 规则比多   先比张数，多者胜；超过 21 点仍算爆牌；张数相同才比接近 21。
  *                注意这条打破了「满点必胜」——恰好 21 点也可能因张数少而输。
  *    · 规则暗牌   只有暗牌计入判定，明牌一律不算；仍以接近 21 点为目标。
  *
- *  伤害 = 1（底伤）+ 本场平局次数 + 败方累计败场数 + 败方爆牌 1 + 胜方满点 1
+ *  伤害 = 5（底伤）+ 败方爆牌 3 + 胜方满点 3 + 平局加伤 + 败场差加伤
  *
- *  【平局加伤】每平一次，这一场的底伤 +1：干净一局输是 -1，平过一次再输 -2，
- *  平两次 -3，以此类推。惩罚只在这一场（同一次拼点）里累积，新的一场归零。
+ *  【平局加伤】翻倍制：平 1 次 +1、2 次 +2、3 次 +4，之后 8/16/32…
+ *  惩罚只在这一场（同一次拼点）里累积，新的一场归零。
  *  拼点画面显示「平局✖N」。单机、1v1、锦标赛共用这一份规则。
+ *
+ *  【败场差加伤】comeback 机制：胜者败场比败者多时，差额计入额外伤害，
+ *  不设上限。落后者赢了才加伤，领先者赢了不多打。
  *
  * ============================================================================
  * 功能牌的发放与弃牌
@@ -96,6 +100,8 @@
  *  swap return rob pickback
  *  rule18 rule24 rule+1 rule-1 rule21 check
  *  repick reback picksmall
+ *  pickbig +1 -1 copy 2pick1
+ *  rulenull helppick mirror destroy
  * ============================================================================
  */
 
@@ -243,6 +249,7 @@ Scene_D678.prototype.create = function () {
     this._shake      = 0;    // 剩余震屏帧数
     this._shakePow   = 0;    // 震屏幅度（像素）
     this._fxQueue    = [];   // 延时触发的特效 [{t:剩余帧, fn:回调}]
+    this._prevRule   = null; // 上一帧的规则牌 ID，用来检测变化触发切换动画
     this.createBackground();
     this.createLayers();
     this.preloadImages();
@@ -332,9 +339,9 @@ Scene_D678.prototype.box = function (bmp, x, y, w, h, fill, stroke, r) {
 
 Scene_D678.prototype.totalString = function (b, si, revealAll) {
     var cards = b.sides[si].cards;
-    var parts = [], base = 0, visible = 0;
+    var parts = [], base = 0, visible = 0, allVisible = true;
     for (var i = 0; i < cards.length; i++) {
-        if (cards[i].hidden && !revealAll) { parts.push('?'); }
+        if (cards[i].hidden && !revealAll) { parts.push('?'); allVisible = false; }
         else {
             // 虚空数字写成 (+1) / (-1) / (7)，见 D678.cardFaceStr ——
             // 直接拼数值会得到「7+-1」和看着像 bug 的「7+7」。
@@ -348,10 +355,18 @@ Scene_D678.prototype.totalString = function (b, si, revealAll) {
     var s = parts.join('+') + '=' + base;
     var m = b.mod();
     if (m !== 0) {
-        // 修正量按“手上所有牌”算，含看不见的暗牌 —— 只数明牌会少算，
+        // 修正量按”手上所有牌”算，含看不见的暗牌 —— 只数明牌会少算，
         // 例如对方 ?(6)+7+11 在 rule-1 下应显示 18-3 而不是 18-2。
         var d = m * cards.length;
         s += (d >= 0 ? '+' : '-') + Math.abs(d);
+    }
+    // 牛牛规则下，全部牌可见且≥3张时，公式后追加牛的结果
+    if (b.isCowRule() && allVisible && cards.length >= D678.COW_MIN_CARDS) {
+        var sc = b.scoreOf(si);
+        if (sc.cow === 0)         s += '（无牛）';
+        else if (sc.cow === 0.5)  s += '（有牛没点）';
+        else if (sc.cow === 10)   s += '（牛牛）';
+        else                      s += '（牛' + sc.cow + '）';
     }
     return s;
 };
@@ -517,9 +532,7 @@ Scene_D678.prototype.drawHpBar = function () {
     this.box(bmp, x, y, w, 18, 'rgba(255,255,255,0.15)', null, 6);
     if (ratio > 0) this.box(bmp, x, y, Math.floor(w * ratio), 18,
         ratio > 0.4 ? '#4be08a' : '#ff6b6b', null, 6);
-    // HP 后面挂上「此刻输一局至少掉多少血」（底伤 + 累计败场）——
-    // 败场越多这个数越大，玩家该知道自己现在输一局有多贵
-    this.txt(bmp, 'HP ' + me.showHp() + '（-' + me.lossPenalty() + '）',
+    this.txt(bmp, 'HP ' + me.showHp(),
         x + w + 12, 20, 180, 24, COL.gold);
     this.txt(bmp, this._showList ? '▲ 收起' : '▼ 排名', 590, 22, 110, 22, COL.blue);
     this._hits.push({ x: 12, y: 10, w: 696, h: 56, cb: this.onToggleList.bind(this) });
@@ -534,7 +547,7 @@ Scene_D678.prototype.drawBattle = function (b) {
     var bmp = this._uiBmp;
     var opp = b.players[1];
     this.drawOppName(opp);
-    this.txt(bmp, 'HP ' + opp.showHp() + '（-' + opp.lossPenalty() + '）',
+    this.txt(bmp, 'HP ' + opp.showHp(),
         0, 130, LY.SW, 20, COL.gray, 'center');
 
     // 对方点数
@@ -542,6 +555,15 @@ Scene_D678.prototype.drawBattle = function (b) {
         b.revealed ? COL.gold : COL.white, 'center');
     // 我方点数
     this.txt(bmp, this.totalString(b, 0, true), 0, 610, LY.SW, 30, COL.white, 'center');
+    // 满点金框：玩家方满点时把所有牌一起框住
+    if (b.sides[0].cards.length > 0 && b.scoreOf(0).max) {
+        var cn = b.sides[0].cards.length;
+        var cspan = Math.min(LY.CARD_W + 12, Math.floor(660 / Math.max(cn, 1)));
+        var ctw = cspan * (cn - 1) + LY.CARD_W;
+        var csx = Math.floor((LY.SW - ctw) / 2);
+        this.box(bmp, csx - 6, LY.MY_CARD_Y - 6, ctw + 12, LY.CARD_H + 12,
+            null, COL.gold, 10);
+    }
     // 底牌标记
     this.txt(bmp, '（左起第一张为底牌）', 0, 812, LY.SW, 16, COL.gray, 'center');
 
@@ -603,7 +625,14 @@ Scene_D678.prototype.drawRuleCard = function (b) {
     var bmp = this._uiBmp;
     var x = LY.RULE_X, y = LY.RULE_Y;
     var w = LY.RULE_W, h = Math.round(w * D678.CARD_H / D678.CARD_W);
+    var prevRule = this._prevRule;
+    this._prevRule = b.rule;
     this.syncRuleSprite(b.rule, x, y, w);
+    // 规则牌变化时播放切换动画（在 syncRuleSprite 之后调用，这样常驻精灵
+    // 已经换好新图，动画只需隐藏它、用临时精灵演入场/退场）
+    if (b.rule !== prevRule) {
+        this.ruleCardFx(prevRule, b.rule);
+    }
     if (!b.rule) return;          // 没有规则牌就空着，不画占位框
     // 卡图由精灵绘制，这里只描边 + 在下方标名字
     this.box(bmp, x - 3, y - 3, w + 6, h + 6, null, COL.purple, 7);
@@ -644,7 +673,7 @@ Scene_D678.prototype.drawRuleInfo = function () {
 // 照着写会直接骗玩家（牛牛下会写成「目标 21 点」）。
 Scene_D678.prototype.ruleGoalString = function (b) {
     if (b.isCowRule()) {
-        return '凑十取余，点数越大越好（10 点为牛牛）；每人最多 ' +
+        return '3 或 4 张凑十取余，点数越大越好（10 为牛牛）；每人最多 ' +
                D678.COW_MAX_CARDS + ' 张牌';
     }
     // 牛牛占着规则位但已失效（有人超张数）—— 不能只写「目标 21 点」，
@@ -674,6 +703,90 @@ Scene_D678.prototype.syncRuleSprite = function (id, x, y, w) {
     sp.visible = true;
 };
 
+// 规则牌切换动画：新牌从右侧滑入，有旧牌则碰撞撞飞。
+//
+// 【为什么用临时精灵而不是直接动 _ruleSprite】_ruleSprite 是常驻的，
+// addFx 会在动画结束时把精灵从层里移除 —— 直接拿它演会被销毁。
+// 所以走两条路：临时精灵演入场/退场，_ruleSprite 先藏起来、动画完了再显示。
+//
+// 【_ruleFxId 防竞态】连打两张规则牌时第一段动画还没完第二段就来了。
+// laterFx 的回调只认最新一次的 ID，旧回调即使触发也不会抢先显示精灵。
+Scene_D678.prototype.ruleCardFx = function (oldId, newId) {
+    var x = LY.RULE_X, y = LY.RULE_Y;
+    var w = LY.RULE_W;
+    var scale = w / D678.CARD_W;
+    var h = Math.round(w * D678.CARD_H / D678.CARD_W);
+    var self = this;
+
+    if (this._ruleSprite) this._ruleSprite.visible = false;
+    this._ruleFxId = (this._ruleFxId || 0) + 1;
+    var myId = this._ruleFxId;
+
+    // --- 旧牌飞出（向左旋转淡出）---
+    if (oldId) {
+        var oldF = D678.funcData(oldId);
+        if (oldF) {
+            var oldSp = new Sprite(ImageManager.loadPicture(oldF.img));
+            oldSp.scale.x = oldSp.scale.y = scale;
+            oldSp.x = x; oldSp.y = y;
+            this.addFx(oldSp, 25, function (s, r) {
+                s.x = x - r * 420;
+                s.y = y - r * 60;
+                s.rotation = -r * 0.7;
+                s.opacity = 255 * (1 - r * r);
+            });
+        }
+    }
+
+    // --- 新牌从右侧滑入 ---
+    if (!newId) return;   // 规则被清除，只播退场
+    var newF = D678.funcData(newId);
+    if (!newF) return;
+
+    var newSp = new Sprite(ImageManager.loadPicture(newF.img));
+    newSp.scale.x = newSp.scale.y = scale;
+    var startX = LY.SW + 20;
+    newSp.x = startX; newSp.y = y;
+    var hasOld = !!oldId;
+    var enterDur = hasOld ? 18 : 25;   // 有碰撞时入场更快
+
+    this.addFx(newSp, enterDur + 10, function (s, r, tick) {
+        if (tick <= enterDur) {
+            // ease-out：先快后慢
+            var er = tick / enterDur;
+            var e = 1 - (1 - er) * (1 - er);
+            s.x = startX + (x - startX) * e;
+            s.y = y;
+            // 碰撞瞬间：局部闪白 + 轻震屏
+            if (hasOld && tick === enterDur) {
+                var fb = new Bitmap(w + 50, h + 50);
+                fb.fillRect(0, 0, w + 50, h + 50, '#ffffff');
+                var flash = new Sprite(fb);
+                flash.anchor.x = flash.anchor.y = 0.5;
+                flash.x = x + w / 2; flash.y = y + h / 2;
+                flash.blendMode = 1;          // 加色混合
+                self.addFx(flash, 6, function (f, fr) {
+                    f.opacity = 200 * (1 - fr * fr);
+                });
+                self.shake(5, 3);
+            }
+        } else {
+            // 弹性回弹：撞到位后轻微压拉
+            var br = (tick - enterDur) / 10;
+            var bounce = Math.sin(br * Math.PI);
+            s.scale.x = scale * (1 + bounce * 0.15);
+            s.scale.y = scale * (1 - bounce * 0.08);
+        }
+    });
+
+    // 动画结束后显示常驻精灵（只认最新一次的 ID）
+    this.laterFx(enterDur + 10, function () {
+        if (myId === this._ruleFxId && this._ruleSprite) {
+            this._ruleSprite.visible = true;
+        }
+    });
+};
+
 // 未见的牌逐张绘制：
 //   能凑成满点的那张 -> 红色
 //   抽到后不会爆牌   -> 金色
@@ -692,7 +805,7 @@ Scene_D678.prototype.unseenTone = function (b, v) {
     var rc = b.isCowRule()
         ? D678.cowReachAdd(D678.cowReach(b.scoreVals(0)), dv) : null;
     var s = D678.AI.scoreFromTotal(b, 0, t, b.countCards(0, false) + 1,
-        rc ? rc[0] : undefined);
+        rc);
     if (s.max) return 'max';
     return D678.cmpScore(s, curS) > 0 ? 'good' : 'bad';
 };
@@ -1008,7 +1121,7 @@ Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y, r, si) {
     // doResolve 把成绩放在 r.cows 里带出来（联机走同一份 result，无需另配）。
     if (r && r.cows) {
         var cow = r.cows[si];
-        s = (cow === 0) ? '无牛' : (cow === 10 ? '牛牛' : '牛' + cow);
+        s = (cow === 0) ? '无牛' : (cow === 0.5 ? '有牛没点' : (cow === 10 ? '牛牛' : '牛' + cow));
         if (cow === 0) col = COL.gray;
         tag = '';                        // 「牛牛」本身已经说明是满点
     } else if (r && r.cardCounts) {
@@ -2273,10 +2386,10 @@ Scene_D678.prototype.tutCardRect = function (si, from, to) {
 D678.TUT_STEPS = [
     { box: 'hp', lines: [
         '这是玩家的生命值，如果生命值降为 0 游戏将会失败',
-        '对局失败了会 -1 生命值，如果爆牌会额外 -1 生命值'] },
+        '对局失败了会 -5 生命值，如果爆牌会额外 -3 生命值'] },
     { box: 'hp', lines: [
-        '对方满点胜利，也会额外 -1 生命值',
-        '每次对局失败都会累计 -1 生命值'] },
+        '对方满点胜利，也会额外 -3 生命值',
+        '败数多的一方赢了败数少的会额外扣除对方生命值'] },
     { box: 'rank', lines: ['点击此处打开目前排名情况'] },
     { box: null, openRank: true, lines: [
         '这是 ' + '{N}' + ' 位玩家的排名情况，记得点开查看'] },
@@ -2347,7 +2460,8 @@ D678.TUT_STEPS = [
         '双方连续过牌两次，此时将会揭开双方底牌'] },
     { box: null, lines: [
         '对方 21 点，我方也是 21 点',
-        '那么这局就是平局处理，需要重新对局'] },
+        '那么这局就是平局处理，需要重新对局',
+        '第一次平局会额外扣1生命，再次平局就会翻倍'] },
     { box: null, lines: [
         '游戏除了普通数字牌外，还会有不同的功能牌',
         '通过游戏过程了解具体使用方式和功能'] },

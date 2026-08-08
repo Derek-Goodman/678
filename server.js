@@ -1727,7 +1727,7 @@ function viewOrder(playerN, mePIdx, oppPIdx) {
 // 挂的是标量（双方对称）就加进 SCALARS。
 const RESULT_SIDE_ARRAYS = ['totals', 'busts', 'maxes', 'cows', 'cardCounts'];
 const RESULT_SCALARS     = ['tie', 'dmg', 'items', 'target',
-                            'tieCount', 'tieBonus', 'prevLosses'];
+                            'tieCount', 'tieBonus', 'comeback'];
 
 // meSide 是「我」在这桌的 side（0/1）。返回的视图里我恒为下标 0。
 // winnerP / loserP 是 Player 对象引用，绝不能直接发（会把对方全部字段带出去），
@@ -3265,7 +3265,10 @@ function checkRoundBarrier(room) {
         });
 
         const aliveN = room.game.players.filter(p => p.alive).length;
-        const humansLeft = room.seats.filter(s => s && !s.left && s.connected).length;
+        // 【掉线 ≠ 离开】只看 left 不看 connected —— 单人天梯掉线时游戏要继续
+        // 推进（AI 照打、掉线的人超时自动过牌），等他重连回来接着打。
+        // graceTimer 到点才置 left=true，那之后这里 humansLeft 才会归零。
+        const humansLeft = room.seats.filter(s => s && !s.left).length;
         if (aliveN <= 1 || humansLeft === 0) { enterOverT(room); return; }
         startRound(room);
     }, CFG.advanceMs);

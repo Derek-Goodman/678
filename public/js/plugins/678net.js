@@ -1246,6 +1246,23 @@ Scene_D678Net.prototype.drawBoardBtn = function (y) {
                       cb: this.onBoard.bind(this) });
 };
 
+// 「功能牌图鉴」。和排行榜按钮同宽同高，放在它下方。
+Scene_D678Net.prototype.drawCodexBtn = function (y) {
+    var W = Graphics.width;
+    var x = Math.round(W / 2 - BTN_W / 2);
+    var press = (this._press === 122);
+    var h = 62;
+    drawBtn(this._bmp, x, y, BTN_W, h, press, press);
+    this._bmp.fontSize = 26;
+    this._bmp.textColor = press ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('功能牌图鉴', x, y + (h - 32) / 2 + (press ? 2 : 0),
+                       BTN_W, 32, 'center');
+    this._hits.push({ x: x, y: y, w: BTN_W, h: h, i: 122,
+                      cb: this.onCodex.bind(this) });
+};
+
 // 「开启排位」。lit = 亮着（登录且有名字）。没登录也画，只是点不动 ——
 // 看不见的按钮等于没告诉玩家「登录之后有东西」。
 Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
@@ -1485,9 +1502,12 @@ Scene_D678Net.prototype.drawLadMatching = function (info) {
     // 排行榜按钮（你定的：等的时候有东西可看）
     this.drawBoardBtn(516);
 
+    // 功能牌图鉴按钮
+    this.drawCodexBtn(516 + 62 + 16);
+
     // 取消匹配
     var bw = 220, bh = 56;
-    var bx = Math.round(W / 2 - bw / 2), by = 516 + 62 + 20;
+    var bx = Math.round(W / 2 - bw / 2), by = 516 + 62 + 16 + 62 + 20;
     var press = (this._press === 130);
     drawBtn(this._bmp, bx, by, bw, bh, press, press);
     this._bmp.fontSize = 24;
@@ -2165,6 +2185,11 @@ Scene_D678Net.prototype.onRank = function () {
         self._page = 'waiting';
         self.refresh();
     });
+};
+
+// 功能牌图鉴。直接推场景，不需要网络请求。
+Scene_D678Net.prototype.onCodex = function () {
+    SceneManager.push(Scene_FuncCodex);
 };
 
 // 排行榜。不要求登录 —— 匹配中也能看（你定的：等的时候有东西可做）。

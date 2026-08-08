@@ -268,7 +268,7 @@ D678.FUNCS = [];
     // 「求和，比谁接近一个目标数」，这三张跳出了那个形状 ——
     // 见 D678_Battle.prototype.scoreOf 上方的长注释。
     D678.FUNCS.push({ id: 'rulecow', img: 'rulecow', name: '规则牛牛', kind: 'rule',
-        desc: '游戏规则改为牛牛，本规则没有爆牌限制。\n每位玩家最多 5 张数字牌（含底牌）。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+        desc: '3 或 4 张牌凑十取余，余数即成绩（10 为牛牛）。\n没有爆牌限制，每位玩家最多 5 张牌（含底牌）。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
     D678.FUNCS.push({ id: 'rulemore', img: 'rulemore', name: '规则比多', kind: 'rule',
         desc: '改为比牌的张数，多者获胜。\n超过 21 点仍算爆牌，张数相同才比谁近 21 点。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
     // 【这张的卡面被 4 行上限逼着把末尾两句并成一行】其它规则牌是
@@ -282,6 +282,24 @@ D678.FUNCS = [];
     // 所以它牵动的地方比别的牌多：回合计时、掉线兜底、平局重发的清理。
     D678.FUNCS.push({ id: '2pick1', img: '2pick1', name: '二选一', kind: 'pick2',
         desc: '一次性抽出两张数字牌，选一张放到自己场上（明牌），\n另一张塞入牌库底部。\n牌库只剩 1 张时直接抽那一张。\n抽牌后本回合结束。' });
+    // 【rulenull 用 kind:'rule'】走已有的 rule 分支，this.rule = 'rulenull' 后
+    // isCowRule / isMoreRule / isHiddenRule / isOver21Rule 全部返回 false，
+    // target() 回到 21、mod() 回到 0 —— 自然就是默认规则，不用额外写判定。
+    D678.FUNCS.push({ id: 'rulenull', img: 'rulenull', name: '规则标准21', kind: 'rule',
+        desc: '没有规则就是最好的规则。\n恢复默认的 21 点规则。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+    // helppick：往对方场上加一张牌库里最小的明牌，不消耗回合。
+    // 不进 GAIN_KINDS（加的是对方不是自己），牛牛上限在 useFunc 里单独挡对方。
+    D678.FUNCS.push({ id: 'helppick', img: 'helppick', name: '帮小抽', kind: 'helppick',
+        desc: '帮对方抽一张牌库里最小的数字牌\n（明牌）。\n不消耗回合。' });
+    // mirror：放在自己场上最新位置，动态复制对方同位置的明牌值。
+    // 是虚空数字牌（fake），进 GAIN_KINDS（算牛牛 5 张上限）。
+    // resolveMirror 在 scoreVals / endTurn / useFunc 末尾刷新，保证值始终同步。
+    D678.FUNCS.push({ id: 'mirror', img: 'mirror', name: '镜像复制', kind: 'mirror',
+        desc: '复制对方同位置的一张明牌\n（暗牌无法复制），\n变为虚空数字牌。\n打出后本回合结束。' });
+    // destroy：把对方最新的非底牌放到牌库最下方，不消耗回合。
+    // 明牌暗牌都能破坏，被破坏的是暗牌时不透露点数。
+    D678.FUNCS.push({ id: 'destroy', img: 'destroy', name: '破坏', kind: 'destroy',
+        desc: '将对方最新的一张牌\n放到牌库最下方（必须非底牌，\n不论明牌暗牌）。\n不消耗回合。' });
 })();
 
 D678.funcData = function (id) {
@@ -331,7 +349,11 @@ D678.copy = function (arr) { return arr.slice(0); };
 //   普通牌    -> 7
 D678.cardFaceStr = function (c) {
     if (!c) return '?';
-    if (c.fake) return '(' + (c.face || c.v) + ')';
+    if (c.fake) {
+        // 镜像没复制到牌时 face='mirror'，公式里显示 (0) 而不是 (mirror)
+        var fv = (c.face && c.face !== 'mirror') ? c.face : c.v;
+        return '(' + fv + ')';
+    }
     return String(c.v);
 };
 D678.remove = function (arr, v) {
@@ -399,13 +421,7 @@ D678_Player.prototype.rateText = function (v) {
 };
 // 界面上显示的 HP：伤害可能打穿 0，展示时一律截到 0，不露出负数
 D678_Player.prototype.showHp = function () { return Math.max(0, this.hp); };
-// 此刻输一局至少要掉多少血 = 底伤 1 + 累计败场数（见 doResolve 的伤害公式）。
-// HP 后面那个「（-N）」显示的就是它 —— 开局 -1，败满 10 场之后 -11。
-//
-// 【是下限不是全额】完整伤害还要加本局爆牌 / 对方满点 / 平局次数，
-// 那三项都只有打完才知道，所以这里只报「累计败场已经让底伤涨到多少」，
-// 也正是玩家在做决定时唯一能确定的那部分。
-D678_Player.prototype.lossPenalty = function () { return 1 + (this.losses || 0); };
+// 伤害不再含累计败场加罚，底伤固定 5；lossPenalty 已移除。
 D678_Player.prototype.loseHp = function (n) {
     this.hp -= n;
     if (this.hp <= 0 && this.alive) {
@@ -433,6 +449,7 @@ function D678_Game() {
     }
     this.pool      = D678.shuffle(D678.ALL_FUNC_IDS());  // 公共功能牌池
     this.pairedLog = {};   // "a-b" -> true 本轮循环内已交手
+    this._lastPairs = {};  // 上一轮的配对，防止循环重置后连续撞同一个对手
     this.round     = 0;
     this.outCount  = 0;    // 已淘汰人数，用于确定淘汰顺序
     this.finished  = false;
@@ -496,29 +513,47 @@ D678_Game.prototype.resetPairLog = function () { this.pairedLog = {}; };
 
 D678_Game.prototype.makeRound = function () {
     var alive = this.alivePlayers();
+    var lastPairs = this._lastPairs;   // 上一轮的配对，防止循环重置后连续撞同一个对手
     var best = null;
     for (var attempt = 0; attempt < 200; attempt++) {
         var pool = D678.shuffle(alive.slice(0));
-        var pairs = [], bye = null, repeats = 0;
+        var pairs = [], bye = null, repeats = 0, consecutives = 0;
         if (pool.length % 2 === 1) bye = pool.pop();
         while (pool.length >= 2) {
             var a = pool.shift();
-            var idx = -1;
+            // 三层偏好：
+            //   1. 最优：不在 pairedLog 里 且 不是上一轮的对手
+            //   2. 次选：不在 pairedLog 里（但可能是上一轮的对手）
+            //   3. 兜底：pairedLog 里的（循环重置，没法避免）
+            var idx = -1, idxOK = -1;
             for (var i = 0; i < pool.length; i++) {
-                if (!this.pairedLog[this.pairKey(a, pool[i])]) { idx = i; break; }
+                var pk = this.pairKey(a, pool[i]);
+                if (!this.pairedLog[pk]) {
+                    if (!lastPairs[pk]) { idx = i; break; }
+                    if (idxOK < 0) idxOK = i;
+                }
             }
+            if (idx < 0) idx = idxOK;
             if (idx < 0) { idx = 0; repeats++; }
+            if (lastPairs[this.pairKey(a, pool[idx])]) consecutives++;
             var b = pool.splice(idx, 1)[0];
             pairs.push([a, b]);
         }
-        if (!best || repeats < best.repeats) best = { pairs: pairs, bye: bye, repeats: repeats };
-        if (repeats === 0) break;
+        // 主排序：repeats 少的优先；次排序：consecutives 少的优先
+        if (!best || repeats < best.repeats ||
+            (repeats === best.repeats && consecutives < best.consecutives)) {
+            best = { pairs: pairs, bye: bye, repeats: repeats, consecutives: consecutives };
+        }
+        if (repeats === 0 && consecutives === 0) break;
     }
     if (best.repeats > 0) {   // 全部组合都打过了 -> 重新开始循环
         this.resetPairLog();
     }
+    this._lastPairs = {};
     for (var j = 0; j < best.pairs.length; j++) {
-        this.pairedLog[this.pairKey(best.pairs[j][0], best.pairs[j][1])] = true;
+        var key = this.pairKey(best.pairs[j][0], best.pairs[j][1]);
+        this.pairedLog[key] = true;
+        this._lastPairs[key] = true;
     }
     this.round++;
     return best;
@@ -668,7 +703,10 @@ D678_Battle.prototype.ruleBlockedReason = function (id) {
 //   num / copy                 -> 造一张虚空数字
 // 净张数不变的不算：swap（互换）、return（只减）、reback（换对方底牌）、
 // repick 和 pickbig（都是先去一张再拿一张）、check / rule（不碰牌）。
-D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy'];
+//   mirror                    -> 复制对方同位置的明牌（虚空数字）
+// helppick 不在里面：它往对方场上加牌，不是自己获得牌，牛牛上限在 useFunc
+// 的 helppick 分支里单独挡对方那侧。
+D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy', 'mirror'];
 D678.funcGainsCard = function (id) {
     var f = D678.funcData(id);
     return !!f && D678.GAIN_KINDS.indexOf(f.kind) >= 0;
@@ -720,7 +758,34 @@ D678_Battle.prototype.countCards = function (si, onlyUp) {
 };
 // 计入判定的那些牌的点数（含修正），一张一个元素。
 // 牛牛要按「哪几张」凑十，光有和不够，所以判定层统一从这里取原料。
+// 镜像牌的动态值刷新：遍历双方场上所有 mirror 牌，按其当前位置索引
+// 去看对方同位置的牌——是明牌就复制 v 和 face，否则（没牌 / 暗牌）显示
+// mirror 自身的卡图、点数 0。
+//
+// 【位置就是数组下标】mirror 牌被放在自己 cards 末尾，它的下标 i 对应
+// 对方 cards[i]。如果之前的牌被 return / destroy 等移走，下标会自然
+// 前移，mirror 跟着换复制对象——这跟「位置」的直觉一致。
+//
+// 调用时机：scoreVals（算分前）、endTurn（回合切换前）、useFunc 末尾
+// （出牌后立刻同步），三处覆盖了所有牌面可能变化的入口。
+D678_Battle.prototype.resolveMirror = function () {
+    for (var s = 0; s < 2; s++) {
+        var c = this.sides[s].cards;
+        for (var i = 0; i < c.length; i++) {
+            if (!c[i].mirror) continue;
+            var oc = this.sides[1 - s].cards[i];
+            if (oc && !oc.hidden) {
+                c[i].v = oc.v;
+                c[i].face = oc.face || String(oc.v);
+            } else {
+                c[i].v = 0;
+                c[i].face = 'mirror';
+            }
+        }
+    }
+};
 D678_Battle.prototype.scoreVals = function (si) {
+    this.resolveMirror();
     var out = [], c = this.sides[si].cards, m = this.mod();
     for (var i = 0; i < c.length; i++) {
         if (!this.countsForScore(c[i])) continue;
@@ -780,22 +845,27 @@ D678_Battle.prototype.isMaxVal = function (t) {
 
 //--- 牛牛 -------------------------------------------------------------------
 //
-// 【为什么不用搜子集】规则是「任意几张凑成 10 的倍数，余下的和的个位是成绩」。
+// 规则要求**恰好 3 或 4 张**牌凑成 10 的倍数才算有牛，余下牌的和的个位即成绩。
 // 设拿走的那部分和为 S（S ≡ 0 mod 10），余下的和就是 T - S，
 // 而 (T - S) mod 10 = T mod 10 —— 也就是说**成绩只取决于总点数的个位**，
-// 拿哪几张去凑都一样。所以唯一要判定的是「存不存在这样一个非空子集」，
-// 余数根本不用搜。
+// 拿哪几张去凑都一样。唯一要判定的是「存在几张牌的子集能凑出 10 的倍数」，
+// 以及「凑完后是否还有剩余牌」。
 //
-// 判定用 mod 10 的子集和 DP：reach 是个 10 位掩码，reach[r] 为真表示
-// 「能用若干张牌凑出个位为 r 的和」。每加一张牌做一次 O(10) 的推进。
-// 允许把**全部**牌都拿走（此时余下为空、和为 0、个位 0 -> 牛牛），
-// 与「总点数本身就是 10 的倍数即牛牛」一致。
+// 判定用 mod 10 的子集和 DP，但按张数分层：reach[k][r] 为真表示
+// 「存在恰好 k 张牌的子集，其和的个位为 r」。每加一张牌做一次推进。
+// k 的范围 0..COW_MAX_CARDS。只关心 reach[3][0] 和 reach[4][0]。
 //
 // 负数牌（假的 -1、以及 rule-1 修正）用 ((x%10)+10)%10 归一化，
 // 否则 JS 的 % 会给出负余数，掩码下标就越界了。
+D678._cowEmptyRow = function () {
+    var r = [];
+    for (var i = 0; i < 10; i++) r.push(false);
+    return r;
+};
 D678.cowReach = function (vals) {
-    var reach = [], i;
-    for (i = 0; i < 10; i++) reach.push(false);
+    var reach = [];
+    for (var i = 0; i <= D678.COW_MAX_CARDS; i++) reach.push(D678._cowEmptyRow());
+    reach[0][0] = true;                     // 空集的个位为 0
     for (i = 0; i < vals.length; i++) reach = D678.cowReachAdd(reach, vals[i]);
     return reach;
 };
@@ -803,33 +873,63 @@ D678.cowReach = function (vals) {
 // AI 沿着抽牌链递推时用，省得每加一张就把整手牌重算一遍。
 D678.cowReachAdd = function (reach, v) {
     var d = ((v % 10) + 10) % 10;
-    var next = reach.slice(0);
-    next[d] = true;
-    for (var r = 0; r < 10; r++) {
-        if (!reach[r]) continue;
-        next[(r + d) % 10] = true;
+    var next = [];
+    for (var i = 0; i <= D678.COW_MAX_CARDS; i++)
+        next.push(reach[i] ? reach[i].slice(0) : D678._cowEmptyRow());
+    // 从高 k 往低，避免同一张牌被重复计入
+    for (var k = D678.COW_MAX_CARDS - 1; k >= 0; k--) {
+        if (!reach[k]) continue;
+        for (var r = 0; r < 10; r++) {
+            if (reach[k][r]) next[k + 1][(r + d) % 10] = true;
+        }
     }
     return next;
 };
-// 构成「牛」至少要 2 张牌（你定的）。单张 10 不算牛牛，
-// 手上只有一张牌时一律无牛。
-D678.COW_MIN_CARDS = 2;
+// 把 2D 掩码序列化成字符串，用作 AI 分布合并 / 缓存的键。
+D678.cowReachKey = function (reach) {
+    if (!reach) return '';
+    var s = '';
+    for (var k = 0; k <= D678.COW_MAX_CARDS; k++) {
+        if (!reach[k]) { s += '----------'; continue; }
+        for (var r = 0; r < 10; r++) s += reach[k][r] ? '1' : '0';
+    }
+    return s;
+};
+// 构成「牛」恰好要 3 或 4 张牌。手上不足 3 张一律无牛。
+D678.COW_MIN_CARDS = 3;
 
-// 成绩：凑得出十的倍数 -> 总点数个位（0 记作 10，即牛牛）；凑不出 -> 0（无牛）
+// 成绩：0=无牛，0.5=有牛没点，1~9=牛1~牛9，10=牛牛
 //
-// n 是手上计入判定的张数。不足 COW_MIN_CARDS 一律无牛 ——
-// 【为什么要多带这个参数】凑十判定（reach 掩码）只知道「凑得出个位 0」，
-// 分不清那是一张 10 还是 4+6；张数这个信息只有调用方有。
-// 老调用方不传 n 时按「张数够」处理（AI 估对手时高估对手是安全方向）。
+// reach 是 cowReach 返回的 2D 掩码，n 是手上计入判定的张数。
+// 恰好 3 或 4 张的子集和为 10 的倍数才算有牛。
+// 有剩余牌时牛值 = 总点数个位（0 记作 10 即牛牛）；
+// 无剩余牌（全部牌都用于凑牛，即 n=3 且 reach[3][0]，或 n=4 且 reach[4][0]）
+//   = 有牛没点（0.5），比任何有分牛都差，比无牛好。
+// 多个有效组合时选牛值最高的 —— 因为牛值 = total%10 与子集无关，
+// 「有剩余」永远 ≥ 「有牛没点」，所以优先看有没有剩余。
 //
-// total 为 0 也算无牛（你定的）：1 + (-1) 这种两张废牌凑出 0，
+// reach 缺失（undefined）时保守当有牛且有余牌（AI 估对手，高估对手是安全方向）。
+//
+// total 为 0 也算无牛：1 + (-1) + 0 这种废牌凑出 0，
 // 按个位算会记成牛牛满点，白拿一个满点不合理。
-D678.cowScoreFrom = function (total, canCow, n) {
-    if (!canCow) return 0;
+D678.cowScoreFrom = function (total, reach, n) {
     if (n !== undefined && n < D678.COW_MIN_CARDS) return 0;
     if (total <= 0) return 0;
-    var d = ((total % 10) + 10) % 10;
-    return d === 0 ? 10 : d;
+    if (!reach) {
+        // reach 缺失：保守当有牛且有余牌
+        var d = ((total % 10) + 10) % 10;
+        return d === 0 ? 10 : d;
+    }
+    var has3 = reach[3] && reach[3][0];
+    var has4 = reach[4] && reach[4][0];
+    // 有剩余的牛：3 张牛且 n>3，或 4 张牛且 n>4
+    if ((has3 && n > 3) || (has4 && n > 4)) {
+        var d2 = ((total % 10) + 10) % 10;
+        return d2 === 0 ? 10 : d2;
+    }
+    // 全部牌凑牛，无剩余
+    if ((has3 && n === 3) || (has4 && n === 4)) return 0.5;
+    return 0;
 };
 
 //--- 判定（唯一权威） -------------------------------------------------------
@@ -848,8 +948,8 @@ D678_Battle.prototype.scoreOf = function (si) {
     var t = 0;
     for (var i = 0; i < vals.length; i++) t += vals[i];
     if (this.isCowRule()) {
-        // 张数一起传进去：构成牛至少要 2 张（单张 10 不算牛牛）
-        var cow = D678.cowScoreFrom(t, D678.cowReach(vals)[0], vals.length);
+        // 掩码和张数一起传进去：构成牛恰好要 3 或 4 张
+        var cow = D678.cowScoreFrom(t, D678.cowReach(vals), vals.length);
         return { bust: false, max: cow === 10, rank: [cow], total: t, cow: cow };
     }
     var bust = this.isBustVal(t);
@@ -885,6 +985,15 @@ D678.cmpScore = function (x, y) {
 D678.tieBonusOf = function (n) {
     n = n || 0;
     return n <= 0 ? 0 : Math.pow(2, n - 1);
+};
+
+// 败场差 comeback 加伤：胜者败场比败者多时，差额计入额外伤害，不设上限。
+// 胜者败场 ≤ 败者败场时不触发（领先者赢了不多打）。
+// doResolve 和 AI.resolveUtil 共用这一个函数 —— 两边必须一致，
+// 否则 AI 在败场差大的时候会误判赌注大小。
+D678.comebackBonusOf = function (winnerLosses, loserLosses) {
+    var diff = (winnerLosses || 0) - (loserLosses || 0);
+    return diff > 0 ? diff : 0;
 };
 
 // 是否可以要牌（明牌合计 >= 21 不可要牌）。
@@ -1007,6 +1116,7 @@ D678_Battle.prototype.rerollOwnHole = function (si) {
 //--- 回合 ------------------------------------------------------------------
 
 D678_Battle.prototype.endTurn = function () {
+    this.resolveMirror();
     this.turn = 1 - this.turn;
     if (this.standStreak >= 2) { this.doResolve(); return; }
     if (this.deck.length === 0 && !this.canHit(this.turn) && this.sides[this.turn].stood) {
@@ -1264,7 +1374,49 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         res.ok = true; res.endTurn = true;
         res.msg = '对方使用了' + f.name;
         break;
+    case 'helppick':
+        // 帮对方抽牌库里最小的一张明牌。不消耗回合。
+        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        // 牛牛下对方满 5 张就不能再往对方场上加牌（helppick 不在 GAIN_KINDS
+        // 里，cardGainBlockedReason 不会挡，所以在这里单独挡对方那侧）
+        if (this.isCowRule() && opp.cards.length >= D678.COW_MAX_CARDS) {
+            res.err = D678.cowCapMsg(); return res;
+        }
+        var hpMn = this.deckMin();
+        this.doPick(1 - si, hpMn, false);
+        res.value = hpMn;
+        res.ok = true; res.msg = '对方使用了' + f.name;
+        break;
+    case 'mirror':
+        // 在自己场上最新位置放一张镜像虚空牌，动态复制对方同位置的明牌。
+        // 算牛牛 5 张上限（已在 GAIN_KINDS 里，cardGainBlockedReason 会挡）。
+        // 初始 v=0 face='mirror'，resolveMirror 立刻刷新成实际值。
+        var mc = D678.mkCard(0, false, true, 'mirror');
+        mc.mirror = true;
+        side.cards.push(mc);
+        this.resolveMirror();
+        res.ok = true; res.endTurn = true;
+        res.msg = '对方使用了' + f.name;
+        break;
+    case 'destroy':
+        // 把对方最新的非底牌放到牌库最下方。不消耗回合。
+        // 底牌始终在 index 0，所以对方只有 1 张牌时没有可破坏的目标。
+        // 明牌暗牌都能破坏；暗牌被破坏时不透露点数（日志只写「暗牌」）。
+        // 假牌（虚空数字 / 镜像）不进牌库，直接消失。
+        if (opp.cards.length <= 1) { res.err = '对方没有可破坏的牌'; return res; }
+        var dst = opp.cards.pop();
+        res.targetHidden = dst.hidden;
+        res.fakeGone = !!dst.fake;
+        if (!dst.fake) this.deck.push(dst.v);
+        this.resolveMirror();
+        res.ok = true; res.msg = '对方使用了' + f.name;
+        break;
     }
+
+    // 出牌后镜像牌的值可能因这次牌面变化而需要刷新
+    //（对方加了牌 / 换了牌 / 被破坏了牌）。endTurn 里也会刷一次，
+    // 但不消耗回合的牌不走 endTurn，所以这里兜底。
+    this.resolveMirror();
 
     if (res.ok) {
         // 日志：使用了什么牌、结果如何
@@ -1292,6 +1444,10 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
                                                   ' 抽出了最大的 ' + res.value;
         else if (f.kind === 'num')        what += '，场上多了 ' + f.name;
         else if (f.kind === 'copy')       what += '，复制了 ' + res.value;
+        else if (f.kind === 'helppick')   what += '，帮对方抽出了 ' + res.value;
+        else if (f.kind === 'mirror')     what += '，镜像复制';
+        else if (f.kind === 'destroy')    what += '，破坏了对方一张' +
+                                                  (res.targetHidden ? '暗牌' : '明牌');
         else if (f.kind === 'pick2' && res.only) {
             what += '，牌库只剩 1 张，抽出了 ' + res.value;
         }
@@ -1411,32 +1567,33 @@ D678_Battle.prototype.doResolve = function () {
     if (m0) this.players[0].maxPoint++;
     if (m1) this.players[1].maxPoint++;
 
-    // 伤害 = 1（底伤） + 本次拼点的平局次数 + 累计败场数（不因胜利重置）
-    //        + 败方爆牌 1 + 胜方满点 1
-    // 例：此前已败 5 次，本局平过 2 次、对方满点、自己爆牌
-    //     -> 1 + 2 + 5 + 1 + 1 = 10
+    // 伤害 = 5（底伤） + 败方爆牌 3 + 胜方满点 3 + 平局加伤 + 败场差加伤
+    // 例：对方满点、自己爆牌 -> 5 + 3 + 3 = 11
+    //     干净一局输 -> 5
     //
-    // 【平局加伤】翻倍制（你定的）：平 1 次 +1、2 次 +2、3 次 +4，之后 8/16/32…
-    // 干净一局输是 -1，平过一次再输是 -2，平过三次再输是 -5。
+    // 【平局加伤】翻倍制：平 1 次 +1、2 次 +2、3 次 +4，之后 8/16/32…
     // redeals 是本次拼点已经重发过几次，也就是已经平了几次 —— 新 Battle 会
     // 归零，所以惩罚只在这一场里累积。
+    // 【败场差加伤】comeback 机制：胜者败场比败者多时，差额计入额外伤害。
+    // 只在胜者败场 > 败者败场时触发（落后者赢了才加伤），不设上限。
     // 单机、1v1、锦标赛、天梯共用这一份规则，AI 的估值（AI.resolveUtil）
-    // 也走同一个 D678.tieBonusOf。
-    var items = 1;
-    if (info.busts[lose]) items++;
-    if (info.maxes[win]) items++;
+    // 也走同一个 D678.tieBonusOf 和 D678.comebackBonusOf。
+    var items = 5;
+    if (info.busts[lose]) items += 3;
+    if (info.maxes[win]) items += 3;
     var tieBonus = D678.tieBonusOf(this.redeals);
-    var dmg = items + L.losses + tieBonus;
+    var comeback = D678.comebackBonusOf(W.losses, L.losses);
+    var dmg = items + tieBonus + comeback;
     info.dmg = dmg;
     info.items = items;
     info.tieBonus = tieBonus;
+    info.comeback = comeback;
     // 分出胜负这一帧也要显示平局次数（解释伤害是怎么来的）。
     //
     // 【这里发的是次数不是加伤】翻倍之后两者不再相等（平 3 次 = 加伤 4）。
     // 客户端拿它画「平局✖N」，要的是次数；原来两者相等所以直接复用了
     // tieBonus，现在必须分开。
     info.tieCount = this.redeals || 0;
-    info.prevLosses = L.losses;
 
     W.wins++;
     L.losses++;
@@ -1512,9 +1669,12 @@ D678_Battle.prototype.clone = function () {
             cards: s.cards.map(function (c) {
                 // fake 要照抄：AI 推演里 return / repick 碰到假牌走的是
                 // 「消失」那条路，漏了它推演出的牌库和真盘面就会分叉。
+                // mirror 也要照抄：resolveMirror 靠它在克隆盘面上刷新镜像值，
+                // 漏了它镜像牌就变成一张恒 0 的死牌，AI 估值全错。
                 // face 不抄 —— 纯绘制用，推演不进画面。
                 var o = { v: c.v, hidden: c.hidden, uid: c.uid };
                 if (c.fake) o.fake = true;
+                if (c.mirror) o.mirror = true;
                 return o;
             }),
             stood: s.stood, checkN: s.checkN, known: s.known.slice(0)
@@ -1615,17 +1775,16 @@ D678.AI.profile = function (p) {
 // 前五张规则牌下这是**精确**的（成绩只是点数的函数），所以老路径分毫不变。
 // 改判定方式的三张需要点数之外的情报：
 //   · 比多  -> 张数 n（张数是公开信息，看得见，能精确带上）
-//   · 牛牛  -> 能否凑十 ne（reach 掩码的第 0 位）
-// 拿不到时退回保守假设：ne 缺失就当「凑得出」（多数手牌确实凑得出，
+//   · 牛牛  -> 凑十掩码 reach（2D 掩码，cowReach 返回值）
+// 拿不到时退回保守假设：reach 缺失就当「凑得出」（多数手牌确实凑得出，
 // 且这只用在**估对手**上 —— 我方成绩永远走 scoreOf 精确算，
 // 高估对手是安全方向）。n 缺失就用盘面上的实际张数。
-D678.AI.scoreFromTotal = function (b, si, t, n, ne) {
+D678.AI.scoreFromTotal = function (b, si, t, n, reach) {
     if (b.isCowRule()) {
-        var canCow = (ne === undefined) ? true : !!ne;
         // 张数缺失时用盘面实际张数（跟比多那支一样的兜底）——
-        // 构成牛至少要 2 张，这个约束不能因为标量还原就丢掉。
+        // 构成牛恰好要 3 或 4 张，这个约束不能因为标量还原就丢掉。
         var cn = (n === undefined) ? b.countCards(si, false) : n;
-        var cow = D678.cowScoreFrom(t, canCow, cn);
+        var cow = D678.cowScoreFrom(t, reach, cn);
         return { bust: false, max: cow === 10, rank: [cow], total: t, cow: cow };
     }
     var bust = b.isBustVal(t);
@@ -1664,19 +1823,22 @@ D678.AI.resolveUtil = function (b, si, mt, ot) {
     var meP = b.sides[si].p, opP = b.sides[1 - si].p;
     // 平局加伤：翻倍制（doResolve 里的 tieBonus，同一个 D678.tieBonusOf）。
     // 这里必须跟着算 —— 不算的话平过几次之后 AI 会低估赌注，
-    // 该保守的时候还在赌爆牌。翻倍之后这个偏差比原来的线性大得多：
-    // 平 3 次时真实加伤是 4，按 0 估值等于把一个 -5 的局面当成 -1。
+    // 该保守的时候还在赌爆牌。
+    // 败场差加伤同理：comeback 机制下落后者赢的收益更大，
+    // 不算的话 AI 在败场差大的时候会低估自己的赢面收益。
     var tieBonus = D678.tieBonusOf(b.redeals);
-    var items, dmg, v;
+    var items, dmg, cb, v;
     if (win > 0) {
-        items = 1 + (bo ? 1 : 0) + (mm ? 1 : 0);
-        dmg = items + (opP.losses || 0) + tieBonus;   // 吃对手累计败场 + 平局加伤
+        items = 5 + (bo ? 3 : 0) + (mm ? 3 : 0);
+        cb = D678.comebackBonusOf(meP.losses, opP.losses);
+        dmg = items + tieBonus + cb;
         v = dmg;
         if ((opP.hp || 0) - dmg <= 0) v += this.HP_KILL;
         return v;
     }
-    items = 1 + (bm ? 1 : 0) + (mo ? 1 : 0);
-    dmg = items + (meP.losses || 0) + tieBonus;  // 我方败场越多、平局越多，再输一次越痛
+    items = 5 + (bm ? 3 : 0) + (mo ? 3 : 0);
+    cb = D678.comebackBonusOf(opP.losses, meP.losses);
+    dmg = items + tieBonus + cb;
     // 败者摸 2 张、胜者摸 1 张，只补差额；必须远小于伤害，否则会“乐于输牌”
     v = -dmg + this.FUNC_VAL;
     if ((meP.hp || 0) - dmg <= 0) v -= this.HP_DIE;
@@ -1750,7 +1912,7 @@ D678.AI.godOppTotals = function (b, si) {
 
 // 分布条目 -> 成绩对象
 D678.AI.entScore = function (b, oi, e) {
-    return this.scoreFromTotal(b, oi, e.t, e.n, e.rc ? e.rc[0] : undefined);
+    return this.scoreFromTotal(b, oi, e.t, e.n, e.rc);
 };
 
 // 沿着推演出来的抽牌链，「还抽得动吗」。
@@ -1958,7 +2120,7 @@ D678.AI.mergeDist = function (list, b) {
         var e = list[i];
         k = String(e.t);
         if (needN)  k += '|' + e.n;
-        if (needRC) k += '|' + (e.rc ? e.rc.join('') : '');
+        if (needRC) k += '|' + D678.cowReachKey(e.rc);
         if (m[k]) { m[k].w += e.w; continue; }
         m[k] = { t: e.t, w: e.w, n: e.n, rc: e.rc };
     }
@@ -1993,7 +2155,7 @@ D678.AI.expandOpp = function (b, si, list, U, depth) {
         // 缓存键必须带上「结果还取决于什么」：牛牛下同一个点数配不同的凑十掩码 /
         // 张数是不同的局面，只按 t 缓存会把别的条目的答案套上来。
         var ck = b.isCowRule()
-            ? (e.t + '|' + e.n + '|' + (e.rc ? e.rc.join('') : '')) : String(e.t);
+            ? (e.t + '|' + e.n + '|' + D678.cowReachKey(e.rc)) : String(e.t);
         if (blocked) hit = false;
         else if (hitCache[ck] !== undefined) hit = hitCache[ck];
         else hit = hitCache[ck] = this.oppWouldHit(b, si, e.t, U, mtView, e);
@@ -2134,7 +2296,7 @@ D678.AI.canImprove = function (b, si) {
         var t = cur + dv;
         if (b.isBustVal(t)) continue;
         var rc = cowR ? D678.cowReachAdd(cowR, dv) : null;
-        var s = this.scoreFromTotal(b, si, t, n + 1, rc ? rc[0] : undefined);
+        var s = this.scoreFromTotal(b, si, t, n + 1, rc);
         if (D678.cmpScore(s, curS) > 0) return true;
     }
     return false;

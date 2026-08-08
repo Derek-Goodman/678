@@ -2,7 +2,7 @@
 // title.js
 //=============================================================================
 /*:
- * @plugindesc 标题画面改造：只保留「开始游戏」与「说明」，按钮美化并置于画面 1/3 处
+ * @plugindesc 标题画面改造：只保留「开始游戏」「说明」「功能牌图鉴」，按钮美化并置于画面 1/3 处
  * @author DerekGoodman
  *
  * @help
@@ -62,10 +62,10 @@ D678T.HELP_LINES = `8名玩家进行21点对局，每次1对1分成4组同时进
 数字牌从数字1-11不重复，游戏为回合制
 发数字牌后牌面小的一方先手回合
 
-对局失败-1生命值
-爆牌-1生命值
-对方满点-1生命值
-连败后对局失败生命值惩罚会额外多1
+对局失败-5生命值
+爆牌-3生命值
+对方满点-3生命值
+失败次数多的人胜利会额外扣失败少的人差额生命值
 平局后本局生命值惩罚会额外多1叠加：如1，2，4，8……
 胜方获得1张功能牌
 败方获得2张功能牌
@@ -113,7 +113,7 @@ var BTN_W = 360, BTN_H = 74;
 // 34 的话净空 32px，字上下各留 4px 富余。
 //
 // 三道间隙一起放大（不是只放大那一道）—— 只改一道会让按钮组看着是排歪了。
-// 按钮组底部锚定不变，所以整组往上挪 24px：3 个按钮时顶边 944 -> 920，
+// 按钮组底部锚定不变，3 个按钮时顶边按公式自动算出。
 // 标题字（画在顶边 - 96）848 -> 824，都还在画面里。
 var BTN_GAP = 34;
 var BTN_BOTTOM = 70;                    // 按钮组距画面底部留出的空间
@@ -171,7 +171,7 @@ D678T.hitTest = function (list, x, y) {
 };
 
 //=============================================================================
-// 标题命令窗口：只剩 开始游戏 / 说明
+// 标题命令窗口：开始游戏 / 说明 / 功能牌图鉴
 //
 // 窗口本身整体隐藏，只留它的命令表与 handler（键盘/手柄仍能用）。
 // 按钮改画在场景最顶层的独立精灵上（见下面 createTitleButtons），
@@ -181,6 +181,7 @@ D678T.hitTest = function (list, x, y) {
 Window_TitleCommand.prototype.makeCommandList = function () {
     this.addCommand('开始游戏', 'newGame');
     this.addCommand('说明',     'gameHelp');
+    this.addCommand('功能牌图鉴', 'funcCodex');
 };
 
 var _WTC_init = Window_TitleCommand.prototype.initialize;
@@ -206,11 +207,16 @@ var _ST_createCommandWindow = Scene_Title.prototype.createCommandWindow;
 Scene_Title.prototype.createCommandWindow = function () {
     _ST_createCommandWindow.call(this);
     this._commandWindow.setHandler('gameHelp', this.commandGameHelp.bind(this));
+    this._commandWindow.setHandler('funcCodex', this.commandFuncCodex.bind(this));
     this.createTitleButtons();
 };
 
 Scene_Title.prototype.commandGameHelp = function () {
     SceneManager.push(Scene_GameHelp);
+};
+
+Scene_Title.prototype.commandFuncCodex = function () {
+    SceneManager.push(Scene_FuncCodex);
 };
 
 // 按钮层：最后 addChild，永远在封面图（背景层/前景层）与窗口层之上
@@ -222,20 +228,35 @@ Scene_Title.prototype.createTitleButtons = function () {
     this.addChild(this._btnSprite);
 
     // 全部靠下排布，底部留出 BTN_BOTTOM 的空间
+    // 最后两个按钮（说明 / 功能牌图鉴）左右并排，保持 3 行高度
     var list = this._commandWindow._list || [];
     var n = list.length;
-    var totalH = n * BTN_H + (n - 1) * BTN_GAP;
+    var pairLast = (n >= 4 &&
+        list[n - 2].symbol === 'gameHelp' && list[n - 1].symbol === 'funcCodex');
+    var rows = pairLast ? (n - 1) : n;
+    var totalH = rows * BTN_H + (rows - 1) * BTN_GAP;
     var y0 = H - BTN_BOTTOM - totalH;
     if (y0 < 10) y0 = 10;
     var x = Math.round(W / 2 - BTN_W / 2);
     D678T._btnTop = y0;              // 供标题文字定位
 
+    var halfW = Math.round((BTN_W - 16) / 2);   // 并排按钮各占一半，中间留 16 间距
     this._btns = [];
     for (var i = 0; i < n; i++) {
-        this._btns.push({
-            x: x, y: y0 + i * (BTN_H + BTN_GAP), w: BTN_W, h: BTN_H,
-            label: list[i].name, symbol: list[i].symbol
-        });
+        if (pairLast && i >= n - 2) {
+            var isLeft = (i === n - 2);
+            this._btns.push({
+                x: isLeft ? x : x + halfW + 16,
+                y: y0 + (rows - 1) * (BTN_H + BTN_GAP),
+                w: halfW, h: BTN_H,
+                label: list[i].name, symbol: list[i].symbol, half: true
+            });
+        } else {
+            this._btns.push({
+                x: x, y: y0 + i * (BTN_H + BTN_GAP), w: BTN_W, h: BTN_H,
+                label: list[i].name, symbol: list[i].symbol, half: false
+            });
+        }
     }
     this._btnPress = -1;
     this._btnCache = '';
@@ -259,7 +280,7 @@ Scene_Title.prototype.refreshTitleButtons = function () {
         var press = (i === this._btnPress);
         var on = press;
         D678T.drawButton(bmp, b.x, b.y, b.w, b.h, on, press);
-        bmp.fontSize = 30;
+        bmp.fontSize = b.half ? 24 : 30;
         bmp.textColor = (on || press) ? TC.edge : TC.textD;
         bmp.outlineColor = 'rgba(0,0,0,0.8)';
         bmp.outlineWidth = 4;
@@ -335,6 +356,7 @@ Scene_Title.prototype.callTitleButton = function (symbol) {
     w.deactivate();
     if (symbol === 'newGame')  { this.commandNewGame(); return; }
     if (symbol === 'gameHelp') { this.commandGameHelp(); w.activate(); return; }
+    if (symbol === 'funcCodex') { this.commandFuncCodex(); w.activate(); return; }
 };
 
 // 从说明画面返回后重新激活按钮
@@ -353,8 +375,8 @@ Scene_Title.prototype.drawGameTitle = function () {
     var w = Graphics.width;
     var top = D678T._btnTop;
     if (top === undefined) {
-        // 还没建按钮时按同样的规则先算一次（命令数按 2 估）
-        var totalH = 2 * BTN_H + BTN_GAP;
+        // 还没建按钮时按同样的规则先算一次（命令数按 3 估）
+        var totalH = 3 * BTN_H + 2 * BTN_GAP;
         top = Graphics.height - BTN_BOTTOM - totalH;
     }
     var y = top - 96;
@@ -469,6 +491,218 @@ Scene_GameHelp.prototype.update = function () {
 };
 
 Scene_GameHelp.prototype.popScene = function () {
+    if (this._popped) return;
+    this._popped = true;
+    SceneManager.pop();
+};
+
+//=============================================================================
+// Scene_FuncCodex：功能牌图鉴
+//=============================================================================
+
+function Scene_FuncCodex() { this.initialize.apply(this, arguments); }
+Scene_FuncCodex.prototype = Object.create(Scene_Base.prototype);
+Scene_FuncCodex.prototype.constructor = Scene_FuncCodex;
+window.Scene_FuncCodex = Scene_FuncCodex;
+
+Scene_FuncCodex.prototype.initialize = function () {
+    Scene_Base.prototype.initialize.call(this);
+    this._page = 0;
+    this._guard = 12;
+};
+
+// 每页 2 列 × 3 行 = 6 张。32 张牌 → 6 页。
+Scene_FuncCodex.PAGE_SIZE = 6;
+Scene_FuncCodex.COLS = 2;
+
+Scene_FuncCodex.prototype.create = function () {
+    Scene_Base.prototype.create.call(this);
+
+    // 背景
+    var bg = new Bitmap(Graphics.width, Graphics.height);
+    var ctx = bg._context;
+    var g = ctx.createLinearGradient(0, 0, 0, Graphics.height);
+    g.addColorStop(0, TC.bg1); g.addColorStop(1, TC.bg2);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, Graphics.width, Graphics.height);
+    bg._setDirty();
+    this.addChild(new Sprite(bg));
+
+    // 文字层
+    this._bmp = new Bitmap(Graphics.width, Graphics.height);
+    this.addChild(new Sprite(this._bmp));
+
+    // 卡图精灵层
+    this._cardLayer = new Sprite();
+    this.addChild(this._cardLayer);
+    this._cardSprites = [];
+
+    this._funcs = (typeof D678 !== 'undefined' && D678.FUNCS) ? D678.FUNCS : [];
+    this._pages = Math.max(1, Math.ceil(this._funcs.length / Scene_FuncCodex.PAGE_SIZE));
+
+    this.refresh();
+};
+
+Scene_FuncCodex.prototype.start = function () {
+    Scene_Base.prototype.start.call(this);
+    this.startFadeIn(this.fadeSpeed(), false);
+};
+
+Scene_FuncCodex.prototype.txt = function (s, x, y, w, size, color, align) {
+    var b = this._bmp;
+    b.fontSize = size;
+    b.textColor = color || TC.text;
+    b.outlineColor = 'rgba(0,0,0,0.8)';
+    b.outlineWidth = 4;
+    b.drawText(s, x, y, w, size + 10, align || 'left');
+};
+
+// 卡图原始尺寸 360×510，图鉴里缩到 150×213
+Scene_FuncCodex.IMG_W = 150;
+Scene_FuncCodex.IMG_H = 213;
+
+Scene_FuncCodex.prototype.refresh = function () {
+    var W = Graphics.width, H = Graphics.height;
+    var b = this._bmp;
+    b.clear();
+
+    // 清掉旧精灵
+    for (var i = 0; i < this._cardSprites.length; i++) {
+        this._cardLayer.removeChild(this._cardSprites[i]);
+    }
+    this._cardSprites = [];
+
+    // 标题
+    this.txt('功能牌图鉴', 0, 40, W, 36, TC.edge, 'center');
+
+    var ctx = b._context;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(80, 92); ctx.lineTo(W - 80, 92); ctx.stroke();
+    ctx.restore();
+    b._setDirty();
+
+    // 布局
+    var cols = Scene_FuncCodex.COLS;
+    var imgW = Scene_FuncCodex.IMG_W, imgH = Scene_FuncCodex.IMG_H;
+    var cellW = 320;                         // 每格宽（720 / 2 - 40 间距）
+    var cellH = imgH + 24 + 96;              // 卡图 + 名 + 说明(4行)
+    var gridW = cols * cellW;
+    var startX = Math.round((W - gridW) / 2);
+    var startY = 120;
+    var textH = 20;                          // 每行说明文字高
+
+    var start = this._page * Scene_FuncCodex.PAGE_SIZE;
+    var end = Math.min(start + Scene_FuncCodex.PAGE_SIZE, this._funcs.length);
+
+    for (var idx = start; idx < end; idx++) {
+        var f = this._funcs[idx];
+        var slot = idx - start;
+        var col = slot % cols;
+        var row = Math.floor(slot / cols);
+        var cx = startX + col * cellW;
+        var cy = startY + row * cellH;
+
+        // 卡图精灵
+        var sp = new Sprite(ImageManager.loadPicture(f.img));
+        sp.scale.x = sp.scale.y = imgW / 360;
+        sp.x = cx + Math.round((cellW - imgW) / 2);
+        sp.y = cy;
+        this._cardLayer.addChild(sp);
+        this._cardSprites.push(sp);
+
+        // 名称
+        this.txt(f.name, cx, cy + imgH + 2, cellW, 22, TC.edge, 'center');
+
+        // 说明（按 \n 分行，最多 4 行）
+        var lines = (f.desc || '').split('\n');
+        for (var li = 0; li < Math.min(lines.length, 4); li++) {
+            this.txt(lines[li], cx + 8, cy + imgH + 28 + li * textH,
+                     cellW - 16, 16, TC.gray, 'center');
+        }
+    }
+
+    // 底部：页码 + 按钮
+    var by = H - 130;
+    this.txt((this._page + 1) + ' / ' + this._pages, 0, by, W, 24, TC.gray, 'center');
+
+    // 上一页 / 下一页 / 返回
+    var bw = 160, bh = 54, gap = 24;
+    var btns = [
+        { label: '上一页', x: Math.round(W / 2 - bw * 1.5 - gap),      enabled: this._page > 0 },
+        { label: '下一页', x: Math.round(W / 2 - bw / 2),              enabled: this._page < this._pages - 1 },
+        { label: '返回',   x: Math.round(W / 2 + bw / 2 + gap),        enabled: true },
+    ];
+    this._codexBtns = [];
+    for (var bi = 0; bi < btns.length; bi++) {
+        var bt = btns[bi];
+        var press = (this._btnPress === bi);
+        var on = bt.enabled;
+        ctx.save();
+        roundRect(ctx, bt.x, by + 36, bw, bh, 10);
+        var g2 = ctx.createLinearGradient(0, by + 36, 0, by + 36 + bh);
+        if (!on) { g2.addColorStop(0, '#2a3a34'); g2.addColorStop(1, '#1a2a24'); }
+        else if (press) { g2.addColorStop(0, TC.faceH1); g2.addColorStop(1, TC.faceH2); }
+        else { g2.addColorStop(0, TC.face1); g2.addColorStop(1, TC.face2); }
+        ctx.fillStyle = g2; ctx.fill();
+        ctx.strokeStyle = on ? TC.edge : TC.edgeD; ctx.lineWidth = 2; ctx.stroke();
+        ctx.restore();
+        b._setDirty();
+        this.txt(bt.label, bt.x, by + 36 + (bh - 28) / 2 + (press ? 2 : 0),
+                 bw, 28, on ? (press ? TC.edge : TC.textD) : TC.gray, 'center');
+        this._codexBtns.push({ x: bt.x, y: by + 36, w: bw, h: bh, enabled: on, idx: bi });
+    }
+    this._btnPress = -1;
+};
+
+Scene_FuncCodex.prototype.update = function () {
+    Scene_Base.prototype.update.call(this);
+    if (this._guard > 0) { this._guard--; return; }
+
+    // 键盘：左右翻页，确认/取消返回
+    if (Input.isTriggered('left') && this._page > 0) {
+        SoundManager.playCursor();
+        this._page--;
+        this.refresh();
+        return;
+    }
+    if (Input.isTriggered('right') && this._page < this._pages - 1) {
+        SoundManager.playCursor();
+        this._page++;
+        this.refresh();
+        return;
+    }
+    if (Input.isTriggered('cancel') || Input.isTriggered('ok')) {
+        SoundManager.playCancel();
+        this.popScene();
+        return;
+    }
+
+    // 触屏
+    var hit = -1;
+    for (var i = 0; i < this._codexBtns.length; i++) {
+        var bt = this._codexBtns[i];
+        if (!bt.enabled) continue;
+        if (TouchInput.x >= bt.x && TouchInput.x < bt.x + bt.w &&
+            TouchInput.y >= bt.y && TouchInput.y < bt.y + bt.h) { hit = i; break; }
+    }
+
+    if (TouchInput.isTriggered() && hit >= 0) {
+        SoundManager.playOk();
+        if (hit === 0 && this._page > 0) { this._page--; this.refresh(); return; }
+        if (hit === 1 && this._page < this._pages - 1) { this._page++; this.refresh(); return; }
+        if (hit === 2) { this.popScene(); return; }
+    }
+
+    // 按下高亮
+    if (TouchInput.isPressed() && hit >= 0) {
+        if (this._btnPress !== hit) { this._btnPress = hit; this.refresh(); }
+    } else if (this._btnPress >= 0) {
+        this._btnPress = -1;
+        this.refresh();
+    }
+};
+
+Scene_FuncCodex.prototype.popScene = function () {
     if (this._popped) return;
     this._popped = true;
     SceneManager.pop();
