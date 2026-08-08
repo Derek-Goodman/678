@@ -656,6 +656,15 @@ Scene_FuncCodex.prototype.refresh = function () {
 
 Scene_FuncCodex.prototype.update = function () {
     Scene_Base.prototype.update.call(this);
+    // 匹配中开着图鉴时对局开始了 —— 自动关掉，让 D678Net 接手进对局场景。
+    // _codexBack 只有从 D678Net push 进来时才非空（标题画面开的图鉴是 null），
+    // 所以不会误触发。states 到了 = 开赛盘面已就绪，pop 后 D678Net.start
+    // 恢复匹配页，第一帧 pollNet 就把 Scene_D678 推上去。
+    if (D678N._codexBack && D678N.inbox &&
+        D678N.inbox.states && D678N.inbox.states.length > 0) {
+        this.popScene();
+        return;
+    }
     if (this._guard > 0) { this._guard--; return; }
 
     // 键盘：左右翻页，确认/取消返回

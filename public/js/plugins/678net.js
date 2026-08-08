@@ -507,6 +507,10 @@ D678N.statusText = function (st) {
 D678N.elim = null;
 // 赛事最终排名，大厅收到 over 时存这里
 D678N.finalOver = null;
+// 从大厅 push 出去的子场景（功能牌图鉴）返回时，RMMV 会销毁旧实例、
+// 新建一个 Scene_D678Net —— _page / _roomInfo / 匹配计时全没了。
+// push 前把这几个值暂存到这里，start() 取回后即清。详见 onCodex / start。
+D678N._codexBack = null;
 
 // 把服务器发来的盘面套到一个 D678.Battle 形状的对象上，
 // 这样 total / adj / mod / isMaxVal / canHit / target / handStr 这些
@@ -797,6 +801,21 @@ Scene_D678Net.prototype.start = function () {
     Scene_Base.prototype.start.call(this);
     this.startFadeIn(this.fadeSpeed(), false);
     this._guard = 10;
+    // 从功能牌图鉴回来：RMMV push/pop 会销毁旧实例，_page / _roomInfo /
+    // 匹配计时都在 onCodex 里存到了 D678N._codexBack，这里原样取回。
+    // 必须排在 elim / resumeSid / autoRoom 之前 —— 那些是"从别的地方回来"，
+    // 这里是"从图鉴回来"，互斥的。
+    if (D678N._codexBack) {
+        var s = D678N._codexBack;
+        D678N._codexBack = null;
+        this._page = s.page;
+        this._roomInfo = s.roomInfo;
+        this._ladFillMs = s.ladFillMs || 0;
+        this._ladFillAt = s.ladFillAt || 0;
+        this._ladClockShown = -1;   // 强制下一帧重画一次计时
+        this.refresh();
+        return;
+    }
     // 锦标赛里被淘汰、从牌桌 pop 回来的。
     //
     // 【SSE 已经断了】收到 eliminated 那一刻客户端就 Net.reset()、服务器也
@@ -852,7 +871,10 @@ Scene_D678Net.prototype.doResume = function (sid) {
 };
 
 Scene_D678Net.prototype.bindNet = function () {
-    D678N.clearInbox();
+    // 从图鉴回来时不清收件箱 —— SSE 连接没断，图鉴开着那段时间推来的
+    // room / states 都是有效的。清了会丢掉匹配进度，甚至丢掉开赛盘面
+    // （对局刚好在图鉴开着时开了，那份 states 被清掉就进不了牌桌）。
+    if (!D678N._codexBack) D678N.clearInbox();
 };
 
 //--- 在线人数 --------------------------------------------------------------
@@ -2188,7 +2210,15 @@ Scene_D678Net.prototype.onRank = function () {
 };
 
 // 功能牌图鉴。直接推场景，不需要网络请求。
+// push 前把当前页状态存到 D678N._codexBack —— RMMV 的 push/pop 会销毁
+// 当前场景实例，pop 回来时是全新实例，不存就回不到匹配页（见 start）。
 Scene_D678Net.prototype.onCodex = function () {
+    D678N._codexBack = {
+        page: this._page,
+        roomInfo: this._roomInfo,
+        ladFillMs: this._ladFillMs,
+        ladFillAt: this._ladFillAt,
+    };
     SceneManager.push(Scene_FuncCodex);
 };
 
