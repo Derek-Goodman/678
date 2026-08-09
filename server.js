@@ -1037,7 +1037,9 @@ function accSave() {
                             // 少了它跨月重启会把上个赛季的分当本赛季的用
                             ladScore: a.ladScore, ladSeason: a.ladSeason,
                             ladGames: a.ladGames, ladSGames: a.ladSGames,
-                            ladRankSum: a.ladRankSum, ladChamps: a.ladChamps });
+                            ladRankSum: a.ladRankSum, ladChamps: a.ladChamps,
+                            // 历史战绩（最多 20 条）
+                            ladHistory: a.ladHistory || [] });
         }
         const tmp = ACC_FILE + '.tmp';
         try {
@@ -1085,6 +1087,7 @@ function accLoad() {
             ladSGames:  Math.max(0, Math.round(num(a.ladSGames, 0))),
             ladRankSum: Math.max(0, Math.round(num(a.ladRankSum, 0))),
             ladChamps:  Math.max(0, Math.round(num(a.ladChamps, 0))),
+            ladHistory: Array.isArray(a.ladHistory) ? a.ladHistory.slice(0, 20) : [],
         };
         // 名字要过一遍校验再认：规则以后收紧的话，老数据里不合规的那些
         // 就当没起过名，让他重新起一个
@@ -1534,6 +1537,48 @@ function ladSettle(room, seat, rank, total) {
     };
 }
 
+//--- 历史战绩 ----------------------------------------------------------------
+// 在账号上记一条天梯对局。淘汰 / 退出时调 ladHistoryAdd 建一条 pending，
+// 对局结束（enterOverT）时调 ladHistoryFinalize 补 endedAt / overInfo / expectedEndAt。
+//
+// 【为什么 pending 也要写盘】玩家被淘汰后赛事可能还在打（多真人），
+// 他回大厅点「历史战绩」要看到「对局中」。pending 条目存账号文件里，
+// 服务器重启也不丢。万一房间被异常销毁（掉线未回来等），条目会永远停在
+// pending —— 罕见，可接受。
+
+function ladHistoryAdd(accKey, gameId, startedAt, rank, total, result, quit) {
+    const a = accKey ? accounts.get(accKey) : null;
+    if (!a) return;
+    if (!a.ladHistory) a.ladHistory = [];
+    // 同一局不应该有两条；保险起见去重
+    a.ladHistory = a.ladHistory.filter(h => h.gameId !== gameId);
+    a.ladHistory.unshift({
+        gameId: gameId,
+        startedAt: startedAt || Date.now(),
+        endedAt: null,             // null = 对局未结束
+        expectedEndAt: null,       // null = 对局未结束
+        rank: rank,
+        total: total,
+        delta: result ? result.delta : 0,
+        score: result ? result.score : 0,
+        tier: result ? result.tier : '',
+        quit: !!quit,
+        overInfo: null,            // null = 不能看详情
+    });
+    if (a.ladHistory.length > 20) a.ladHistory.length = 20;
+}
+
+// 对局结束时补全 pending 条目。expectedEndAt 之前详情锁定（单人天梯快进）。
+function ladHistoryFinalize(accKey, gameId, endedAt, expectedEndAt, overInfo) {
+    const a = accKey ? accounts.get(accKey) : null;
+    if (!a || !a.ladHistory) return;
+    const entry = a.ladHistory.find(h => h.gameId === gameId);
+    if (!entry) return;
+    entry.endedAt = endedAt;
+    entry.expectedEndAt = expectedEndAt;
+    entry.overInfo = overInfo;
+}
+
 // 把房间里所有还没结算的天梯座位按**末名**结算。
 //
 // 用在「房间要被销毁、但赛事还没走到 enterOverT」的时刻 —— 那条路上没有
@@ -1550,6 +1595,8 @@ function ladSettleAllLeft(room, why) {
         seat.ladResult = ladSettle(room, seat, total, total);
         if (seat.ladResult) {
             seat.ladResult.quit = true;
+            ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
+                total, total, seat.ladResult, true);
             log('房间 %s %s %s -> 按末名结算', room.code, seat.name, why);
             // 连接大概已经没了，发了也就发了（sendTo 自己判 seat.sse）
             sendTo(seat, 'ladscore', seat.ladResult);
@@ -2202,27 +2249,40 @@ function sweepVisitors() {
     }
 }
 
-// online  = 还连着的座位 + 没被座位数过的访客
-// playing = 已经开打的房间里还连着的座位
-// waiting = 建好了、还差一个人的房间数（至少有一个人真连着）
+// 按模式和阶段细分，给 GM 看运营全貌。每个字段都是真人座位数（非房间数）。
+//   online         总在线（座位 + 散客）
+//   tourneyLobby   锦标赛大厅里等人的真人
+//   duelLobby      1v1 大厅里等人的真人
+//   ladLobby       天梯匹配中的真人
+//   duelPlaying    1v1 对局中的真人
+//   tourneyPlaying 锦标赛对局中的真人
+//   ladPlaying     天梯对局中的真人
+//   aiPlaying      AI 模拟对局数（不是真人，单独一个字段）
 function computeStats() {
     sweepVisitors();
 
     const liveSids = new Set();
-    let playing = 0, waiting = 0, seated = 0;
+    let seated = 0;
+    let tourneyLobby = 0, duelLobby = 0, ladLobby = 0;
+    let duelPlaying = 0, tourneyPlaying = 0, ladPlaying = 0;
 
     for (const room of rooms.values()) {
         const live = room.seats.filter(s => s && !s.left && s.connected);
         live.forEach(s => liveSids.add(s.sid));
         seated += live.length;
-        if (room.phase === 'lobby') {
-            // 「等人」= 还没开始、还没坐满。原来写死了 < 2（1v1 两座），
-            // 锦标赛是 8 座，得按房间自己的席数判。
-            if (live.length > 0 && live.length < room.seats.length) waiting++;
-        } else if (room.phase !== 'over') {
-            // 打完的房间不销毁（结算面板还要看），但那些人已经不在对局中了 ——
-            // 不排除会显示成「N 人对局中」而其实他们正在看排名
-            playing += live.length;
+        const isLobby = room.phase === 'lobby';
+        const isInGame = room.phase !== 'lobby' && room.phase !== 'over';
+        if (!isLobby && !isInGame) continue;   // over：结算面板还挂着，人已不在对局
+        if (room.mode === 'ladder') {
+            if (isLobby) ladLobby += live.length;
+            else ladPlaying += live.length;
+        } else if (room.mode === 'tourney') {
+            if (isLobby) tourneyLobby += live.length;
+            else tourneyPlaying += live.length;
+        } else {
+            // duel（1v1）
+            if (isLobby) duelLobby += live.length;
+            else duelPlaying += live.length;
         }
     }
 
@@ -2234,25 +2294,17 @@ function computeStats() {
         loose++;
     }
 
-    // 【2026-08-07：这个接口一律真数】原来 online 里加了 ladPlayingCount()
-    // （AI 模拟对局的假人数），ladPlaying 发的也是那个假数。现在这几行只有
-    // GM 看得见（见 /api/stats 的门禁），假数就没有存在的理由了 —— GM 要看的
-    // 是真实运营情况，冲了假人数反而看不出「到底有没有人在玩」。
-    //
     // 【门面数在客户端，不在这里】标题画面那行「天梯模式对局中人数：N」
-    // （200~1000，给所有玩家看）是客户端按本地时钟算的，压根不走这个接口 ——
-    // 见 678net.js 的 D678N.ladFakePlaying。所以这里不需要、也不该掺假数。
-    //
-    // ladPlaying = 真的在天梯房里打的真人（ladRealPlaying）。
-    // aiPlaying  = AI 模拟对局数，单独一个字段，只给 GM 看运营。
-    //
-    // playing（对局中）不含天梯那批：天梯单独一行显示，加进去就是重复计数。
-    const ladN = ladRealPlaying();
+    // （200~1000，给所有玩家看）是客户端按本地时钟算的，压根不走这个接口。
+    // 这里一律真人真数，GM 看的是真实运营情况。
     return {
-        online: seated + loose + ladN,
-        playing: playing,
-        waiting: waiting,
-        ladPlaying: ladN,
+        online: seated + loose,
+        tourneyLobby: tourneyLobby,
+        duelLobby: duelLobby,
+        ladLobby: ladLobby,
+        duelPlaying: duelPlaying,
+        tourneyPlaying: tourneyPlaying,
+        ladPlaying: ladPlaying,
         aiPlaying: ladAiPlayingCount(),
     };
 }
@@ -2706,6 +2758,8 @@ function startLadder(room) {
 
     room.phase = 'battle';
     dailyBump('online', humans.length);
+    // 历史战绩要用：对局开始时间
+    room.tourneyStartAt = Date.now();
     // 谁会掉线 / 离开，这一局一次掷定（见 aiNetRoll）
     aiNetRoll(room);
     // 超哥是谁只记在服务器日志里 —— 客户端永远收不到（见 maskViewT 的 isGod）
@@ -3271,6 +3325,8 @@ function checkRoundBarrier(room) {
             if (room.mode === 'ladder' && s.ladAcc && !s.ladResult) {
                 s.ladResult = ladSettle(room, s, rank, room.game.players.length);
                 ladR = s.ladResult;
+                ladHistoryAdd(s.ladAcc, room.code, room.tourneyStartAt,
+                    rank, room.game.players.length, ladR, false);
             }
             sendTo(s, 'eliminated', Object.assign({
                 rank: rank, total: room.game.players.length,
@@ -3291,7 +3347,18 @@ function checkRoundBarrier(room) {
         // 推进（AI 照打、掉线的人超时自动过牌），等他重连回来接着打。
         // graceTimer 到点才置 left=true，那之后这里 humansLeft 才会归零。
         const humansLeft = room.seats.filter(s => s && !s.left).length;
-        if (aliveN <= 1 || humansLeft === 0) { enterOverT(room); return; }
+        if (aliveN <= 1 || humansLeft === 0) {
+            // 单人天梯：最后一个真人离开时赛事还没打完（aliveN > 1），
+            // 立刻快进模拟剩余 AI 轮次，算出最终排名。结果不马上公布 ——
+            // 设 expectedEndAt = now + 轮数 × 40s，到时间才能看详情，
+            // 否则第 8 名淘汰后秒出排名就等于告诉玩家「其余 7 个是 AI」。
+            if (humansLeft === 0 && aliveN > 1 && room.mode === 'ladder') {
+                fastForwardLad(room);
+            } else {
+                enterOverT(room);
+            }
+            return;
+        }
         startRound(room);
     }, CFG.advanceMs);
 }
@@ -3330,6 +3397,54 @@ function rankOf(room, pIdx) {
     return (i >= 0) ? i + 1 : room.game.players.length;
 }
 
+// 快进模拟：所有真人离开后，把剩余 AI 轮次一次性算完，再走 enterOverT。
+//
+// 每轮固定 40 秒（你定的），expectedEndAt = now + 轮数 × 40s。
+// 到时间之前历史战绩显示「对局中」，过了才能看详情 —— 避免泄露 AI 身份。
+function fastForwardLad(room) {
+    const g = room.game;
+    let ffRounds = 0;
+    const rawAIStep = D678.AI.step;
+    withRoom(room, () => {
+        while (g.alivePlayers().length > 1 && ffRounds < 200) {
+            const r = g.makeRound();
+            if (r.bye) r.bye.last = { type: 'bye', dmg: 0 };
+            r.pairs.forEach(pair => {
+                const pa = pair[0], pb = pair[1];
+                const ia = g.players.indexOf(pa), ib = g.players.indexOf(pb);
+                const frozenA = aiFrozen(room, ia), frozenB = aiFrozen(room, ib);
+                // 冻结的 AI（掉线 / 离开）强制过牌，和正常轮次的行为一致
+                try {
+                    if (frozenA || frozenB) {
+                        D678.AI.step = function (b, si) {
+                            if ((si === 0 && frozenA) || (si === 1 && frozenB)) {
+                                b.act(si, 'stand');
+                                return { side: si, action: 'stand', msg: '对方过牌' };
+                            }
+                            return rawAIStep.call(this, b, si);
+                        };
+                    } else {
+                        D678.AI.step = rawAIStep;
+                    }
+                    D678.simulateMatch(pa, pb);
+                } finally {
+                    D678.AI.step = rawAIStep;
+                }
+            });
+            // 被淘汰的玩家手牌退回池子（和正常 doResolveT 里的逻辑一致）
+            g.players.forEach(p => {
+                if (!p.alive && p.funcs.length > 0) g.returnAllFuncs(p);
+            });
+            ffRounds++;
+        }
+    });
+    D678.AI.step = rawAIStep;
+    room._ffExpectedEndAt = Date.now() + ffRounds * 40000;
+    log('房间 %s 天梯快进模拟：%d 轮，预计 %ds 后公布结果',
+        room.code, ffRounds, ffRounds * 40);
+    enterOverT(room);
+}
+
 function enterOverT(room) {
     room.battles.forEach(bt => { clearTimeout(bt.turnTimer); clearTimeout(bt.aiTimer); });
     clearTimeout(room.roundTimer);
@@ -3361,6 +3476,9 @@ function enterOverT(room) {
         // 不再算第二次 —— ladResult 就是这道闸门。
         if (room.mode === 'ladder' && seat.ladAcc && !seat.ladResult) {
             seat.ladResult = ladSettle(room, seat, myRank, room.game.players.length);
+            // 冠军：之前没被淘汰 / 退出，没有 pending 条目，这里建一条
+            ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
+                myRank, room.game.players.length, seat.ladResult, false);
         }
         sendTo(seat, 'over', {
             mode: 'tourney',
@@ -3371,6 +3489,17 @@ function enterOverT(room) {
             lad: seat.ladResult || undefined,
         });
     });
+    // 天梯历史战绩：把这一局所有 pending 条目补全 endedAt / overInfo / expectedEndAt。
+    // 快进模拟的 expectedEndAt 在未来 —— 到时间之前详情锁定。
+    if (room.mode === 'ladder') {
+        const endedAt = Date.now();
+        const expectedEndAt = room._ffExpectedEndAt || endedAt;
+        room.seats.forEach(seat => {
+            if (!seat || !seat.ladAcc) return;
+            ladHistoryFinalize(seat.ladAcc, room.code, endedAt, expectedEndAt, room.overInfo);
+        });
+        accSave();
+    }
     // 解冻定时器不用留了 —— overInfo 已经拍好快照（status 在上面读过），
     // 之后再改 aiNet 也影响不到任何显示。留着只会让房间在销毁前多握几个定时器。
     aiNetClear(room);
@@ -3813,6 +3942,10 @@ function onDisconnect(room, seat) {
                 // 同一个口径）。重连回来的人走不到这里（上面 seat.connected
                 // 那条就 return 了）。
                 ladSettleAllLeft(room, '掉线未回来');
+                if (room.mode === 'ladder' && room.game) {
+                    room.seats.forEach(s => { if (s && s.sse) releaseSeatConn(room, s); });
+                    fastForwardLad(room);
+                }
                 dropRoom(room, '赛事里所有真人都离开了');
                 return;
             }
@@ -4169,6 +4302,35 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    //--- 天梯：历史战绩 ----------------------------------------------------
+    // 必须登录。返回最近 20 场天梯对局，新在上。
+    // pending（对局未结束或快进模拟未到时间）只返回 startedAt + status，
+    // 不带排名 / 分数 / overInfo —— 单人天梯不能泄露 AI 身份。
+    if (u === '/api/lad/history' && req.method === 'POST') {
+        readBody(req, body => {
+            body = body || {};
+            const rec = accOfToken(body.token);
+            if (!rec) return json(res, 401, { err: '请先登录天梯账号' });
+            const a = accounts.get(rec.acc.toLowerCase());
+            if (!a) return json(res, 404, { err: '账号不存在' });
+            const now = Date.now();
+            const hist = (a.ladHistory || []).map(h => {
+                if (!h.endedAt || now < (h.expectedEndAt || 0)) {
+                    return { gameId: h.gameId, startedAt: h.startedAt,
+                             status: 'pending' };
+                }
+                return {
+                    gameId: h.gameId, startedAt: h.startedAt,
+                    endedAt: h.endedAt, rank: h.rank, total: h.total,
+                    delta: h.delta, score: h.score, tier: h.tier,
+                    quit: h.quit, overInfo: h.overInfo, status: 'done',
+                };
+            });
+            json(res, 200, { ok: true, history: hist });
+        });
+        return;
+    }
+
     //--- 天梯：开启排位 ----------------------------------------------------
     // **必须登录**（分要挂在账号上）而且必须已经起过天梯名 —— 榜上显示的是
     // 天梯名，没名字的人上不了榜，让他先去起名。
@@ -4388,6 +4550,8 @@ const server = http.createServer((req, res) => {
                     seat.ladResult = ladSettle(room, seat, total, total);
                     if (seat.ladResult) {
                         seat.ladResult.quit = true;
+                        ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
+                            total, total, seat.ladResult, true);
                         sendTo(seat, 'ladscore', seat.ladResult);
                     }
                 }
@@ -4408,6 +4572,13 @@ const server = http.createServer((req, res) => {
                     // 结算的人**会跟着房间一起被销毁 —— 他也得按末名算，
                     // 否则「等队友退出」又是一道免罚门。
                     ladSettleAllLeft(room, '房间随他人退出销毁');
+                    // 天梯：快进模拟剩余 AI 轮次，算出最终排名再销毁。
+                    // 先关 SSE —— enterOverT 会发 over（含完整排名表），
+                    // 退出的玩家不该收到（单人天梯会泄露 AI 身份）。
+                    if (room.mode === 'ladder' && room.game) {
+                        room.seats.forEach(s => { if (s && s.sse) releaseSeatConn(room, s); });
+                        fastForwardLad(room);
+                    }
                     dropRoom(room, '赛事里所有真人都离开了');
                 } else {
                     pushStateT(room);
@@ -4489,7 +4660,7 @@ accLoad();
 // 单独断言 —— 只能通过 HTTP 验的话，测「北京时间 9/1 00:00 翻篇」就得
 // 改系统时钟。
 module.exports = {
-    rooms, CFG, withRoom, visitors, daily, accounts, ladTokens,
+    rooms, CFG, withRoom, visitors, daily, accounts, ladTokens, accSave,
     ladSeason, ladTier, ladConv, ladAiState, ladBoard, ladBoardView,
     ladPersona, ladReplaySeason, ladFrac, ladK, ladBoardBust,
     ladAiPlayingCount, ladRealPlaying, aiNetRoll, aiNetOf, setAiNetForce, GM_ACC,

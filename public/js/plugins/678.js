@@ -2262,6 +2262,7 @@ Scene_D678.prototype.refresh = function () {
         // 补一张全员表 —— 名次 / 名字 / 胜-负 / 胜率。overInfo（_netOver.ranks）
         // 里每人带了 wins / losses，客户端算一下胜率就行。单机不画——
         // 那边有血条上的「▼ 排名」可看全员，再叠一份就重复了。
+        var blogY = 584;
         if (over0 && this._net && this._netOver && this._netOver.ranks) {
             var rk = this._netOver.ranks, rMy = this._netOver.myRank || 0;
             var rY = top + hgt + 8;
@@ -2282,8 +2283,28 @@ Scene_D678.prototype.refresh = function () {
                 this.txt(bmp, '胜率 ' + rrate, 440, rrow, 120, 18,
                     (rg > 0 && (rp.wins || 0) / rg >= 0.5) ? COL.green : rcol, 'left');
             }
+            // 天梯加减分 —— 和 678net.js 的 drawLadDelta 同一套配色，
+            // 但画在排名表下方（gameover 画面是 678.js 管的，那边没有 drawLadDelta）。
+            // 冠军原先看不到这一行：over 消息带了 lad，但 gameover 画面没取它。
+            var lad = this._netOver.lad;
+            if (lad) {
+                var ladY = rY + rH + 4;
+                var ladH = lad.quit ? 52 : 34;
+                this.box(bmp, 40, ladY, 640, ladH, 'rgba(0,0,0,0.5)', COL.line, 12);
+                var ld = lad.delta;
+                var lsign = (ld > 0 ? '+' : '');
+                this.txt(bmp, '天梯分 ' + lsign + ld, 64, ladY + 8, 220, 26,
+                    ld >= 0 ? COL.gold : COL.red, 'left');
+                this.txt(bmp, lad.tier + '  ' + lad.score + ' 分',
+                    LY.SW - 64 - 300, ladY + 10, 300, 24, COL.white, 'right');
+                if (lad.quit) {
+                    this.txt(bmp, '中途退出按末名结算', 64, ladY + 34, 556, 18,
+                        COL.red, 'left');
+                }
+                blogY = ladY + ladH + 6;
+            }
         }
-        this.drawBattleLog();
+        this.drawBattleLog(blogY);
         var over = (this._phase === 'gameover');
         // 【联机的轮结果页整行让位】678net.js 的 netDrawOverlay 在 y=1070 画
         // 自己那句（「点击任意位置继续」/「其他玩家还在对局（还有 N 桌）」…），
@@ -2303,10 +2324,10 @@ Scene_D678.prototype.refresh = function () {
 };
 
 // 本局对战记录：画在「第X轮结果」界面，谁做了什么、动作后的牌面
-Scene_D678.prototype.drawBattleLog = function () {
+Scene_D678.prototype.drawBattleLog = function (startY) {
     var bmp = this._uiBmp;
     var log = this._lastLog || [];
-    var x = 40, y = 584, w = 640, h = 470, lineH = 24;
+    var x = 40, y = startY || 584, w = 640, h = 1054 - y, lineH = 24;
     var maxLines = 16;
     this.box(bmp, x, y, w, h, 'rgba(0,0,0,0.5)', COL.line, 12);
     this.txt(bmp, '本局对战记录', x, y + 8, w, 20, COL.gold, 'center');

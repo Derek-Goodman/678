@@ -582,21 +582,29 @@ var TIER_COL = {
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
 
+// 历史战绩日期格式化：x年x月x日x时
+function fmtLadDate(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' +
+           d.getDate() + '日' + d.getHours() + '时';
+}
+function fmtLadHour(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    return d.getHours() + '时';
+}
+
 // 在线信息两行的 y，和它下面标题 / 按钮的 y。
 //
-// 【为什么要重排】原来在线行在 292（占 292~322），天梯行在 324（占 324~354），
-// 而「锦标赛」/「单人对决」标题画在 336（30 号字占 40 高，336~376）——
-// 天梯行和标题重叠了 18 像素（你报的）。当时 drawDuel 把标题从 300 让到 336
-// 只避开了第一行，后来加的天梯行没跟着让。
-//
-// 【为什么不是简单往下推】现在天梯那行还要多带一段「N 个 AI 模拟对局中」。
-// 三行的话底边到 386，而菜单按钮从 380 起 —— 又会压到按钮上。所以两个天梯
-// 数字并进同一行（真人红色 · AI 灰色），整块保持两行，再把标题和按钮让开。
+// 【两行布局】第一行：在线 + 大厅等待（匹配 / 1v1房 / 天梯匹配）。
+// 第二行：对局中（1v1 / 锦标赛 / 天梯）+ AI 模拟数。
+// 按模式和阶段拆开，不再笼统计「对局中」，避免重复计数。
 //
 // 【行距按 size + 10 算】this.txt 的绘制高度是 size + 10，20 号字占 30 高 ——
 // 按 20 算间距会重叠 7 像素。
-var ONLINE_Y = 288;          // 第一行：在线 / 对局中 / 等人   288~318
-var ONLINE_Y2 = 318;         // 第二行：天梯真人 / AI 模拟     318~348
+var ONLINE_Y = 288;          // 第一行：在线 / 大厅等待        288~318
+var ONLINE_Y2 = 318;         // 第二行：对局中 / AI 模拟       318~348
 var MENU_TITLE_Y = 360;      // 「锦标赛」「单人对决」标题      360~400
 var MENU_BTN_Y = 412;        // 菜单按钮起点
 
@@ -900,13 +908,18 @@ Scene_D678Net.prototype.pingStats = function () {
         }
         self._statsFail = false;
         var old = D678N.stats;
-        // 非 GM：清掉本地那份，那两行就不画了（退出登录后不能还挂着旧数字）
+        // 非 GM：清掉本地那份，那几行就不画了（退出登录后不能还挂着旧数字）
         D678N.stats = r.gm ? r : null;
         var now = D678N.stats;
         // 数字没变就不重绘，省得每 5 秒白刷一遍整个画面
         if (!old !== !now || (old && now &&
-            (old.online !== now.online || old.playing !== now.playing ||
-             old.waiting !== now.waiting || old.ladPlaying !== now.ladPlaying ||
+            (old.online !== now.online ||
+             old.tourneyLobby !== now.tourneyLobby ||
+             old.duelLobby !== now.duelLobby ||
+             old.ladLobby !== now.ladLobby ||
+             old.duelPlaying !== now.duelPlaying ||
+             old.tourneyPlaying !== now.tourneyPlaying ||
+             old.ladPlaying !== now.ladPlaying ||
              old.aiPlaying !== now.aiPlaying))) {
             self.refresh();
         }
@@ -925,14 +938,20 @@ Scene_D678Net.prototype.updateStats = function () {
 // 【只有 GM 看得见】（2026-08-07 你定的）非 GM 拿不到 D678N.stats
 // （pingStats 里 gm 为假就置 null），所以这里 !s 直接不画。
 //
-// 【这两行的数字一律是真的】原来 online 里掺了 AI 模拟对局的假人数。现在只有
-// GM 看，冲了假数反而看不出「到底有没有人在玩」，所以 online / ladPlaying 都是
-// 真人，AI 模拟数单独一段（灰色）摆在第二行。
+// 【数字一律是真的】原来 online 里掺了 AI 模拟对局的假人数。现在只有
+// GM 看，冲了假数反而看不出「到底有没有人在玩」，所以各项都是真人座位数，
+// AI 模拟数单独标在后半段。
 //
 // 【别和标题上那行红字搞混】标题画面「天梯模式对局中人数：N」是**造的门面数**
 // （2026-08-07 你定的，见 D678N.ladFakePlaying），给所有玩家看、量级 200~1000。
 // 这两行是运营数字、只给 GM、量级个位到几十。GM 会同时看到两个数，它们之间
 // 没有任何换算关系 —— 一个是门面，一个是实情，故意分开的。
+//
+// 【两行布局】
+// 第一行：在线总数 + 各类大厅等待人数（匹配 / 1v1 / 天梯匹配）
+// 第二行：各类对局中人数（1v1 / 锦标赛 / 天梯）+ AI 模拟数
+// 按模式和阶段拆开，不再笼统计「对局中」，避免「1 人天梯对局中又显示 1 人对局中」
+// 的重复（旧的 playing 和 ladPlaying 分不清是谁在打谁）。
 Scene_D678Net.prototype.drawOnline = function () {
     var W = Graphics.width;
     var s = D678N.stats;
@@ -941,23 +960,26 @@ Scene_D678Net.prototype.drawOnline = function () {
     // 一行永远不消失的提示）
     if (!s) return;
 
-    var parts = ['在线 ' + s.online + ' 人'];
-    if (s.playing > 0) parts.push(s.playing + ' 人对局中');
-    if (s.waiting > 0) parts.push(s.waiting + ' 个房间等人');
-    // 有人在等就标绿：这时候点「加入房间」马上能开一局
-    var col = s.waiting > 0 ? LC.green : (s.online > 1 ? LC.text : LC.gray);
-    this.txt('● ' + parts.join(' · '), 0, ONLINE_Y, W, 20, col, 'center');
+    // 第一行：在线 + 大厅等待
+    var lobby = ['在线 ' + s.online];
+    lobby.push('匹配 ' + (s.tourneyLobby || 0));
+    lobby.push('1v1房 ' + (s.duelLobby || 0));
+    lobby.push('天梯匹配 ' + (s.ladLobby || 0));
+    // 有人在大厅等 → 标绿（ actionable：点进去马上能开一局）
+    var anyLobby = (s.tourneyLobby || 0) + (s.duelLobby || 0) + (s.ladLobby || 0);
+    var col1 = anyLobby > 0 ? LC.green : (s.online > 1 ? LC.text : LC.gray);
+    this.txt('● ' + lobby.join(' · '), 0, ONLINE_Y, W, 20, col1, 'center');
 
-    // 第二行：天梯真人（红）+ AI 模拟（灰）。两个数字并在一行 ——
-    // 各占一行的话底边会压到下面的标题上。
-    // 真人那段为 0 时只显示 AI 那段。
-    var lad = [];
-    if (s.ladPlaying > 0) lad.push(s.ladPlaying + ' 人天梯对局中');
-    if (s.aiPlaying > 0) lad.push(s.aiPlaying + ' 个 AI 模拟对局');
-    if (!lad.length) return;
-    // 有真人就用红色（真人在打是要紧信息），只有 AI 时用灰色（那只是背景噪音）
-    this.txt(lad.join(' · '), 0, ONLINE_Y2, W, 20,
-             s.ladPlaying > 0 ? LC.red : LC.gray, 'center');
+    // 第二行：对局中 + AI 模拟
+    var game = [];
+    game.push('1v1对局 ' + (s.duelPlaying || 0));
+    game.push('锦标赛 ' + (s.tourneyPlaying || 0));
+    game.push('天梯 ' + (s.ladPlaying || 0));
+    var realPlaying = (s.duelPlaying || 0) + (s.tourneyPlaying || 0) + (s.ladPlaying || 0);
+    if ((s.aiPlaying || 0) > 0) game.push('AI模拟 ' + s.aiPlaying);
+    // 有真人在打 → 白色；只有 AI → 灰色（背景噪音）
+    var col2 = realPlaying > 0 ? LC.text : LC.gray;
+    this.txt(game.join(' · '), 0, ONLINE_Y2, W, 20, col2, 'center');
 };
 
 //--- 绘制 ------------------------------------------------------------------
@@ -1013,8 +1035,12 @@ Scene_D678Net.prototype.refresh = function () {
 
     // 排行榜自己占满整屏（100 行要地方），不画「多人游戏」标题和名字条。
     // 它的返回按钮也自己画 —— 位置和别处不一样（底部要留给分页按钮）。
-    if (this._page === 'board') {
-        this.drawBoard();
+    // 历史战绩同理 —— 列表和详情都自己占满整屏。
+    if (this._page === 'board' || this._page === 'history' ||
+        this._page === 'historyDetail') {
+        if (this._page === 'board') this.drawBoard();
+        else if (this._page === 'history') this.drawLadHistory();
+        else this.drawLadHistoryDetail();
         if (this._noticeTime > 0 && this._notice) {
             this.panel(60, H - 200, W - 120, 64);
             this.txt(this._notice, 60, H - 182, W - 120, 24, LC.red, 'center');
@@ -1238,6 +1264,17 @@ Scene_D678Net.prototype.drawLadReady = function () {
 
     var bw = 200, bh = 54;
     var bx = px + BTN_W - bw, by = ry + BTN_H + 16 + 62 + 16;
+    // 历史战绩按钮（退出登录左边，同宽同高）
+    var hpress = (this._press === 123);
+    drawBtn(this._bmp, px, by, bw, bh, hpress, hpress);
+    this._bmp.fontSize = 22;
+    this._bmp.textColor = hpress ? LC.edge : LC.text;
+    this._bmp.outlineColor = 'rgba(0,0,0,0.8)';
+    this._bmp.outlineWidth = 4;
+    this._bmp.drawText('历史战绩', px, by + (bh - 28) / 2 + (hpress ? 2 : 0),
+                       bw, 28, 'center');
+    this._hits.push({ x: px, y: by, w: bw, h: bh, i: 123,
+                      cb: this.onLadHistory.bind(this) });
     var press = (this._press === 110);
     drawBtn(this._bmp, bx, by, bw, bh, press, press);
     this._bmp.fontSize = 22;
@@ -1773,6 +1810,112 @@ Scene_D678Net.prototype.drawFinalRanks = function () {
     this.drawLadDelta(o.lad, 372 + 12 + list.length * 34 + 14);
 };
 
+// 天梯历史战绩列表。最多 20 条，新在上。pending 显示「对局中」，
+// done 显示日期 / 排名 / 加减分。点 done 条目进详情。
+Scene_D678Net.prototype.drawLadHistory = function () {
+    var W = Graphics.width, H = Graphics.height;
+    var list = this._ladHistory || [];
+    this.txt('历史战绩', 0, 40, W, 40, LC.gold, 'center');
+
+    if (!list.length) {
+        this.txt('还没有天梯对局记录', 0, 300, W, 28, LC.gray, 'center');
+    } else {
+        var y0 = 100, rowH = 52;
+        // 整块底板
+        this.panel(32, y0 - 8, W - 64, list.length * rowH + 14);
+        var self = this;
+        for (var i = 0; i < list.length; i++) {
+            var h = list[i];
+            var ry = y0 + i * rowH;
+            if (h.status === 'pending') {
+                this.txt('对局中，请稍后查看', 56, ry + 16, W - 112, 22,
+                         LC.gray, 'left');
+            } else {
+                var line1 = fmtLadDate(h.startedAt) + '开始-' +
+                            fmtLadHour(h.endedAt) + '结束';
+                var line2 = '对局排名 ' + h.rank + ' / ' + (h.total || 8) +
+                            '　·　天梯分 ' + (h.delta > 0 ? '+' : '') + h.delta;
+                var col = h.delta >= 0 ? LC.gold : LC.red;
+                this.txt(line1, 56, ry + 6, W - 112, 20, LC.text, 'left');
+                this.txt(line2, 56, ry + 28, W - 112, 20, col, 'left');
+                if (h.quit) {
+                    this.txt('（中途退出）', W - 200, ry + 6, 130, 18,
+                             LC.red, 'right');
+                }
+                // 点击进详情
+                this._hits.push({
+                    x: 32, y: ry, w: W - 64, h: rowH, i: 200 + i,
+                    cb: (function (entry) {
+                        return function () {
+                            self._ladHistDetail = entry;
+                            self._page = 'historyDetail';
+                            self.refresh();
+                        };
+                    })(h),
+                });
+            }
+        }
+    }
+
+    // 返回按钮
+    var by = H - 100;
+    var rx = Math.round(W / 2 - 110);
+    this.panel(rx, by, 220, 56);
+    this.txt('返回', rx, by + 17, 220, 26, LC.text, 'center');
+    this._hits.push({ x: rx, y: by, w: 220, h: 56, i: -1,
+                      cb: this.onBack.bind(this) });
+};
+
+// 历史战绩详情：完整排名表 + 天梯加减分（和最终结算画面一致）。
+Scene_D678Net.prototype.drawLadHistoryDetail = function () {
+    var W = Graphics.width;
+    var h = this._ladHistDetail;
+    if (!h) { this._page = 'history'; this.refresh(); return; }
+    var list = h.overInfo || [];
+
+    this.txt('历史战绩', 0, 40, W, 40, LC.gold, 'center');
+    this.txt(fmtLadDate(h.startedAt) + '开始-' + fmtLadHour(h.endedAt) + '结束',
+             0, 88, W, 22, LC.gray, 'center');
+
+    // 排名表（和 drawFinalRanks 同一套版式）
+    this.panel(50, 130, W - 100, 12 + list.length * 34);
+    for (var i = 0; i < list.length; i++) {
+        var p = list[i], y = 140 + i * 34;
+        var mine = (i + 1 === h.rank);
+        var col = mine ? LC.gold : (p.alive ? LC.text : '#8a9a92');
+        this.txt(String(i + 1), 72, y, 40, 20,
+                 mine ? LC.gold : LC.gray, 'left');
+        this.txt(p.name, 112, y, 220, 20, col, 'left');
+        this.txt('HP ' + Math.max(0, p.hp), 340, y, 90, 20,
+                 p.hp > 30 ? col : LC.red, 'left');
+        var st = D678N.statusText(p.status);
+        if (st) this.txt(st, W - 180, y, 110, 20, LC.red, 'right');
+    }
+
+    // 天梯加减分
+    var ladY = 130 + 12 + list.length * 34 + 14;
+    var d = h.delta;
+    var sign = (d > 0 ? '+' : '');
+    this.panel(50, ladY, W - 100, h.quit ? 62 : 44);
+    this.txt('天梯分 ' + sign + d, 74, ladY + 10, 220, 26,
+             d >= 0 ? LC.gold : LC.red, 'left');
+    this.txt(h.tier + '  ' + h.score + ' 分',
+             W - 74 - 300, ladY + 12, 300, 24,
+             TIER_COL[h.tier] || LC.text, 'right');
+    if (h.quit) {
+        this.txt('中途退出按末名结算', 74, ladY + 36, W - 148, 18,
+                 LC.red, 'left');
+    }
+
+    // 返回按钮
+    var by = ladY + (h.quit ? 62 : 44) + 30;
+    var rx = Math.round(W / 2 - 110);
+    this.panel(rx, by, 220, 56);
+    this.txt('返回', rx, by + 17, 220, 26, LC.text, 'center');
+    this._hits.push({ x: rx, y: by, w: 220, h: 56, i: -1,
+                      cb: this.onBack.bind(this) });
+};
+
 //--- 输入 ------------------------------------------------------------------
 
 Scene_D678Net.prototype.update = function () {
@@ -2243,6 +2386,24 @@ Scene_D678Net.prototype.onBoard = function () {
     });
 };
 
+// 历史战绩：从服务器拉最近 20 场天梯对局。
+Scene_D678Net.prototype.onLadHistory = function () {
+    var self = this;
+    this._busy = true;
+    D678N.Net.post('/api/lad/history', { token: D678N.ladToken() },
+    function (r, code) {
+        self._busy = false;
+        if (!r || code !== 200) {
+            self.notice((r && r.err) || '战绩读取失败');
+            self.refresh();
+            return;
+        }
+        self._ladHistory = r.history || [];
+        self._page = 'history';
+        self.refresh();
+    });
+};
+
 // 匹配：服务器找一个未满未开始的锦标赛房，没有就建。不要房号 —— 朋友局
 // 直接进同一个空房就行（你定的）。
 Scene_D678Net.prototype.onMatch = function () {
@@ -2285,6 +2446,19 @@ Scene_D678Net.prototype.onReady = function () {
 };
 
 Scene_D678Net.prototype.onBack = function () {
+    // 历史战绩详情 → 回列表
+    if (this._page === 'historyDetail') {
+        this._page = 'history';
+        this.refresh();
+        return;
+    }
+    // 历史战绩列表 → 回天梯页
+    if (this._page === 'history') {
+        this._ladHistory = null;
+        this._page = 'ladder';
+        this.refresh();
+        return;
+    }
     // 排行榜：回到进来时那一页。**绝不能顺手清会话** —— 匹配中点开榜再返回
     // 要还在匹配里（服务器那边席位一直占着，清了就变成「界面回菜单但服务器
     // 还在给我攒人」，开赛时没人接盘面）。
@@ -2492,6 +2666,8 @@ Scene_D678.prototype.netApply = function (m) {
     if (!plist) return;   // 不该发生，但别让一份坏消息把场景搞崩
 
     // 副本：players[0] 永远是本地玩家（服务器已镜像）
+    // 记下更新前的轮号 —— 重连补 fresh 那条判断要拿它比（见下方）
+    var prevRound = (D678.Game && D678.Game.round) || 0;
     var g = D678N.buildReplica(plist, m.round, this._netStartHp);
     D678.Game = g;
 
@@ -2737,6 +2913,41 @@ Scene_D678.prototype.netApply = function (m) {
         return;
     }
 
+    // 【重连时漏了 fresh 就补上】
+    //
+    // SSE 断线重连期间服务器可能已经开了新一局：startRound / nextBattle 推的
+    // {fresh:true} 丢了，重连后 onReconnect 推的 resync 不带 fresh。下面
+    // netPhaseSettled() 守卫会把我们留在 roundResult / resolve，于是卡在上一轮
+    // 的画面上，而服务器已经在下一轮了 —— 这就是「有时进不去对局」的根因。
+    //
+    // 判据：resync + 已落定 + 服务器轮号比我们手里的高 = 漏了新一轮的 fresh。
+    // 和 fresh 分支做同样的清理（重置 resolveId / preFuncs 追踪、清掉轮结果
+    // 残留），但不播发牌动画 —— 牌局已经在进行中，播了反而对不上当前盘面。
+    if (m.resync && this.netPhaseSettled() && g.round > prevRound) {
+        this._selFunc = null;
+        this._notice = '';
+        this._panelHold = 0;
+        this._panelFade = 1;
+        this._netWaitAck = false;
+        this._netWaiting = false;
+        this._netAdvancing = false;
+        this._netFinished = false;
+        this._netWaitRound = false;
+        this._netAutoDiscarded = null;
+        this._report = null;
+        this._lastLog = null;
+        this._netPending = null;
+        this._netPendFresh = false;
+        this._netPendRedealt = false;
+        this._netPlayedResolve = 0;
+        this._netPreApplied = 0;
+        this._battle = D678N.buildBattle(v, g);
+        this._phase = 'battle';
+        this._wait = 0;
+        this.refresh();
+        return;
+    }
+
     // 【别再无条件写 _phase = 'battle'】锦标赛里别人桌每动一下，pushStateT 都会
     // 给我推一份状态（8 个人共用一条广播）。这些状态既没有 fresh 也没有 resolved，
     // 会一路落到下面 —— 原来那两行把我的 _phase 从 resolve / discard / roundResult
@@ -2903,6 +3114,9 @@ Scene_D678.prototype.netPoll = function () {
     if (b.over) {
         this._netOver = b.over;
         var tourney = (b.over.mode === 'tourney');
+        // 【天梯：冠军这条路也要更新分数】淘汰那条路在 elim 分支里调了
+        // applyLadResult，over 这条路原来漏了 —— 冠军的天梯登录态分不会即时刷新。
+        if (b.over.lad) D678N.applyLadResult(b.over.lad);
         b.over = null;
         b.elim = null;              // 同一帧的淘汰通知并进这次结算
         // 沿用单机的淘汰 / 通关画面
