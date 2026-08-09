@@ -1863,14 +1863,19 @@ Scene_D678Net.prototype.drawLadHistory = function () {
 };
 
 // 历史战绩详情：个人战绩面板 + 所有玩家排名表 + 天梯加减分。
-// 排名表只显示名次 / 名字 / 胜率，不显示 HP 和离开状态（你定的）。
+// 排名表列：名次 / 名字 / 胜负 / 满点 / 功能 / 对战胜 / 总胜率。
+// 对战胜 = 查看者对该玩家的胜率（来自 vsLog），没交手过显示—。
 Scene_D678Net.prototype.drawLadHistoryDetail = function () {
     var W = Graphics.width;
     var h = this._ladHistDetail;
     if (!h) { this._page = 'history'; this.refresh(); return; }
     var list = h.overInfo || [];
+    var vsLog = h.vsLog || [];
     var pct = function (v) { return (v === null || v === undefined) ? '—' : v + '%'; };
     var rate = function (a, n) { return n > 0 ? Math.round(a / n * 100) : null; };
+    // vsLog 按名字索引，方便查每个对手的对战胜率
+    var vsMap = {};
+    for (var v = 0; v < vsLog.length; v++) vsMap[vsLog[v].name] = vsLog[v];
 
     this.txt('历史战绩', 0, 40, W, 40, LC.gold, 'center');
     this.txt(fmtLadTime(h.startedAt, h.endedAt), 0, 88, W, 22, LC.gray, 'center');
@@ -1892,42 +1897,73 @@ Scene_D678Net.prototype.drawLadHistoryDetail = function () {
             '共使用功能牌 ' + (me.funcUses || 0) + ' 次',
         ];
         var panelH = 12 + rows.length * 28 + 6;
-        this.panel(50, top, W - 100, panelH);
+        this.panel(40, top, W - 80, panelH);
         for (var r = 0; r < rows.length; r++) {
-            this.txt(rows[r], 50, top + 12 + r * 28, W - 100, 20,
+            this.txt(rows[r], 40, top + 12 + r * 28, W - 80, 20,
                      LC.text, 'center');
         }
         top += panelH + 14;
     }
 
-    // 所有玩家排名表：名次 / 名字 / 胜率
-    this.panel(50, top, W - 100, 12 + list.length * 34);
+    // 排名表列位置（面板 x=40, w=W-80）
+    // 名次24 / 名字100 / 胜负56 / 满点36 / 功能40 / 对战胜90 / 总胜率50
+    var cx = {
+        rank: 56, name: 82, wl: 186, mp: 244, fn: 284,
+        vs: 330, wr: W - 136,
+    };
+    var rowH = 30, headH = 32;
+    var tableH = headH + list.length * rowH + 8;
+    this.panel(40, top, W - 80, tableH);
     // 表头
-    this.txt('胜率', W - 180, top + 2, 110, 18, LC.gray, 'right');
+    var hy = top + 6;
+    this.txt('名次', cx.rank, hy, 40, 16, LC.gray, 'left');
+    this.txt('名字', cx.name, hy, 80, 16, LC.gray, 'left');
+    this.txt('胜负', cx.wl, hy, 50, 16, LC.gray, 'left');
+    this.txt('满点', cx.mp, hy, 36, 16, LC.gray, 'left');
+    this.txt('功能', cx.fn, hy, 40, 16, LC.gray, 'left');
+    this.txt('对战胜', cx.vs, hy, 80, 16, LC.gray, 'left');
+    this.txt('总胜率', cx.wr, hy, 60, 16, LC.gray, 'right');
     for (var i = 0; i < list.length; i++) {
-        var p = list[i], y = top + 12 + i * 34;
+        var p = list[i], y = top + headH + i * rowH;
         var mine = (p.rank === h.rank);
         var col = mine ? LC.gold : LC.text;
-        this.txt(String(p.rank), 72, y, 40, 20,
+        this.txt(String(p.rank), cx.rank, y, 40, 18,
                  mine ? LC.gold : LC.gray, 'left');
-        this.txt(p.name, 112, y, 220, 20, col, 'left');
+        this.txt(p.name, cx.name, y, 100, 18, col, 'left');
+        this.txt((p.wins || 0) + '-' + (p.losses || 0),
+                 cx.wl, y, 50, 18, col, 'left');
+        this.txt(String(p.maxPoint || 0), cx.mp, y, 36, 18, col, 'left');
+        this.txt(String(p.funcUses || 0), cx.fn, y, 40, 18, col, 'left');
+        // 对战胜：自己的行不显示
+        if (mine) {
+            this.txt('—', cx.vs, y, 80, 18, LC.gray, 'left');
+        } else {
+            var vs = vsMap[p.name];
+            if (vs) {
+                var vcol = (vs.rate !== null && vs.rate >= 50) ? LC.green : LC.gray;
+                this.txt(vs.games + '场 ' + pct(vs.rate),
+                         cx.vs, y, 90, 18, vcol, 'left');
+            } else {
+                this.txt('—', cx.vs, y, 80, 18, LC.gray, 'left');
+            }
+        }
         var wr = rate(p.wins, p.games);
-        this.txt(pct(wr), W - 180, y, 110, 20,
+        this.txt(pct(wr), cx.wr, y, 60, 18,
                  (wr !== null && wr >= 50) ? LC.green : col, 'right');
     }
 
     // 天梯加减分
-    var ladY = top + 12 + list.length * 34 + 14;
+    var ladY = top + tableH + 14;
     var d = h.delta;
     var sign = (d > 0 ? '+' : '');
-    this.panel(50, ladY, W - 100, h.quit ? 62 : 44);
-    this.txt('天梯分 ' + sign + d, 74, ladY + 10, 220, 26,
+    this.panel(40, ladY, W - 80, h.quit ? 62 : 44);
+    this.txt('天梯分 ' + sign + d, 64, ladY + 10, 220, 26,
              d >= 0 ? LC.gold : LC.red, 'left');
     this.txt(h.tier + '  ' + h.score + ' 分',
-             W - 74 - 300, ladY + 12, 300, 24,
+             W - 64 - 300, ladY + 12, 300, 24,
              TIER_COL[h.tier] || LC.text, 'right');
     if (h.quit) {
-        this.txt('中途退出按末名结算', 74, ladY + 36, W - 148, 18,
+        this.txt('中途退出按末名结算', 64, ladY + 36, W - 128, 18,
                  LC.red, 'left');
     }
 

@@ -1546,7 +1546,7 @@ function ladSettle(room, seat, rank, total) {
 // 服务器重启也不丢。万一房间被异常销毁（掉线未回来等），条目会永远停在
 // pending —— 罕见，可接受。
 
-function ladHistoryAdd(accKey, gameId, startedAt, rank, total, result, quit) {
+function ladHistoryAdd(accKey, gameId, startedAt, rank, total, result, quit, vsLog) {
     const a = accKey ? accounts.get(accKey) : null;
     if (!a) return;
     if (!a.ladHistory) a.ladHistory = [];
@@ -1564,6 +1564,9 @@ function ladHistoryAdd(accKey, gameId, startedAt, rank, total, result, quit) {
         tier: result ? result.tier : '',
         quit: !!quit,
         overInfo: null,            // null = 不能看详情
+        // 被淘汰 / 退出时拍的 vsLog：你对每个交手过的对手的胜负。
+        // overInfo 是最终数据，但 vsLog 在你离场后就不再变了 —— 拍一份留着。
+        vsLog: vsLog || null,
     });
     if (a.ladHistory.length > 20) a.ladHistory.length = 20;
 }
@@ -1596,7 +1599,8 @@ function ladSettleAllLeft(room, why) {
         if (seat.ladResult) {
             seat.ladResult.quit = true;
             ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
-                total, total, seat.ladResult, true);
+                total, total, seat.ladResult, true,
+                snapshotVsLog(room, seat.pIdx));
             log('房间 %s %s %s -> 按末名结算', room.code, seat.name, why);
             // 连接大概已经没了，发了也就发了（sendTo 自己判 seat.sse）
             sendTo(seat, 'ladscore', seat.ladResult);
@@ -3326,7 +3330,8 @@ function checkRoundBarrier(room) {
                 s.ladResult = ladSettle(room, s, rank, room.game.players.length);
                 ladR = s.ladResult;
                 ladHistoryAdd(s.ladAcc, room.code, room.tourneyStartAt,
-                    rank, room.game.players.length, ladR, false);
+                    rank, room.game.players.length, ladR, false,
+                    snapshotVsLog(room, s.pIdx));
             }
             sendTo(s, 'eliminated', Object.assign({
                 rank: rank, total: room.game.players.length,
@@ -3388,6 +3393,20 @@ function eliminatedStats(room, pIdx) {
         funcUses: p.funcUses || 0,
         vs: vs,
     };
+}
+
+// 拍一份 vsLog 快照给历史战绩用：你对每个交手过的对手的胜负。
+// 玩家被淘汰 / 退出后 vsLog 不再变，拍一份存进历史条目。
+function snapshotVsLog(room, pIdx) {
+    const p = room.game ? room.game.players[pIdx] : null;
+    if (!p) return null;
+    const rate = (a, n) => (n > 0 ? Math.round(a / n * 100) : null);
+    return Object.keys(p.vsLog || {}).map(k => {
+        const e = p.vsLog[k];
+        const n = e.wins + e.losses;
+        return { name: e.name, games: n, wins: e.wins, losses: e.losses,
+                 rate: rate(e.wins, n) };
+    }).sort((a, b) => (b.games - a.games) || a.name.localeCompare(b.name));
 }
 
 // 名次：已淘汰的按 outAt 倒数，存活的按血量。和 rankedPlayers 同一套语义。
@@ -3478,7 +3497,8 @@ function enterOverT(room) {
             seat.ladResult = ladSettle(room, seat, myRank, room.game.players.length);
             // 冠军：之前没被淘汰 / 退出，没有 pending 条目，这里建一条
             ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
-                myRank, room.game.players.length, seat.ladResult, false);
+                myRank, room.game.players.length, seat.ladResult, false,
+                snapshotVsLog(room, seat.pIdx));
         }
         sendTo(seat, 'over', {
             mode: 'tourney',
@@ -4323,7 +4343,8 @@ const server = http.createServer((req, res) => {
                     gameId: h.gameId, startedAt: h.startedAt,
                     endedAt: h.endedAt, rank: h.rank, total: h.total,
                     delta: h.delta, score: h.score, tier: h.tier,
-                    quit: h.quit, overInfo: h.overInfo, status: 'done',
+                    quit: h.quit, overInfo: h.overInfo,
+                    vsLog: h.vsLog || null, status: 'done',
                 };
             });
             json(res, 200, { ok: true, history: hist });
@@ -4551,7 +4572,8 @@ const server = http.createServer((req, res) => {
                     if (seat.ladResult) {
                         seat.ladResult.quit = true;
                         ladHistoryAdd(seat.ladAcc, room.code, room.tourneyStartAt,
-                            total, total, seat.ladResult, true);
+                            total, total, seat.ladResult, true,
+                            snapshotVsLog(room, seat.pIdx));
                         sendTo(seat, 'ladscore', seat.ladResult);
                     }
                 }
