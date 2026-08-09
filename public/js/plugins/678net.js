@@ -582,17 +582,17 @@ var TIER_COL = {
 
 var BTN_W = 420, BTN_H = 78, BTN_GAP = 24;
 
-// 历史战绩日期格式化：x年x月x日x时
-function fmtLadDate(ts) {
-    if (!ts) return '';
-    var d = new Date(ts);
-    return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' +
-           d.getDate() + '日' + d.getHours() + '时';
-}
-function fmtLadHour(ts) {
-    if (!ts) return '';
-    var d = new Date(ts);
-    return d.getHours() + '时';
+// 历史战绩时间格式化：20260810/00:15-00:35
+function fmtLadTime(s, e) {
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    function f(ts) {
+        if (!ts) return '';
+        var d = new Date(ts);
+        return d.getFullYear() +
+               p2(d.getMonth() + 1) + p2(d.getDate()) + '/' +
+               p2(d.getHours()) + ':' + p2(d.getMinutes());
+    }
+    return f(s) + '-' + f(e);
 }
 
 // 在线信息两行的 y，和它下面标题 / 按钮的 y。
@@ -1811,7 +1811,7 @@ Scene_D678Net.prototype.drawFinalRanks = function () {
 };
 
 // 天梯历史战绩列表。最多 20 条，新在上。pending 显示「对局中」，
-// done 显示日期 / 排名 / 加减分。点 done 条目进详情。
+// done 一行显示时间 / 排名 / 加减分。点 done 条目进详情。
 Scene_D678Net.prototype.drawLadHistory = function () {
     var W = Graphics.width, H = Graphics.height;
     var list = this._ladHistory || [];
@@ -1820,26 +1820,22 @@ Scene_D678Net.prototype.drawLadHistory = function () {
     if (!list.length) {
         this.txt('还没有天梯对局记录', 0, 300, W, 28, LC.gray, 'center');
     } else {
-        var y0 = 100, rowH = 52;
-        // 整块底板
+        var y0 = 100, rowH = 36;
         this.panel(32, y0 - 8, W - 64, list.length * rowH + 14);
         var self = this;
         for (var i = 0; i < list.length; i++) {
             var h = list[i];
             var ry = y0 + i * rowH;
             if (h.status === 'pending') {
-                this.txt('对局中，请稍后查看', 56, ry + 16, W - 112, 22,
+                this.txt('对局中，请稍后查看', 56, ry + 8, W - 112, 22,
                          LC.gray, 'left');
             } else {
-                var line1 = fmtLadDate(h.startedAt) + '开始-' +
-                            fmtLadHour(h.endedAt) + '结束';
-                var line2 = '对局排名 ' + h.rank + ' / ' + (h.total || 8) +
-                            '　·　天梯分 ' + (h.delta > 0 ? '+' : '') + h.delta;
-                var col = h.delta >= 0 ? LC.gold : LC.red;
-                this.txt(line1, 56, ry + 6, W - 112, 20, LC.text, 'left');
-                this.txt(line2, 56, ry + 28, W - 112, 20, col, 'left');
+                var line = fmtLadTime(h.startedAt, h.endedAt) +
+                    '　对局排名' + h.rank +
+                    '　天梯分' + (h.delta > 0 ? '+' : '') + h.delta;
+                this.txt(line, 56, ry + 8, W - 112, 22, LC.text, 'left');
                 if (h.quit) {
-                    this.txt('（中途退出）', W - 200, ry + 6, 130, 18,
+                    this.txt('退出', W - 120, ry + 8, 60, 20,
                              LC.red, 'right');
                 }
                 // 点击进详情
@@ -1866,34 +1862,62 @@ Scene_D678Net.prototype.drawLadHistory = function () {
                       cb: this.onBack.bind(this) });
 };
 
-// 历史战绩详情：完整排名表 + 天梯加减分（和最终结算画面一致）。
+// 历史战绩详情：个人战绩面板 + 所有玩家排名表 + 天梯加减分。
+// 排名表只显示名次 / 名字 / 胜率，不显示 HP 和离开状态（你定的）。
 Scene_D678Net.prototype.drawLadHistoryDetail = function () {
     var W = Graphics.width;
     var h = this._ladHistDetail;
     if (!h) { this._page = 'history'; this.refresh(); return; }
     var list = h.overInfo || [];
+    var pct = function (v) { return (v === null || v === undefined) ? '—' : v + '%'; };
+    var rate = function (a, n) { return n > 0 ? Math.round(a / n * 100) : null; };
 
     this.txt('历史战绩', 0, 40, W, 40, LC.gold, 'center');
-    this.txt(fmtLadDate(h.startedAt) + '开始-' + fmtLadHour(h.endedAt) + '结束',
-             0, 88, W, 22, LC.gray, 'center');
+    this.txt(fmtLadTime(h.startedAt, h.endedAt), 0, 88, W, 22, LC.gray, 'center');
 
-    // 排名表（和 drawFinalRanks 同一套版式）
-    this.panel(50, 130, W - 100, 12 + list.length * 34);
+    // 找到自己的 overInfo 行
+    var me = null;
     for (var i = 0; i < list.length; i++) {
-        var p = list[i], y = 140 + i * 34;
-        var mine = (i + 1 === h.rank);
-        var col = mine ? LC.gold : (p.alive ? LC.text : '#8a9a92');
-        this.txt(String(i + 1), 72, y, 40, 20,
+        if (list[i].rank === h.rank) { me = list[i]; break; }
+    }
+
+    // 个人战绩面板（和 drawElim 同一套数据）
+    var top = 120;
+    if (me) {
+        var g = me.games || 0;
+        var rows = [
+            '对局 ' + g + ' 场　胜 ' + (me.wins || 0) + '　负 ' + (me.losses || 0) +
+                '　胜率 ' + pct(rate(me.wins, g)),
+            '满点 ' + (me.maxPoint || 0) + ' 次　满点率 ' + pct(rate(me.maxPoint, g)),
+            '共使用功能牌 ' + (me.funcUses || 0) + ' 次',
+        ];
+        var panelH = 12 + rows.length * 28 + 6;
+        this.panel(50, top, W - 100, panelH);
+        for (var r = 0; r < rows.length; r++) {
+            this.txt(rows[r], 50, top + 12 + r * 28, W - 100, 20,
+                     LC.text, 'center');
+        }
+        top += panelH + 14;
+    }
+
+    // 所有玩家排名表：名次 / 名字 / 胜率
+    this.panel(50, top, W - 100, 12 + list.length * 34);
+    // 表头
+    this.txt('胜率', W - 180, top + 2, 110, 18, LC.gray, 'right');
+    for (var i = 0; i < list.length; i++) {
+        var p = list[i], y = top + 12 + i * 34;
+        var mine = (p.rank === h.rank);
+        var col = mine ? LC.gold : LC.text;
+        this.txt(String(p.rank), 72, y, 40, 20,
                  mine ? LC.gold : LC.gray, 'left');
         this.txt(p.name, 112, y, 220, 20, col, 'left');
-        this.txt('HP ' + Math.max(0, p.hp), 340, y, 90, 20,
-                 p.hp > 30 ? col : LC.red, 'left');
-        var st = D678N.statusText(p.status);
-        if (st) this.txt(st, W - 180, y, 110, 20, LC.red, 'right');
+        var wr = rate(p.wins, p.games);
+        this.txt(pct(wr), W - 180, y, 110, 20,
+                 (wr !== null && wr >= 50) ? LC.green : col, 'right');
     }
 
     // 天梯加减分
-    var ladY = 130 + 12 + list.length * 34 + 14;
+    var ladY = top + 12 + list.length * 34 + 14;
     var d = h.delta;
     var sign = (d > 0 ? '+' : '');
     this.panel(50, ladY, W - 100, h.quit ? 62 : 44);
