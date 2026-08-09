@@ -1043,7 +1043,7 @@ function accSave() {
         }
         const tmp = ACC_FILE + '.tmp';
         try {
-            fs.writeFileSync(tmp, JSON.stringify(out), 'utf8');
+            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf8');
             fs.renameSync(tmp, ACC_FILE);
         } catch (e) {
             log('天梯账号写盘失败（忽略）: %s', e.message);
