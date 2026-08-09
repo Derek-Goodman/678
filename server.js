@@ -125,7 +125,8 @@ const CFG = {
     // hit 会把它归零，所以在线方每要一张牌都要多买一个完整回合的等待。
     // 重连回来立刻恢复成 turnSec（见 armTurnTimer）。
     goneTurnSec: Number(argOf('--gone-turn-sec', 10)),
-    // 二选一的选牌时限（秒）。实际窗口是 min(这个值, 回合剩余时间)。
+    // 二选一的选牌时限（秒）。已废弃——二选一超时改挂在回合计时器上（含
+    // 思考池），不再另起短窗口。保留解析是为了老命令行 / 测试脚本不报错。
     pick2Sec: Number(argOf('--pick2-sec', 10)),
 
     // 掉线后多久强制结束房间（秒）。界面上不再显示这个倒计时 ——
@@ -1876,9 +1877,19 @@ function maskViewT(room, bt, seat, snapPre) {
     const P = (pIdx) => {
         const p = g.players[pIdx];
         const st = room.seats.find(s => s && s.pIdx === pIdx);
+        // 假 AI 桌算完了但还没公布：HP/胜负用公布前的快照，
+        // 否则真人那桌一推状态，另外几桌 AI 已经掉血了，
+        // 而这一轮还没打完 —— 泄漏 AI 身份。
+        const fakeBt = room.battles.find(x => x.fakeAI && !x.done &&
+                                              x.pIdx.indexOf(pIdx) >= 0);
+        const ps = (fakeBt && fakeBt.preStats && fakeBt.preStats[pIdx]) || null;
         return {
-            name: p.name, hp: p.hp, alive: p.alive,
-            wins: p.wins, losses: p.losses, maxPoint: p.maxPoint,
+            name: p.name,
+            hp: ps ? ps.hp : p.hp,
+            alive: p.alive,
+            wins: ps ? ps.wins : p.wins,
+            losses: ps ? ps.losses : p.losses,
+            maxPoint: ps ? ps.maxPoint : p.maxPoint,
             funcUses: p.funcUses,
             // 【淘汰顺序，排名表按它排】少了这个字段客户端副本里所有死人的
             // outAt 都是 0，rankedPlayers 的 `b.outAt - a.outAt` 对每一对死人
@@ -2756,6 +2767,15 @@ function startRound(room) {
                     stepsBySide[si]++;
                     return raw.call(this, b, si);
                 };
+                // 在 simulateMatch 改掉 HP/胜负之前拍一张快照 ——
+                // 假桌的 done 被推迟了，但 doResolve 会当场改玩家对象。
+                // 不快照的话真人那桌一推 pushStateT，另外几桌 AI 已经掉血了，
+                // 而这一轮还没打完 —— 真人不会在轮次中途掉血，这等于泄漏 AI 身份。
+                const preStats = {};
+                preStats[ia] = { hp: pa.hp, wins: pa.wins, losses: pa.losses,
+                                 maxPoint: pa.maxPoint };
+                preStats[ib] = { hp: pb.hp, wins: pb.wins, losses: pb.losses,
+                                 maxPoint: pb.maxPoint };
                 try {
                     withRoom(room, () => { D678.simulateMatch(pa, pb); });
                 } finally {
@@ -2773,6 +2793,8 @@ function startRound(room) {
                     aiPlan: null,
                     // 标记：这桌已经算完了，只是还没到公布时间
                     fakeAI: true,
+                    // 公布之前的 HP/胜负快照（P 函数据此遮蔽）
+                    preStats: preStats,
                 };
                 room.battles.push(fake);
                 fake.aiTimer = setTimeout(() => {
@@ -2922,29 +2944,11 @@ function armTurnTimerT(room, bt) {
     bt.turnHardDeadline = bt.turnDeadline + bankTurn;
     bt.bankTurnMs = bankTurn;
 
-    // 二选一的待选：窗口 = min(pick2Sec, 回合剩余)，超时随机选。
-    // 跟 1v1 的 armTurnTimer 同一套语义，详见那边的注释。
+    // 【二选一不另起短计时器】选牌窗口 = 整个回合计时（含思考池），和普通回合
+    // 一样挂在 turnHardDeadline 上。超时（玩家没操作导致自动跳过）时如果还有
+    // pending2，随机选一张——见 forceStand。不再用 min(pick2Sec, 回合剩余) 提前
+    // 开火；玩家有思考池时，即使回合时限到了也不该替他选。
     //
-    // 【二选一不给动用思考池】窗口按 turnDeadline 算，不看 turnHardDeadline。
-    // 取 min 本来就是为了不让这张牌变成偷时间的手段，让它能额外多拿 15 秒
-    // 正好是反过来。
-    if (bt.b.pending2) {
-        const leftMs = bt.turnDeadline - now;
-        const wait = Math.max(0, Math.min(CFG.pick2Sec * 1000, leftMs));
-        bt.pick2Deadline = now + wait;
-        bt.turnTimer = setTimeout(() => {
-            if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
-            if (!bt.b.pending2) return;              // 已经选过了
-            const who = bt.b.pending2.side;
-            log('房间 %s 第 %d 桌 pIdx=%d 二选一超时 -> 随机选',
-                room.code, bt.id, bt.pIdx[who]);
-            applyActionT(room, bt, who,
-                { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
-        }, wait);
-        return;
-    }
-    bt.pick2Deadline = 0;
-
     // 判过牌挂在硬截止上（回合时限 + 本回合可动用的池子）。
     // 池子那一段烧完时要把它扣掉 —— 玩家确实用掉了那段时间。
     bt.turnTimer = setTimeout(() => {
@@ -2955,6 +2959,15 @@ function armTurnTimerT(room, bt) {
 
 function forceStand(room, bt, why) {
     if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
+    // 二选一超时 -> 随机选（pick2Resolve 会 endTurn），不直接判过牌。
+    if (bt.b.pending2) {
+        const who = bt.b.pending2.side;
+        log('房间 %s 第 %d 桌 pIdx=%d 二选一超时 -> 随机选',
+            room.code, bt.id, bt.pIdx[who]);
+        applyActionT(room, bt, who,
+            { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
+        return;
+    }
     log('房间 %s 第 %d 桌 pIdx=%d %s -> 判过牌',
         room.code, bt.id, bt.pIdx[bt.b.turn], why);
     applyActionT(room, bt, bt.b.turn, { type: 'stand' }, true);
@@ -2997,7 +3010,16 @@ function stepAIIfNeeded(room, bt) {
     // 万一没有（非天梯、或者被别的路径绕过），当场补一个。
     if (!bt.aiPlan) bt.aiPlan = ladAiPlan(room, pIdx);
     const plan = bt.aiPlan;
-    const wait = (room.mode === 'ladder') ? plan.delay : CFG.aiStepMs;
+    let wait = (room.mode === 'ladder') ? plan.delay : CFG.aiStepMs;
+
+    // 【不能要牌时缩短延迟】明牌已 ≥ 21（或牛牛满 5 张）时 canHit 返回 false，
+    // AI 只能过牌或用不消耗回合的功能牌 —— 没什么好想的，长考反而不像真人。
+    // 只缩短延迟，decide 照常跑（功能牌该用还是会用）。
+    // cost 也要清零：没真想那么久，不该扣思考池。
+    if (!bt.b.canHit(bt.b.turn)) {
+        wait = Math.min(wait, 500);
+        plan.cost = 0;
+    }
 
     bt.aiTimer = setTimeout(() => {
         if (!bt.b || bt.b.finished || bt.done || room.phase !== 'battle') return;
@@ -3088,7 +3110,7 @@ function applyActionT(room, bt, side, action, forced) {
             // 客户端发来的一律不可信，越界或不是他的回合都拒掉。
             const rp = b.pick2Resolve(side, action.idx);
             if (!rp) { ok = false; err = '现在不能选牌'; return; }
-            msg = '对方选了 1 张牌';
+            msg = '对方选了 ' + rp.value;
         } else {
             ok = false; err = '未知动作';
         }
@@ -3444,31 +3466,20 @@ function armTurnTimer(room) {
 
     room.turnDeadline = room.turnStartAt + sec * 1000;
 
-    // 【二选一的待选另起一个更短的时限】选牌窗口 = min(pick2Sec, 回合剩余)。
-    // 你定的：回合只剩 3 秒时用这张牌，选牌也只有 3 秒；超时随机选，
-    // 且因为「他有操作、只是慢了」不挂 idled（见 applyAction）。
-    // 取 min 而不是另开一个完整窗口，是为了不让这张牌变成偷时间的手段。
-    const p2 = room.battle.pending2;
-    if (p2) {
-        const left = room.turnDeadline - Date.now();
-        const wait = Math.max(0, Math.min(CFG.pick2Sec * 1000, left));
-        room.pick2Deadline = Date.now() + wait;
-        room.turnTimer = setTimeout(() => {
-            const b = room.battle;
-            if (!b || b.finished || room.phase !== 'battle') return;
-            if (!b.pending2) return;                 // 这期间已经选过了
-            const who = b.pending2.side;
-            log('房间 %s 座位 %d 二选一超时 -> 随机选（%d 秒）',
-                room.code, who, Math.round(wait / 1000));
-            applyAction(room, who, { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
-        }, wait);
-        return;
-    }
-    room.pick2Deadline = 0;
-
+    // 【二选一不另起短计时器】选牌窗口 = 整个回合剩余时间，和普通回合一样挂在
+    // turnDeadline 上。超时（玩家没操作导致自动跳过）时如果还有 pending2，
+    // 随机选一张而不是直接判过牌——见下面的回调。不再用 min(pick2Sec, 回合剩余)
+    // 提前开火，那是「还有思考时间却替他选了」。
     room.turnTimer = setTimeout(() => {
         const b = room.battle;
         if (!b || b.finished || room.phase !== 'battle') return;
+        if (b.pending2) {
+            // 二选一超时 -> 随机选（pick2Resolve 会 endTurn）
+            const who = b.pending2.side;
+            log('房间 %s 座位 %d 二选一超时 -> 随机选', room.code, who);
+            applyAction(room, who, { type: 'pick2', idx: Math.random() < 0.5 ? 0 : 1 }, true);
+            return;
+        }
         log('房间 %s 座位 %d 回合超时 -> 判过牌（%d 秒时限%s）',
             room.code, b.turn, sec, short ? '，挂机中' : '');
         applyAction(room, b.turn, { type: 'stand' }, true);
@@ -3538,7 +3549,7 @@ function applyAction(room, si, action, forced) {
             // 二选一的选择。只有待选那一方能选，idx 只接受 0/1
             const rp = b.pick2Resolve(si, action.idx);
             if (!rp) { ok = false; err = '现在不能选牌'; return; }
-            msg = '对方选了 1 张牌';
+            msg = '对方选了 ' + rp.value;
         } else {
             ok = false; err = '未知动作';
         }

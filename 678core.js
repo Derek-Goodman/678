@@ -291,11 +291,12 @@ D678.FUNCS = [];
     // 不进 GAIN_KINDS（加的是对方不是自己），牛牛上限在 useFunc 里单独挡对方。
     D678.FUNCS.push({ id: 'helppick', img: 'helppick', name: '帮小抽', kind: 'helppick',
         desc: '帮对方抽一张牌库里最小的数字牌\n（明牌）。\n不消耗回合。' });
-    // mirror：放在自己场上最新位置，动态复制对方同位置的明牌值。
-    // 是虚空数字牌（fake），进 GAIN_KINDS（算牛牛 5 张上限）。
+    // mirror：放在对方场上，动态复制自己同位置的明牌，点数算对方头上（骚扰）。
+    // 是虚空数字牌（fake），不进 GAIN_KINDS（加的是对方不是自己），牛牛上限在
+    // useFunc 里单独挡对方侧。
     // resolveMirror 在 scoreVals / endTurn / useFunc 末尾刷新，保证值始终同步。
     D678.FUNCS.push({ id: 'mirror', img: 'mirror', name: '镜像复制', kind: 'mirror',
-        desc: '复制对方同位置的一张明牌\n（暗牌无法复制），\n变为虚空数字牌。\n打出后本回合结束。' });
+        desc: '在对方场上放一张镜像牌，\n复制自己同位置的明牌\n（暗牌无法复制，显示 0），\n点数算在对方头上。不消耗回合。' });
     // destroy：把对方最新的非底牌放到牌库最下方，不消耗回合。
     // 明牌暗牌都能破坏，被破坏的是暗牌时不透露点数。
     D678.FUNCS.push({ id: 'destroy', img: 'destroy', name: '破坏', kind: 'destroy',
@@ -703,10 +704,9 @@ D678_Battle.prototype.ruleBlockedReason = function (id) {
 //   num / copy                 -> 造一张虚空数字
 // 净张数不变的不算：swap（互换）、return（只减）、reback（换对方底牌）、
 // repick 和 pickbig（都是先去一张再拿一张）、check / rule（不碰牌）。
-//   mirror                    -> 复制对方同位置的明牌（虚空数字）
-// helppick 不在里面：它往对方场上加牌，不是自己获得牌，牛牛上限在 useFunc
-// 的 helppick 分支里单独挡对方那侧。
-D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy', 'mirror'];
+// helppick 和 mirror 都不在里面：它们往**对方**场上加牌，牛牛上限在 useFunc
+// 各自分支里单独挡对方那侧。
+D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy'];
 D678.funcGainsCard = function (id) {
     var f = D678.funcData(id);
     return !!f && D678.GAIN_KINDS.indexOf(f.kind) >= 0;
@@ -762,9 +762,11 @@ D678_Battle.prototype.countCards = function (si, onlyUp) {
 // 去看对方同位置的牌——是明牌就复制 v 和 face，否则（没牌 / 暗牌）显示
 // mirror 自身的卡图、点数 0。
 //
-// 【位置就是数组下标】mirror 牌被放在自己 cards 末尾，它的下标 i 对应
-// 对方 cards[i]。如果之前的牌被 return / destroy 等移走，下标会自然
-// 前移，mirror 跟着换复制对象——这跟「位置」的直觉一致。
+// 【位置就是数组下标】mirror 牌在谁的 cards 里就复制对面同下标的那张。
+// 放对方场上时复制自己同位置的牌（骚扰），被 swap / rob 挪回自己场上后
+// 自动反转为复制对方同位置的牌（借牌）—— 不需要改 resolveMirror，
+// 它本来就两边都扫。下标随 return / destroy 等移牌自然前移，mirror 跟着
+// 换复制对象，跟「位置」的直觉一致。
 //
 // 调用时机：scoreVals（算分前）、endTurn（回合切换前）、useFunc 末尾
 // （出牌后立刻同步），三处覆盖了所有牌面可能变化的入口。
@@ -1208,17 +1210,21 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
     case 'swap':
         var a = this.newestUp(si), b = this.newestUp(1 - si);
         if (!a || !b) { res.err = b ? '我方场上没有明牌' : '对方场上没有明牌'; return res; }
+        res.value = a.v; res.other = b.v;     // 换之前的值，给 msg / what 用
         // 【假牌跟着数值走】（你定的规则）换的是「这张牌是什么」，所以
         // fake/face 必须跟 v 一起换：我的假 +1 换给对方，对方拿到的就是
         // 一张假 +1；换过来的真 7 在我这儿是一张真 7。
         // 只换 v 的话会造出「真牌显示 1 点」和「假牌显示 7 点」这种四不像。
+        // mirror 标记同理：镜像牌被 swap 挪到对面后，仍然是一张动态镜像。
         var t = a.v; a.v = b.v; b.v = t;
-        var tf = a.fake, tc = a.face;
+        var tf = a.fake, tc = a.face, tm = a.mirror;
         if (b.fake) a.fake = true; else delete a.fake;
         if (b.face) a.face = b.face; else delete a.face;
+        if (b.mirror) a.mirror = true; else delete a.mirror;
         if (tf) b.fake = true; else delete b.fake;
         if (tc) b.face = tc; else delete b.face;
-        res.ok = true; res.msg = '对方使用了' + f.name;
+        if (tm) b.mirror = true; else delete b.mirror;
+        res.ok = true; res.msg = '对方使用了' + f.name + '，' + res.value + ' 和 ' + res.other + ' 互换';
         break;
     case 'rob':
         var rb = this.newestUp(1 - si);
@@ -1227,9 +1233,13 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         opp.cards.splice(pos, 1);
         // 换手就是换阵营，给个新 uid —— 客户端会当成「新到我这边的牌」重新入场，
         // 正是强夺该有的观感。沿用旧 uid 的话它会从对方那一排原地跳过来。
-        // 假牌被抢走仍然是假牌（fake/face 一起带过去）。
-        side.cards.push(D678.mkCard(rb.v, false, rb.fake, rb.face));
-        res.ok = true; res.msg = '对方使用了' + f.name;
+        // 假牌被抢走仍然是假牌（fake/face 一起带过去）；
+        // 镜像牌被抢走仍然是镜像（mirror 标记带过去，到新位置后照常动态刷新）。
+        var rbCard = D678.mkCard(rb.v, false, rb.fake, rb.face);
+        if (rb.mirror) rbCard.mirror = true;
+        side.cards.push(rbCard);
+        res.value = rb.v;
+        res.ok = true; res.msg = '对方使用了' + f.name + '，夺走了 ' + res.value + ' 点明牌';
         break;
     case 'return':
         var rt = this.newestUp(si);
@@ -1240,7 +1250,8 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         // 但玩家看得见那是复制品/加减牌，不拦着他。
         if (!rt.fake) this.deck.push(rt.v);
         res.fakeGone = !!rt.fake;
-        res.ok = true; res.msg = '对方使用了' + f.name;
+        res.value = rt.v;
+        res.ok = true; res.msg = '对方使用了' + f.name + '，退回了 ' + res.value + ' 点明牌';
         break;
     case 'rule':
         var rblock = this.ruleBlockedReason(id);
@@ -1292,7 +1303,8 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         }
         res.same = (!rp.fake && res.value === rp.v);
         res.ok = true; res.endTurn = true;
-        res.msg = '对方使用了' + f.name;
+        res.msg = '对方使用了' + f.name + '，洗掉 ' +
+            res.oldValue + ' 重抽到 ' + res.value;
         break;
     case 'reback':
         // 强制替换对方第一张底牌。换上来的一定不是原来那张：
@@ -1320,7 +1332,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         this.doPick(si, mn, false);
         res.value = mn;
         res.ok = true; res.endTurn = true;
-        res.msg = '对方使用了' + f.name;
+        res.msg = '对方使用了' + f.name + '，抽到了 ' + res.value;
         break;
     case 'pickbig':
         // 先退明牌再抽最大，而「最大」要**除开刚退回去的那张**（你定的规则）——
@@ -1344,7 +1356,8 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         this.doPick(si, mx, false);
         res.value = mx;
         res.ok = true; res.endTurn = true;
-        res.msg = '对方使用了' + f.name;
+        res.msg = '对方使用了' + f.name + '，退回 ' +
+            (res.fakeGone ? '复制品' : res.oldValue) + ' 抽到了 ' + res.value;
         break;
     case 'num':
         // 视作数字牌打在自己场上（+1 / -1）。不来自牌库 -> 假牌。
@@ -1369,10 +1382,13 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         // 原来只复制点数，于是复制 +1 得到一张「1 点的复制品」，显示成 1 ——
         // 玩家看到的是「我复制了 +1，场上却多了张 1」，读不通。
         // 点数本来就相同（+1 的 v 就是 1），所以这只影响显示成哪张卡图。
-        side.cards.push(D678.mkCard(cp.v, false, true, cp.face));
+        // 镜像牌被复制后仍然是镜像（mirror 标记带过去）。
+        var cpCard = D678.mkCard(cp.v, false, true, cp.face);
+        if (cp.mirror) cpCard.mirror = true;
+        side.cards.push(cpCard);
         res.value = cp.v;
         res.ok = true; res.endTurn = true;
-        res.msg = '对方使用了' + f.name;
+        res.msg = '对方使用了' + f.name + '，复制了 ' + res.value;
         break;
     case 'helppick':
         // 帮对方抽牌库里最小的一张明牌。不消耗回合。
@@ -1385,17 +1401,23 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         var hpMn = this.deckMin();
         this.doPick(1 - si, hpMn, false);
         res.value = hpMn;
-        res.ok = true; res.msg = '对方使用了' + f.name;
+        res.ok = true; res.msg = '对方使用了' + f.name + '，帮对方抽出了 ' + res.value;
         break;
     case 'mirror':
-        // 在自己场上最新位置放一张镜像虚空牌，动态复制对方同位置的明牌。
-        // 算牛牛 5 张上限（已在 GAIN_KINDS 里，cardGainBlockedReason 会挡）。
-        // 初始 v=0 face='mirror'，resolveMirror 立刻刷新成实际值。
+        // 在对方场上放一张镜像虚空牌，动态复制自己同位置的明牌，
+        // 点数算在对方头上（骚扰：往对方头上塞牌、促使其爆牌）。
+        // resolveMirror 遍历双方，mirror 牌在 opp 侧时自动复制 self 同位置——
+        // 方向反转不需要改 resolveMirror，它本来就两边都扫。
+        // 初始 v=0 face='mirror'（同位置没牌 / 是暗牌时保持 0）。
+        // 不消耗回合。牛牛上限查对方（不在 GAIN_KINDS 里，这里单独挡）。
+        if (this.isCowRule() && opp.cards.length >= D678.COW_MAX_CARDS) {
+            res.err = D678.cowCapMsg(); return res;
+        }
         var mc = D678.mkCard(0, false, true, 'mirror');
         mc.mirror = true;
-        side.cards.push(mc);
+        opp.cards.push(mc);
         this.resolveMirror();
-        res.ok = true; res.endTurn = true;
+        res.ok = true; res.endTurn = false;
         res.msg = '对方使用了' + f.name;
         break;
     case 'destroy':
@@ -1407,9 +1429,11 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         var dst = opp.cards.pop();
         res.targetHidden = dst.hidden;
         res.fakeGone = !!dst.fake;
+        res.value = dst.v;                 // 暗牌不给对方看，下面 msg 按 targetHidden 挑
         if (!dst.fake) this.deck.push(dst.v);
         this.resolveMirror();
-        res.ok = true; res.msg = '对方使用了' + f.name;
+        res.ok = true; res.msg = '对方使用了' + f.name + '，破坏了' +
+            (res.targetHidden ? '一张暗牌' : ' ' + res.value + ' 点明牌');
         break;
     }
 
@@ -1427,9 +1451,9 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         if (res.fail)                     what += '（失败：' + (res.err || '无法使用') + '）';
         else if (f.kind === 'pick')       what += '，抽出了 ' + f.num;
         else if (f.kind === 'pickback')   what += '，暗抽了 1 张';
-        else if (f.kind === 'swap')       what += '，双方最新明牌互换';
-        else if (f.kind === 'rob')        what += '，夺走对方明牌';
-        else if (f.kind === 'return')     what += '，明牌退回牌库底';
+        else if (f.kind === 'swap')       what += '，' + res.value + ' 和 ' + res.other + ' 互换';
+        else if (f.kind === 'rob')        what += '，夺走对方 ' + res.value + ' 点明牌';
+        else if (f.kind === 'return')     what += '，退回 ' + res.value + ' 点明牌';
         else if (f.kind === 'rule')       what += '，规则变为' + f.name +
                                                   // 规则暗牌会重掷出牌方的底牌（换不成时没有这两个字段）
                                                   (res.value !== undefined && res.value !== null ?
@@ -1446,8 +1470,8 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         else if (f.kind === 'copy')       what += '，复制了 ' + res.value;
         else if (f.kind === 'helppick')   what += '，帮对方抽出了 ' + res.value;
         else if (f.kind === 'mirror')     what += '，镜像复制';
-        else if (f.kind === 'destroy')    what += '，破坏了对方一张' +
-                                                  (res.targetHidden ? '暗牌' : '明牌');
+        else if (f.kind === 'destroy')    what += '，破坏了对方' +
+                                                  (res.targetHidden ? '一张暗牌' : ' ' + res.value + ' 点明牌');
         else if (f.kind === 'pick2' && res.only) {
             what += '，牌库只剩 1 张，抽出了 ' + res.value;
         }
@@ -2348,6 +2372,9 @@ D678.AI.mustHit = function (b, si) {
 D678.AI.RULE_NEAR = 4;
 
 D678.AI.ruleTimingOK = function (b, si, id) {
+    // 规则标准21 已经是默认规则：当前没有规则（或已经是标准21）时用这张
+    // 等于白扔，闸门直接拦下。只有现有规则对自己不利时才该出。
+    if (id === 'rulenull' && (!b.rule || b.rule === 'rulenull')) return false;
     var save = b.rule;
     b.rule = id;
     var t     = b.total(si);
