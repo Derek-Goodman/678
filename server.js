@@ -1043,7 +1043,19 @@ function accSave() {
         }
         const tmp = ACC_FILE + '.tmp';
         try {
-            fs.writeFileSync(tmp, JSON.stringify(out, null, 2), 'utf8');
+            // 账号字段缩进显示，但 ladHistory 压成一行——
+            // 20 条历史 × 十几个字段，全展开一个账号占几百行。
+            // 用 0 做占位符再正则替换回紧凑数组。
+            const items = out.list.map(a => {
+                const hist = JSON.stringify(a.ladHistory);
+                a.ladHistory = 0;
+                let s = JSON.stringify(a, null, 2);
+                s = s.replace(/"ladHistory": 0/, '"ladHistory": ' + hist);
+                return s.replace(/^/gm, '    ');
+            });
+            fs.writeFileSync(tmp,
+                '{\n  "v": 1,\n  "list": [\n' +
+                items.join(',\n') + '\n  ]\n}', 'utf8');
             fs.renameSync(tmp, ACC_FILE);
         } catch (e) {
             log('天梯账号写盘失败（忽略）: %s', e.message);
