@@ -1820,27 +1820,28 @@ Scene_D678Net.prototype.drawLadHistory = function () {
     if (!list.length) {
         this.txt('还没有天梯对局记录', 0, 300, W, 28, LC.gray, 'center');
     } else {
-        var y0 = 100, rowH = 36;
-        this.panel(32, y0 - 8, W - 64, list.length * rowH + 14);
+        var y0 = 100, rowH = 44;
         var self = this;
         for (var i = 0; i < list.length; i++) {
             var h = list[i];
             var ry = y0 + i * rowH;
+            // 每条单独一个框
+            this.panel(32, ry, W - 64, rowH - 6);
             if (h.status === 'pending') {
-                this.txt('对局中，请稍后查看', 56, ry + 8, W - 112, 22,
+                this.txt('对局中，请稍后查看', 56, ry + 10, W - 112, 22,
                          LC.gray, 'left');
             } else {
                 var line = fmtLadTime(h.startedAt, h.endedAt) +
                     '　对局排名' + h.rank +
                     '　天梯分' + (h.delta > 0 ? '+' : '') + h.delta;
-                this.txt(line, 56, ry + 8, W - 112, 22, LC.text, 'left');
+                this.txt(line, 56, ry + 10, W - 112, 22, LC.text, 'left');
                 if (h.quit) {
-                    this.txt('退出', W - 120, ry + 8, 60, 20,
+                    this.txt('退出', W - 120, ry + 10, 60, 20,
                              LC.red, 'right');
                 }
                 // 点击进详情
                 this._hits.push({
-                    x: 32, y: ry, w: W - 64, h: rowH, i: 200 + i,
+                    x: 32, y: ry, w: W - 64, h: rowH - 6, i: 200 + i,
                     cb: (function (entry) {
                         return function () {
                             self._ladHistDetail = entry;
@@ -1905,50 +1906,50 @@ Scene_D678Net.prototype.drawLadHistoryDetail = function () {
         top += panelH + 14;
     }
 
-    // 排名表列位置（面板 x=40, w=W-80）
-    // 名次24 / 名字100 / 胜负56 / 满点36 / 功能40 / 对战胜90 / 总胜率50
+    // 排名表列位置（面板 x=40, w=W-80, 内容区 x=56~664）
+    // 7 列均匀分布，列间距 16px
     var cx = {
-        rank: 56, name: 82, wl: 186, mp: 244, fn: 284,
-        vs: 330, wr: W - 136,
+        rank: 56, name: 96, wl: 322, mp: 386, fn: 434,
+        vs: 486, wr: 602,
     };
-    var rowH = 30, headH = 32;
+    var rowH = 30, headH = 36;
     var tableH = headH + list.length * rowH + 8;
     this.panel(40, top, W - 80, tableH);
     // 表头
     var hy = top + 6;
-    this.txt('名次', cx.rank, hy, 40, 16, LC.gray, 'left');
-    this.txt('名字', cx.name, hy, 80, 16, LC.gray, 'left');
-    this.txt('胜负', cx.wl, hy, 50, 16, LC.gray, 'left');
-    this.txt('满点', cx.mp, hy, 36, 16, LC.gray, 'left');
-    this.txt('功能', cx.fn, hy, 40, 16, LC.gray, 'left');
-    this.txt('对战胜', cx.vs, hy, 80, 16, LC.gray, 'left');
-    this.txt('总胜率', cx.wr, hy, 60, 16, LC.gray, 'right');
+    this.txt('名次', cx.rank, hy, 24, 16, LC.gray, 'left');
+    this.txt('名字', cx.name, hy, 210, 16, LC.gray, 'left');
+    this.txt('胜负', cx.wl, hy, 48, 16, LC.gray, 'left');
+    this.txt('满点', cx.mp, hy, 32, 16, LC.gray, 'left');
+    this.txt('功能', cx.fn, hy, 36, 16, LC.gray, 'left');
+    this.txt('对战胜', cx.vs, hy, 100, 16, LC.gray, 'left');
+    this.txt('总胜率', cx.wr, hy, 62, 16, LC.gray, 'right');
     for (var i = 0; i < list.length; i++) {
         var p = list[i], y = top + headH + i * rowH;
         var mine = (p.rank === h.rank);
         var col = mine ? LC.gold : LC.text;
-        this.txt(String(p.rank), cx.rank, y, 40, 18,
+        this.txt(String(p.rank), cx.rank, y, 24, 18,
                  mine ? LC.gold : LC.gray, 'left');
-        this.txt(p.name, cx.name, y, 100, 18, col, 'left');
+        this.txt(p.name, cx.name, y, 210, 18, col, 'left');
         this.txt((p.wins || 0) + '-' + (p.losses || 0),
-                 cx.wl, y, 50, 18, col, 'left');
-        this.txt(String(p.maxPoint || 0), cx.mp, y, 36, 18, col, 'left');
-        this.txt(String(p.funcUses || 0), cx.fn, y, 40, 18, col, 'left');
+                 cx.wl, y, 48, 18, col, 'left');
+        this.txt(String(p.maxPoint || 0), cx.mp, y, 32, 18, col, 'left');
+        this.txt(String(p.funcUses || 0), cx.fn, y, 36, 18, col, 'left');
         // 对战胜：自己的行不显示
         if (mine) {
-            this.txt('—', cx.vs, y, 80, 18, LC.gray, 'left');
+            this.txt('—', cx.vs, y, 100, 18, LC.gray, 'left');
         } else {
             var vs = vsMap[p.name];
             if (vs) {
                 var vcol = (vs.rate !== null && vs.rate >= 50) ? LC.green : LC.gray;
                 this.txt(vs.games + '场 ' + pct(vs.rate),
-                         cx.vs, y, 90, 18, vcol, 'left');
+                         cx.vs, y, 100, 18, vcol, 'left');
             } else {
-                this.txt('—', cx.vs, y, 80, 18, LC.gray, 'left');
+                this.txt('—', cx.vs, y, 100, 18, LC.gray, 'left');
             }
         }
         var wr = rate(p.wins, p.games);
-        this.txt(pct(wr), cx.wr, y, 60, 18,
+        this.txt(pct(wr), cx.wr, y, 62, 18,
                  (wr !== null && wr >= 50) ? LC.green : col, 'right');
     }
 
