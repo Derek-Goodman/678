@@ -1290,6 +1290,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         side.cards.splice(rpPos, 1);
         res.fakeGone = !!rp.fake;
         res.oldValue = rp.v;
+        res.oldFace = rp.face || undefined;   // 镜像牌 v=0 但 face='mirror'，收牌动画要靠它加载 mirror.jpg
         if (rp.fake) {
             // 假牌不洗回牌库，直接消失，然后照常重抽一张（见 mkCard 的注释）。
             // 它本来就不占牌库的位子，所以没有「排除刚洗回去那张」这回事。

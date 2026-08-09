@@ -3103,7 +3103,7 @@ function applyActionT(room, bt, side, action, forced) {
             if (r.fail) failNote = r.err || '无法使用';
             if (r.kind === 'repick') {
                 const nc = b.sides[side].cards[b.sides[side].cards.length - 1];
-                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
+                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue, oldFace: r.oldFace };
             }
         } else if (action.type === 'pick2') {
             // 二选一的选择。只有待选那一方能选，idx 只接受 0/1 ——
@@ -3543,7 +3543,7 @@ function applyAction(room, si, action, forced) {
                 // 没法按人镜像；而客户端恒把自己当 side 0。发 uid 的话它在
                 // 自己那份已镜像的盘面里一找就知道是哪一排，免疫镜像问题。
                 const nc = b.sides[si].cards[b.sides[si].cards.length - 1];
-                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue };
+                repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue, oldFace: r.oldFace };
             }
         } else if (action.type === 'pick2') {
             // 二选一的选择。只有待选那一方能选，idx 只接受 0/1

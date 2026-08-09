@@ -3111,7 +3111,7 @@ Scene_D678.prototype.netRepickFx = function (rp) {
         if (!cards.length) continue;
         // 重抽的新牌一定在末尾（doDraw 是 push）
         if (cards[cards.length - 1].uid === rp.uid) {
-            this.redealCard(si, rp.oldValue);
+            this.redealCard(si, rp.oldValue, rp.oldFace);
             return;
         }
     }

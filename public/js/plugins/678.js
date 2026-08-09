@@ -1391,7 +1391,7 @@ Scene_D678.prototype.onUseFunc = function () {
     // 【重抽一律播完整动画】必须在 refresh 之前动精灵，否则那一帧就已经
     // 复用了旧精灵。收牌用 r.oldValue（洗回去那张的数值），发牌靠扔掉
     // 新牌的精灵让它重新入场。
-    if (r.kind === 'repick') this.redealCard(0, r.oldValue);
+    if (r.kind === 'repick') this.redealCard(0, r.oldValue, r.oldFace);
     this._selFunc = null;
     // 二选一：回合没结束，盘面停在待选上。这里只 refresh 让选择面板出来，
     // 不能走 afterPlayerAction —— 那会去推进回合、让 AI 行动。
@@ -1412,7 +1412,7 @@ Scene_D678.prototype.onUseFunc = function () {
 //
 // oldValue 可能是 undefined（比如联机下服务器没带过来），那就只播新牌入场，
 // 不至于什么都不显示。
-Scene_D678.prototype.redealCard = function (si, oldValue) {
+Scene_D678.prototype.redealCard = function (si, oldValue, oldFace) {
     var b = this._battle;
     if (!b) return;
     var cards = b.sides[si].cards;
@@ -1441,15 +1441,15 @@ Scene_D678.prototype.redealCard = function (si, oldValue) {
     }
 
     if (oldValue !== undefined && oldValue !== null) {
-        this.returnCardFx(si, oldValue, fromX, fromY);
+        this.returnCardFx(si, oldValue, fromX, fromY, oldFace);
     }
     this.redealSweepFx(si);
 };
 
 // 收牌：一张牌从 (x,y) 飞向画面中央上方（牌库方向）并淡出、缩小。
 // 用临时精灵，不进 _cardSprites —— 它不代表场上的任何一张牌。
-Scene_D678.prototype.returnCardFx = function (si, v, x, y) {
-    var sp = new Sprite(ImageManager.loadPicture(String(v)));
+Scene_D678.prototype.returnCardFx = function (si, v, x, y, face) {
+    var sp = new Sprite(ImageManager.loadPicture(face || String(v)));
     sp.scale.x = sp.scale.y = LY.CARD_W / D678.CARD_W;
     sp.x = x; sp.y = y;
     var tx = LY.SW / 2 - LY.CARD_W / 2, ty = 380;   // 牌库方向（和 dealFx 同一处）
