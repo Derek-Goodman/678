@@ -2908,6 +2908,12 @@ Scene_D678.prototype.netPoll = function () {
         // 沿用单机的淘汰 / 通关画面
         this._phase = 'gameover';
         this._battle = null;
+        // over 常在演出没走完时就到（advanceMs=2s < 演出 2.5s），把 _phase
+        // 抢改成 'gameover' 后 netFinish → netToRoundResult 再也不跑，
+        // _lastLog 停在上一轮 —— 最后一场的对战记录画不出来。
+        // resolved 盘面比 over 先到（server.js 先 pushStateT 再 enterOverT），
+        // _netLog 此时已是最后一轮的，拷一份进 _lastLog 即可。
+        this._lastLog = this._netLog ? this._netLog.slice(0) : null;
         if (tourney) {
             this._notice = this._netOver.win
                 ? '你是本届冠军！'

@@ -2258,6 +2258,31 @@ Scene_D678.prototype.refresh = function () {
                 }
             }
         }
+        // 联机结算（天梯 / 锦标赛）的 gameover：5 行详情只写了我的战绩，
+        // 补一张全员表 —— 名次 / 名字 / 胜-负 / 胜率。overInfo（_netOver.ranks）
+        // 里每人带了 wins / losses，客户端算一下胜率就行。单机不画——
+        // 那边有血条上的「▼ 排名」可看全员，再叠一份就重复了。
+        if (over0 && this._net && this._netOver && this._netOver.ranks) {
+            var rk = this._netOver.ranks, rMy = this._netOver.myRank || 0;
+            var rY = top + hgt + 8;
+            var rH = 28 + rk.length * 22 + 10;
+            this.box(bmp, 40, rY, 640, rH, 'rgba(0,0,0,0.5)', COL.line, 12);
+            this.txt(bmp, '全员战绩', 0, rY + 6, LY.SW, 20, COL.gold, 'center');
+            for (var ri = 0; ri < rk.length; ri++) {
+                var rp = rk[ri], rrow = rY + 30 + ri * 22;
+                var rmine = (ri + 1 === rMy);
+                var rcol = rmine ? COL.gold : (rp.alive ? COL.white : COL.gray);
+                this.txt(bmp, String(ri + 1), 56, rrow, 40, 18,
+                    rmine ? COL.gold : COL.gray, 'left');
+                this.txt(bmp, rp.name, 100, rrow, 180, 18, rcol, 'left');
+                this.txt(bmp, (rp.wins || 0) + '胜 ' + (rp.losses || 0) + '负',
+                    300, rrow, 120, 18, rcol, 'left');
+                var rg = (rp.wins || 0) + (rp.losses || 0);
+                var rrate = rg > 0 ? Math.round((rp.wins || 0) / rg * 100) + '%' : '—';
+                this.txt(bmp, '胜率 ' + rrate, 440, rrow, 120, 18,
+                    (rg > 0 && (rp.wins || 0) / rg >= 0.5) ? COL.green : rcol, 'left');
+            }
+        }
         this.drawBattleLog();
         var over = (this._phase === 'gameover');
         // 【联机的轮结果页整行让位】678net.js 的 netDrawOverlay 在 y=1070 画
