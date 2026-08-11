@@ -1352,8 +1352,8 @@ Scene_D678Net.prototype.drawRankBtn = function (y, lit) {
 // 天梯排行榜
 //=============================================================================
 //
-// 一屏 20 行，前 100 名分 5 页。自己那一行**钉在最上方**（你定的），
-// 不在前 100 就显示「未上榜」+ 真实名次，不足 10 局显示「定级中」。
+// 一屏 20 行，前 300 名分 15 页。自己那一行**钉在最上方**（你定的），
+// 不在前 300 就显示「未上榜」+ 真实名次，不足 10 局显示「定级中」。
 
 var BOARD_ROWS = 20;
 
@@ -1832,10 +1832,19 @@ Scene_D678Net.prototype.drawLadHistory = function () {
                          LC.gray, 'left');
             } else {
                 var deltaText = '　天梯分' + (h.delta > 0 ? '+' : '') + h.delta;
-                var deltaColor = h.delta > 0 ? LC.red : (h.delta < 0 ? LC.green : LC.text);
+                // 【这一页是红涨绿跌】股市口径，你定的。和结算那行（drawLadDelta）
+                // 的金涨红跌不是一套 —— 那边绿另有含义（「有人在等你」），这边
+                // 是一列历史数字，红绿对比比金红更好扫。平局画白色，不涨不跌。
+                var deltaColor = h.delta > 0 ? LC.red
+                               : (h.delta < 0 ? LC.green : LC.text);
                 var timeAndRank = fmtLadTime(h.startedAt, h.endedAt) + '　对局排名' + h.rank;
                 this.txt(timeAndRank, 56, ry + 10, W - 112, 22, LC.text, 'left');
-                this.txt(deltaText, 56 + this.measureText(timeAndRank).width, ry + 10, W - 112, 22, deltaColor, 'left');
+                // 【量宽要用 _bmp.measureTextWidth】Scene 上没有 measureText，
+                // 原来写 this.measureText(...) 直接 TypeError，整个历史列表画不出来。
+                // measureTextWidth 按当前 fontSize 算，而上一行 txt() 刚把它设成 22，
+                // 所以这里量的就是那一行的实际宽度。
+                var dx = 56 + this._bmp.measureTextWidth(timeAndRank);
+                this.txt(deltaText, dx, ry + 10, W - 56 - dx, 22, deltaColor, 'left');
                 if (h.quit) {
                     this.txt('退出', W - 120, ry + 10, 60, 20,
                              LC.red, 'right');
