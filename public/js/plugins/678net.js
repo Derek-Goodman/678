@@ -1831,10 +1831,11 @@ Scene_D678Net.prototype.drawLadHistory = function () {
                 this.txt('对局中，请稍后查看', 56, ry + 10, W - 112, 22,
                          LC.gray, 'left');
             } else {
-                var line = fmtLadTime(h.startedAt, h.endedAt) +
-                    '　对局排名' + h.rank +
-                    '　天梯分' + (h.delta > 0 ? '+' : '') + h.delta;
-                this.txt(line, 56, ry + 10, W - 112, 22, LC.text, 'left');
+                var deltaText = '　天梯分' + (h.delta > 0 ? '+' : '') + h.delta;
+                var deltaColor = h.delta > 0 ? LC.red : (h.delta < 0 ? LC.green : LC.text);
+                var timeAndRank = fmtLadTime(h.startedAt, h.endedAt) + '　对局排名' + h.rank;
+                this.txt(timeAndRank, 56, ry + 10, W - 112, 22, LC.text, 'left');
+                this.txt(deltaText, 56 + this.measureText(timeAndRank).width, ry + 10, W - 112, 22, deltaColor, 'left');
                 if (h.quit) {
                     this.txt('退出', W - 120, ry + 10, 60, 20,
                              LC.red, 'right');
