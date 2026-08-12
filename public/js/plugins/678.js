@@ -40,14 +40,20 @@
  *  双方爆牌：平局，立即重新发牌（不比谁更接近目标点数）。
  *  双方未爆且同点：平局，立即重新发牌。
  *
- *  【三张改判定方式的规则牌】胜负一律走 Battle.scoreOf + D678.cmpScore
+ *  【五张改判定方式的规则牌】胜负一律走 Battle.scoreOf + D678.cmpScore
  *  这一对函数（678core.js），不要在别处另写一份比较逻辑：
  *    · 规则牛牛   恰好 3 或 4 张凑成 10 的倍数，余下的和的个位即成绩，越大越好
  *                （10 点为牛牛=满点；凑不出算无牛，成绩 0；全部牌凑牛无剩余
  *                 为有牛没点，成绩 0.5）。本规则下没有爆牌。
  *    · 规则比多   先比张数，多者胜；超过 21 点仍算爆牌；张数相同才比接近 21。
  *                注意这条打破了「满点必胜」——恰好 21 点也可能因张数少而输。
+ *    · 规则比少   必须达到 21 点以上，未达到即判负（爆牌线是反的）；
+ *                达标者之间张数**少**者胜，张数相同再比接近 21。
+ *                比多的镜像，但多了那道 ≥21 的门 —— 没有它的话双方都不抽牌、
+ *                整局冻住，而且退回明牌减到 1 张就必胜。
  *    · 规则暗牌   只有暗牌计入判定，明牌一律不算；仍以接近 21 点为目标。
+ *    · 规则明牌   只有明牌计入判定，暗牌一律不算（规则暗牌的严格取反）。
+ *                这条规则下整局是全公开信息，底牌相关的五张牌全变废牌。
  *
  *  伤害 = 5（底伤）+ 败方爆牌 3 + 胜方满点 3 + 平局加伤 + 败场差加伤
  *
@@ -75,8 +81,8 @@
  *  或者离新目标点数不超过 D678.AI.RULE_NEAR 点且不爆，才会出手。
  *  否则把牌留着 —— 避免 1+2 就甩规则18 这种离目标还差十几点的出牌。
  *  唯一例外是对手已经停牌/抽不动、而新规则能直接把他打爆且自己没爆。
- *  改判定方式的那三张没有「目标点数」，闸门换成「改完之后我的成绩是否真的
- *  压过对手」（直接用 cmpScore 比），见 D678.AI.ruleTimingOK。
+ *  改判定方式的那五张不走「离目标多远」那道闸门，换成「改完之后我的成绩是否
+ *  真的压过对手」（直接用 cmpScore 比），见 D678.AI.ruleTimingOK。
  *
  *  超哥必定登场，他知道牌库的完整顺序（每次抽到什么牌都算得到），
  *  也看得见对方的底牌，因此他的要牌/过牌是确定性最优的。
@@ -102,6 +108,7 @@
  *  repick reback picksmall
  *  pickbig +1 -1 copy 2pick1
  *  rulenull helppick mirror destroy
+ *  duel ruleless re2big repickback copyback smallchangebig
  * ============================================================================
  */
 
@@ -435,10 +442,20 @@ Scene_D678.prototype.refreshCards = function () {
                 // 【虚空数字一律染色，+1/-1 也染】原来只染没有专属卡图的那种
                 // （复制品），理由是「+1/-1 有自己的卡图，不会被误认成真牌」。
                 // 但染色的意义是标出「这张牌不来自牌库」这个共同属性 ——
-                // 三张虚空数字应该一眼看出是同一类，所以条件只看 fake。
-                // 虚空数字不可能是暗牌（一律正面打出），两种色调互斥，不用叠加。
+                // 虚空数字应该一眼看出是同一类，所以条件只看 fake。
+                //
+                // 【暗的虚空数字要两种色调叠加】这里原来写着「虚空数字不可能是
+                // 暗牌（一律正面打出），两种色调互斥」—— 复制底牌（copyback）
+                // 打破了那个前提，它是第一张以暗牌形式出现的虚空数字。
+                // 只取其一的话：只用 HOLE_TONE 看不出它是虚空的（玩家会当成
+                // 自己抽来的暗牌，以为退回/重抽能把它塞回牌库），
+                // 只用 FAKE_TONE 又丢了「对方看不到这张」那层提示。
                 var tone = [0, 0, 0, 0];
-                if (masked) tone = D678.HOLE_TONE;
+                if (masked && c.fake) {
+                    tone = [D678.HOLE_TONE[0] + D678.FAKE_TONE[0],
+                            D678.HOLE_TONE[1] + D678.FAKE_TONE[1],
+                            D678.HOLE_TONE[2] + D678.FAKE_TONE[2], 0];
+                } else if (masked) tone = D678.HOLE_TONE;
                 else if (c.fake && shown) tone = D678.FAKE_TONE;
                 sp.setColorTone(tone);
             }
@@ -684,6 +701,11 @@ Scene_D678.prototype.ruleGoalString = function (b) {
     }
     if (b.isMoreRule())   return '张数多者胜，超过 21 点仍算爆牌';
     if (b.isHiddenRule()) return '只算暗牌，目标 21 点';
+    if (b.isUpRule())     return '只算明牌，目标 21 点';
+    // 比少要把那道「必须 ≥21」的门写出来 —— 它是这条规则最容易踩的地方，
+    // 只写「张数少者胜」的话玩家会以为不抽牌就赢了。
+    if (b.isLessRule())   return '必须 21 点以上，达标者张数少者胜';
+    if (b.isOver21Rule()) return '低于 21 点判负，高于 21 点比谁接近';
     return '目标 ' + b.target() + ' 点';
 };
 
@@ -1115,7 +1137,11 @@ Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y, r, si) {
     var bmp = this._ovBmp;
     var col = bust ? COL.red : (max ? COL.gold : COL.white);
     var s = String(t);
-    var tag = bust ? '爆牌' : (max ? '满点' : '');
+    // 【判负那个词不能写死成「爆牌」】规则大21 和 规则比少 判负的条件是
+    // **低于** 21 点。措辞由规则层给（doResolve 放进 r.bustWord），
+    // 这里只管画 —— 联机那份 result 里没有 rule 字段，判不出来。
+    var bw = (r && r.bustWord) ? r.bustWord : '爆牌';
+    var tag = bust ? bw : (max ? '满点' : '');
 
     // 【牛牛下点数不是成绩】总点数 24 的成绩是「牛4」，直接画 24 会看不懂。
     // doResolve 把成绩放在 r.cows 里带出来（联机走同一份 result，无需另配）。
@@ -1125,11 +1151,11 @@ Scene_D678.prototype.drawShowdownTotal = function (t, bust, max, y, r, si) {
         if (cow === 0) col = COL.gray;
         tag = '';                        // 「牛牛」本身已经说明是满点
     } else if (r && r.cardCounts) {
-        // 比多：判定看的是张数，所以点数根本不该出现在这里 ——
+        // 比多 / 比少：判定看的是张数，所以点数根本不该出现在这里 ——
         // 写「5 张　24 点」会让人以为 24 点也参与了胜负。
-        // 爆牌是唯一的例外（爆了就直接输，张数多也没用），那时整行只写「爆牌」。
+        // 判负是唯一的例外（判负就直接输，张数再合适也没用），那时整行只写那个词。
         // 「满点」后缀留着：它不是判定依据，但要多打一点伤害，是玩家该看到的信息。
-        s = bust ? '爆牌' : (r.cardCounts[si] + ' 张');
+        s = bust ? bw : (r.cardCounts[si] + ' 张');
         if (bust) tag = '';
     }
 
@@ -1392,6 +1418,10 @@ Scene_D678.prototype.onUseFunc = function () {
     // 复用了旧精灵。收牌用 r.oldValue（洗回去那张的数值），发牌靠扔掉
     // 新牌的精灵让它重新入场。
     if (r.kind === 'repick') this.redealCard(0, r.oldValue, r.oldFace);
+    // 换底牌的三张：新底牌飞进来顶掉旧的。哪一排由规则层判（重抽底牌和
+    // 规则暗牌换自己的、干扰换对方的），失效 / 底牌没动的那次返回 -1。
+    var hs = D678.holeSwapSideOf(r);
+    if (hs >= 0) this.holeSwapFx(hs);
     this._selFunc = null;
     // 二选一：回合没结束，盘面停在待选上。这里只 refresh 让选择面板出来，
     // 不能走 afterPlayerAction —— 那会去推进回合、让 AI 行动。
@@ -1443,6 +1473,77 @@ Scene_D678.prototype.redealCard = function (si, oldValue, oldFace) {
     if (oldValue !== undefined && oldValue !== null) {
         this.returnCardFx(si, oldValue, fromX, fromY, oldFace);
     }
+    this.redealSweepFx(si);
+};
+
+//--- 换底牌的演出 ----------------------------------------------------------
+//
+// 三张牌会换底牌，原来**全都是静默生效**的：盘面上底牌的数字变了，
+// 画面上没有任何表现。干扰那张更是上线以来一直如此（换的是对方的底牌，
+// 连数字变化都看不见 —— 对方底牌一直是背面）。
+//   · 重抽底牌 (repickback)   换自己的
+//   · 干扰     (reback)       换对方的
+//   · 规则暗牌 (rulenoseencard) 出牌方自己的底牌重掷（那张牌自带的代价）
+//
+// 演出：新底牌从右侧边缘飞进底牌位，旧底牌被顶出去、往左飞出并淡出。
+//
+// 【为什么不能只靠 key 变化】两个原因：
+//   1. 牌库空时换上来的是同一个数字（你定的口径：照样算生效、动画照播），
+//      此时 cardKey 完全没变 —— 光靠 refreshCards 一帧都不会动。
+//   2. 对方的底牌一直是背面，key 里的 v 变了但图还是 cardback，
+//      新精灵会从画面中央淡入，看着像原地闪一下。
+// 所以进出两半都用临时精灵画，跟真精灵的生死无关 —— 两种情况表现一致。
+//
+// 底牌恒在 index 0（见 firstHole 的注释），所以位置直接按第一张的槽位算。
+Scene_D678.prototype.holeSwapFx = function (si) {
+    var b = this._battle;
+    if (!b || si < 0 || si > 1) return;
+    var cards = b.sides[si].cards;
+    if (!cards.length) return;
+
+    // 底牌槽位：和 refreshCards 里同一套算法（n 张牌居中排开，取第 0 张）
+    var n = cards.length;
+    var span = Math.min(LY.CARD_W + 12, Math.floor(660 / Math.max(n, 1)));
+    var totalW = span * (n - 1) + LY.CARD_W;
+    var hx = Math.floor((LY.SW - totalW) / 2);
+    var hy = (si === 0) ? LY.MY_CARD_Y : LY.OPP_CARD_Y;
+
+    // 底牌在画面上是什么样：自己的底牌揭牌前是「牌面 + 一层淡黑蒙版」，
+    // 对方的一直是背面。临时精灵照抄这个观感，不然飞进来的那张
+    // 跟落定后的那张长得不一样。
+    var shown = (si === 0 || b.revealed);
+    var faceName = shown ? (cards[0].face || String(cards[0].v)) : 'cardback';
+    var scale = LY.CARD_W / D678.CARD_W;
+
+    // 旧底牌：从底牌位往左飞出、淡出。用背面图 —— 换下去那张的数字
+    // 不该在这一下里暴露（对方的底牌我方本来就不知道，自己的那张
+    // 已经洗回牌库、看到它反而容易误以为还在场上）。
+    var outSp = new Sprite(ImageManager.loadPicture('cardback'));
+    outSp.scale.x = outSp.scale.y = scale;
+    outSp.x = hx; outSp.y = hy;
+    this.addFx(outSp, 20, function (s, r) {
+        s.x = hx - 190 * r;
+        s.y = hy - 26 * r;
+        s.opacity = 255 * (1 - r);
+        s.rotation = -0.5 * r;
+    });
+
+    // 新底牌：从右侧边缘飞进底牌位。到位时淡出，正好让真精灵接上。
+    // 【故意比旧牌那半慢几帧】两张同时动的话看着像互相穿过去，
+    // 而「旧的先被顶开、新的随后落位」才读得出替换的因果。
+    var inSp = new Sprite(ImageManager.loadPicture(faceName));
+    inSp.scale.x = inSp.scale.y = scale;
+    if (shown) inSp.setColorTone(b.revealed ? [0, 0, 0, 0] : D678.HOLE_TONE);
+    inSp.x = LY.SW + 20; inSp.y = hy;
+    this.addFx(inSp, 26, function (s, r) {
+        var e = 1 - Math.pow(1 - r, 3);       // 先快后慢，落位有分量
+        s.x = (LY.SW + 20) + (hx - (LY.SW + 20)) * e;
+        s.y = hy;
+        // 最后 4 帧淡出，交给真精灵
+        s.opacity = (r > 0.85) ? 255 * (1 - (r - 0.85) / 0.15) : 255;
+    });
+
+    // 那一排扫一道光，跟重抽共用同一个效果 —— 两者都是「牌被换掉了」。
     this.redealSweepFx(si);
 };
 
@@ -1910,6 +2011,13 @@ Scene_D678.prototype.updateBattle = function () {
         // 对方重抽也要播完整动画（收牌 + 发牌）—— 否则看不出他到底做了什么。
         // 判 kind 而不是 ev.same：抽到不同数字时旧牌同样该飞回牌库。
         if (ev.kind === 'repick') this.redealCard(1, ev.oldValue);
+        // 对方换底牌同样要演出。
+        // 【要把「使用者视角」翻成「屏幕上哪一排」】holeSwapSideOf 返回的是
+        // 出牌方自己(0)/对方(1)，而这里出牌方是 AI（ev.side 为 1）——
+        // 它换自己的底牌落在屏幕上排，换我方底牌落在下排。搞反的表现是
+        // 动画播在错误的一排，而牌面变化又确实发生在另一排。
+        var evHs = D678.holeSwapSideOf(ev);
+        if (evHs >= 0) this.holeSwapFx(evHs === 0 ? ev.side : 1 - ev.side);
         this.refresh();
         if (b.finished || (b.result && b.result.tie)) this.onBattleEnd();
     }

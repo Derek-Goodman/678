@@ -1801,8 +1801,12 @@ function viewOrder(playerN, mePIdx, oppPIdx) {
 // 加进 SIDE_ARRAYS 就行，两种模式一起生效，不会再漏一边。
 // 挂的是标量（双方对称）就加进 SCALARS。
 const RESULT_SIDE_ARRAYS = ['totals', 'busts', 'maxes', 'cows', 'cardCounts'];
+// bustWord：判负那个状态在界面上叫什么。规则大21 和 规则比少 判负的条件是
+// **低于** 21 点，写「爆牌」会让玩家以为自己超了。漏发的话客户端退回「爆牌」
+// —— 不报错，只是那两条规则下的拼点画面在骗人（和上面 cows / cardCounts
+// 漏发时「规则看着没生效」是同一类症状）。
 const RESULT_SCALARS     = ['tie', 'dmg', 'items', 'target',
-                            'tieCount', 'tieBonus', 'comeback'];
+                            'tieCount', 'tieBonus', 'comeback', 'bustWord'];
 
 // meSide 是「我」在这桌的 side（0/1）。返回的视图里我恒为下标 0。
 // winnerP / loserP 是 Player 对象引用，绝不能直接发（会把对方全部字段带出去），
@@ -1851,6 +1855,38 @@ function maskPick2(b, meSide) {
 
 // b 是一桌对局；me / opp 是这桌的两个 side 对应的 game.players 下标。
 // meSide 是「我」在这桌的 side（0 或 1）—— 镜像后我永远显示成 side 0。
+// 一张牌发给客户端时长什么样。open 为真表示这张牌对收件人是公开的
+//（自己的牌，或者已经揭牌了）。
+//
+// 【fake / face 也要跟着遮】原来这两个字段是无条件发的，理由写的是
+// 「假牌一律正面打出，双方本来就看得见」—— **复制底牌（copyback）打破了
+// 这个前提**，它是全池子里第一张以暗牌形式出现的虚空数字。
+// 无条件发的话对方开 devtools 能看到自己那张暗牌上带着 fake，
+// 而这张牌的规则是「复制自己的底牌」—— 等于告诉他「这两张暗牌点数相同」。
+// 那正好绕开了 v:null 那道防线（见 678net.js 顶部那段注释）。
+//
+// 画面上不受影响：暗牌一律画成背面、不套 FAKE_TONE（见 678.js 的
+// refreshCards，那里的 fake 染色带着 shown 条件），所以遮掉不影响观感。
+// 揭牌后 open 为真，两个字段照常发，翻开的那张仍然显示正确的卡图和染色。
+function maskCard(c, open) {
+    return {
+        // 自己的牌全给；对方的暗牌在揭牌前不给数值
+        v: open || !c.hidden ? c.v : null,
+        hidden: c.hidden,
+        // 假牌标记 + 卡图名（+1/-1/复制品）。明牌一律公开 ——
+        // 不发的话对方那一排的复制品不染色、+1/-1 会显示成 1 号牌。
+        fake: (open || !c.hidden) ? (c.fake || undefined) : undefined,
+        face: (open || !c.hidden) ? (c.face || undefined) : undefined,
+        // 稳定身份，客户端的精灵靠它认牌（见 678.js 的 cardKey）。
+        // 【不算泄漏】uid 只是个自增序号，不带任何牌面信息 ——
+        // 从它只能看出「这张牌是第几张被造出来的」，而出牌顺序本来就
+        // 是双方都看得见的。不发的话客户端只能退回下标，
+        // 「删中间那张」时后面的牌会全部误判成新牌重新入场。
+        // 换底牌的演出也靠它定位排数（见 678net.js 的 netHoleSwapFx）。
+        uid: c.uid,
+    };
+}
+
 function maskView(b, me, snapPre) {
     const mySide = b.sides[me];
 
@@ -1861,22 +1897,7 @@ function maskView(b, me, snapPre) {
         const s = b.sides[si];
         const mine = (si === me);
         return {
-            cards: s.cards.map(c => ({
-                // 自己的牌全给；对方的暗牌在揭牌前不给数值
-                v: (mine || b.revealed || !c.hidden) ? c.v : null,
-                hidden: c.hidden,
-                // 假牌标记 + 卡图名（+1/-1/复制品）。
-                // 【不算泄漏】假牌一律正面打出，双方本来就看得见；
-                // 不发的话对方那一排的复制品不染色、+1/-1 会显示成 1 号牌。
-                fake: c.fake || undefined,
-                face: c.face || undefined,
-                // 稳定身份，客户端的精灵靠它认牌（见 678.js 的 cardKey）。
-                // 【不算泄漏】uid 只是个自增序号，不带任何牌面信息 ——
-                // 从它只能看出「这张牌是第几张被造出来的」，而出牌顺序本来就
-                // 是双方都看得见的。不发的话客户端只能退回下标，
-                // 「删中间那张」时后面的牌会全部误判成新牌重新入场。
-                uid: c.uid,
-            })),
+            cards: s.cards.map(c => maskCard(c, mine || b.revealed)),
             stood: s.stood,
             // 对方用过几张查看牌库不该暴露，只发自己的
             checkN: mine ? s.checkN : 0,
@@ -2011,16 +2032,12 @@ function maskViewT(room, bt, seat, snapPre) {
         const maskSide = (si) => {
             const s = b.sides[si];
             const mine = (si === meSide);
+            // 【和 1v1 共用 maskCard】原来这里手写了一份字段清单 ——
+            // 复制底牌那张暗虚空牌需要连 fake / face 一起遮，两处各写一遍
+            // 迟早只改一处（那正是「遮蔽函数漏字段」那类 bug 的来路）。
             return {
                 v: undefined,
-                cards: s.cards.map(c => ({
-                    v: (mine || b.revealed || !c.hidden) ? c.v : null,
-                    hidden: c.hidden,
-                    uid: c.uid,      // 见 maskSide（1v1 那份）里的注释
-                    // 假牌标记 / 卡图名，同上：正面打出的牌，不涉及遮蔽
-                    fake: c.fake || undefined,
-                    face: c.face || undefined,
-                })),
+                cards: s.cards.map(c => maskCard(c, mine || b.revealed)),
                 stood: s.stood,
                 checkN: mine ? s.checkN : 0,
             };
@@ -3161,6 +3178,7 @@ function applyActionT(room, bt, side, action, forced) {
     const turnBefore = b.turn;
     let msg = '', ok = true, err = '', failNote = '';
     let repick = null;      // 见 applyAction 里的注释
+    let holeSwap = null;    // 换底牌的演出，见下面 holeSwapSideOf 那段
 
     withRoom(room, () => {
         if (action.type === 'hit') {
@@ -3185,6 +3203,16 @@ function applyActionT(room, bt, side, action, forced) {
             if (r.kind === 'repick') {
                 const nc = b.sides[side].cards[b.sides[side].cards.length - 1];
                 repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue, oldFace: r.oldFace };
+            }
+            // 换底牌的三张（重抽底牌 / 干扰 / 规则暗牌）要播新底牌飞入的演出。
+            // 【发 uid，不发 side】客户端永远把自己当 side 0，发绝对 side 的话
+            // 每处都得跟着镜像一次。底牌换牌只改 hole.v、uid 不变，所以拿 uid
+            // 在客户端那份已镜像的盘面里找排数，和 repick 同一个路子。
+            const hsSide = D678.holeSwapSideOf(r);
+            if (hsSide >= 0) {
+                const hsAbs = (hsSide === 0) ? side : 1 - side;
+                const hc = b.firstHole(hsAbs);
+                if (hc) holeSwap = { uid: hc.uid };
             }
         } else if (action.type === 'pick2') {
             // 二选一的选择。只有待选那一方能选，idx 只接受 0/1 ——
@@ -3231,7 +3259,11 @@ function applyActionT(room, bt, side, action, forced) {
         bt.bankCharged = 0;             // 思考池记账也跟着回合走
     }
     armTurnTimerT(room, bt);
-    pushStateT(room, repick ? { repick: repick } : null);
+    // 两种演出可能同时存在（重抽 + 换底牌不会撞，但载荷得都带上）
+    pushStateT(room, (repick || holeSwap)
+        ? Object.assign({}, repick ? { repick: repick } : null,
+                            holeSwap ? { holeSwap: holeSwap } : null)
+        : null);
     stepAIIfNeeded(room, bt);
     return { ok: true, fail: failNote };
 }
@@ -3687,6 +3719,11 @@ function applyAction(room, si, action, forced) {
     //
     // 【不涉及遮蔽】洗回去那张是**明牌**，本来就双方可见。
     let repick = null;
+    // 换底牌的演出（重抽底牌 / 干扰 / 规则暗牌）。同样发 uid 不发 side。
+    // 【不涉及遮蔽】只发底牌那张的 uid，不带点数 —— 客户端拿它定位排数，
+    // 飞进来的临时精灵画的是背面（我方那排画自己看得见的牌面，
+    // 而自己的底牌本来就自己可见）。
+    let holeSwap = null;
 
     withRoom(room, () => {
         if (action.type === 'hit') {
@@ -3717,6 +3754,12 @@ function applyAction(room, si, action, forced) {
                 const nc = b.sides[si].cards[b.sides[si].cards.length - 1];
                 repick = { uid: nc ? nc.uid : 0, oldValue: r.oldValue, oldFace: r.oldFace };
             }
+            const hsSide = D678.holeSwapSideOf(r);
+            if (hsSide >= 0) {
+                const hsAbs = (hsSide === 0) ? si : 1 - si;
+                const hc = b.firstHole(hsAbs);
+                if (hc) holeSwap = { uid: hc.uid };
+            }
         } else if (action.type === 'pick2') {
             // 二选一的选择。只有待选那一方能选，idx 只接受 0/1
             const rp = b.pick2Resolve(si, action.idx);
@@ -3741,7 +3784,10 @@ function applyAction(room, si, action, forced) {
         room.turnGoneDeadline = 0;
     }
     armTurnTimer(room);   // 先武装再推，让这份状态带上新的 turnLeft
-    pushState(room, repick ? { repick: repick } : null);
+    pushState(room, (repick || holeSwap)
+        ? Object.assign({}, repick ? { repick: repick } : null,
+                            holeSwap ? { holeSwap: holeSwap } : null)
+        : null);
     return { ok: true, fail: failNote };
 }
 
@@ -4717,6 +4763,17 @@ module.exports = {
     LAD_DELAY, LAD_DELAY_NOBANK, LAD_BANK_MS, LAD_BANK_TURN_MS,
     ladThinkMs, ladBankCost, ladBankLeft, ladBankSpend, ladBankTurnMs,
     ladAiPlan, armTurnTimerT, applyActionT, turnSecOf, goneSecOf,
+    // 遮蔽函数直接导出，_test_rulecards.js 靠它查「result 的字段清单有没有
+    // 漏掉某个规则挂上去的字段」—— 那种漏法走真实结算也测得出来，但要凑
+    // 一整局；直接调遮蔽函数一句话就够，而且指向的正是出错的那一行。
+    maskView, maskResult, maskCard,
+    // accSave 导出给 _test_ladrank.js 的 Q 段用。
+    // 【它必须自己触发落盘】那一段直接改内存里的账号记录，然后断言
+    // 「文件里是这些值」。落盘是攒 2 秒写一次的，改内存**不会**排一次写 ——
+    // 原来它靠调 /api/lad/board 期待副作用，而那个接口只读不写。
+    // 于是这段只在「前面的对局刚好排了一次没落地的写」时才通过，
+    // 全看时序对不对上：改动别处的对局节奏就会让它翻面（正是这次遇到的）。
+    accSave,
 };
 
 server.listen(CFG.port, '0.0.0.0', () => {

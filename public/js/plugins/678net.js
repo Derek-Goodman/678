@@ -2891,6 +2891,11 @@ Scene_D678.prototype.netApply = function (m) {
     if (m.repick && this._battle) {
         this.netRepickFx(m.repick);
     }
+    // 换底牌的演出（重抽底牌 / 干扰 / 规则暗牌）。同样按 uid 定位排数 ——
+    // 底牌换牌只改点数、uid 不变，所以拿它在自己那份已镜像的盘面里找。
+    if (m.holeSwap && this._battle) {
+        this.netHoleSwapFx(m.holeSwap);
+    }
 
     // 【别人桌的 fresh / resolved 一律不认】
     //
@@ -3399,6 +3404,24 @@ Scene_D678.prototype.netRepickFx = function (rp) {
             this.redealCard(si, rp.oldValue, rp.oldFace);
             return;
         }
+    }
+};
+
+// 联机下播换底牌的演出（重抽底牌 / 干扰 / 规则暗牌都走这里）。
+//
+// 和 netRepickFx 同一个路子：服务器发底牌那张的 uid，在自己那份**已镜像**的
+// 盘面里找它在哪一排。底牌换牌只改 hole.v、uid 不变，所以这个 uid 在
+// 换牌前后都指向同一张牌。
+//
+// 【底牌恒在 index 0】firstHole 找的就是它，别的牌都是往后追加的。
+// 找不到就不播 —— 宁可少一次动画，也不要因为定位错了在错误的一排画。
+Scene_D678.prototype.netHoleSwapFx = function (hs) {
+    var b = this._battle;
+    if (!b || !hs || !hs.uid) return;
+    for (var si = 0; si < 2; si++) {
+        var cards = b.sides[si].cards;
+        if (!cards.length) continue;
+        if (cards[0].uid === hs.uid) { this.holeSwapFx(si); return; }
     }
 };
 

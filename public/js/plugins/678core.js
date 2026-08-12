@@ -378,6 +378,53 @@ D678.FUNCS = [];
     // 明牌暗牌都能破坏，被破坏的是暗牌时不透露点数。
     D678.FUNCS.push({ id: 'destroy', img: 'destroy', name: '破坏', kind: 'destroy',
         desc: '将对方最新的一张牌\n放到牌库最下方（必须非底牌，\n不论明牌暗牌）。\n不消耗回合。' });
+    // 【规则明牌是规则暗牌的严格取反】countsForScore 那一处收口，
+    // 判定/爆牌线/满点/AI 的标量推演全都跟着走。
+    // 代价：没有（你定的）—— 规则暗牌那张的底牌重掷是因为它等于拼底牌，
+    // 偷看过自己底牌的人出了就稳赢；这张是双方明牌全公开，对手还能继续
+    // 抽牌、也能覆盖规则，不需要额外的代价。
+    //
+    // 连带影响（都是这条规则的性质，不是 bug）：抽暗牌 / 复制底牌 /
+    // 重抽底牌 / 干扰 / 查看牌库这五张在它生效期间全是废牌 ——
+    // 暗牌不算分，底牌是什么都无所谓。
+    // 【id 'duel' 和联机的 1v1 房间模式撞名】room.mode === 'duel' /
+    // D678N.mode === 'duel' / this._page === 'duel' 指的是「单人对决」那个页面，
+    // 跟这张规则牌毫无关系。两者不在同一个命名空间（这张只出现在 b.rule 和
+    // 玩家手牌的 id 里），功能上不会互相影响，但**搜 'duel' 会同时命中两种含义**
+    // —— 查这张牌的时候用 isUpRule / RULE_IDS，别用字符串搜。
+    D678.FUNCS.push({ id: 'duel', img: 'duel', name: '规则明牌', kind: 'rule',
+        desc: '只有明牌的点数计入判定，暗牌一律不算。\n仍以接近 21 点为目标，超过即爆牌。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+    // 【比少不是比多的镜像，它多一道「必须 ≥21」的门】只反过来比张数的话，
+    // 开局双方各 2 张、谁抽谁落后 -> 双方都不抽，整局冻住；而且
+    // 退回明牌把自己减到 1 张就必胜（1 张不可能爆）。加上这道门之后
+    // 1 张最多 11 点、达不到 21 直接判负，那条捷径自然没了。
+    //
+    // 排序 [张数少, 近21]（你定的：3 张 25 胜 4 张 21），跟比多严格对称。
+    // 爆牌线反过来：**低于** 21 即判负，超过 21 没有上界（同规则大21）。
+    D678.FUNCS.push({ id: 'ruleless', img: 'ruleless', name: '规则比少', kind: 'rule',
+        desc: '必须达到 21 点以上，未达到即判负。\n达标者之间张数少者胜，张数相同再比近 21。\n规则牌互相覆盖，场上只存在一张。\n不消耗回合。' });
+    // re2big：双方各自最大的一张明牌压到牌库底，两张的顺序随机。
+    // 并列时取最新那张（你定的）。虚空数字不进牌库、直接消失。
+    // 双方都没有明牌时照样能用，只是没有效果。
+    D678.FUNCS.push({ id: 're2big', img: 're2big', name: '去大', kind: 're2big',
+        desc: '将双方各自最大的一张明牌放到牌库最下方\n（两张的顺序随机）。\n没有明牌的一方不受影响。\n不消耗回合。' });
+    // repickback：换自己的底牌，方向和 干扰 正好相反（那张换对方的）。
+    // 复用 rerollOwnHole，所以「一定不是原来那张」靠取牌顺序天然成立。
+    // 牌库空时只能抽回同一张（你定的：照样算生效、动画照播）。
+    D678.FUNCS.push({ id: 'repickback', img: 'repickback', name: '重抽底牌', kind: 'repickback',
+        desc: '将自己的底牌洗回牌库，重新抽一张底牌，\n一定不会抽到同一个数字。\n牌库已空时会抽回原来那张。\n不消耗回合。' });
+    // copyback：复制自己底牌的点数，以**暗牌**形式追加。
+    // 【它是全池子里唯一能绕过要牌闸门加点数的牌】暗牌不进 upTotal，
+    // 所以底牌 10 + 复制品 = 手上 20 点，而明牌合计照旧、还能继续要牌。
+    // 进 GAIN_KINDS（场上多一张牌），牛牛下满 5 张时用不出去。
+    D678.FUNCS.push({ id: 'copyback', img: 'copyback', name: '复制底牌', kind: 'copyback',
+        desc: '复制自己底牌的点数，在场上追加一张暗牌\n（对方看不到）。虚空数字牌。\n打出后本回合结束。' });
+    // smallchangebig：自己最小的明牌 <-> 对方最大的明牌。
+    // 不看位置（全场最小 / 全场最大），并列取最新那张。
+    // 就地换数值（牌不换阵营），和 互换明牌 同一套做法。
+    D678.FUNCS.push({ id: 'smallchangebig', img: 'smallchangebig', name: '以小换大',
+        kind: 'smallchangebig',
+        desc: '将自己最小的一张明牌与对方最大的一张明牌\n互相交换。\n任一方没有明牌时无效果。\n不消耗回合。' });
 })();
 
 D678.funcData = function (id) {
@@ -387,6 +434,23 @@ D678.funcData = function (id) {
     return null;
 };
 D678.funcName = function (id) { var f = D678.funcData(id); return f ? f.name : id; };
+// 这次出牌换掉了谁的底牌：返回使用者视角的 side（0 自己 / 1 对方），
+// 没换底牌就返回 -1。客户端靠它决定往哪一排播「新底牌飞进来」的演出。
+//
+// 【收在这里】单机、联机客户端、以及对方动作那条路径一共四处要判同一件事，
+// 各自写一份 if 迟早漏掉某张牌 —— 而漏掉的表现是「那张牌用了没有动画」，
+// 跟功能没生效长得一模一样（见 678.js 的 holeSwapFx）。
+//
+// res 是 useFunc 的返回值。规则暗牌只在真的重掷成功时才有 value ——
+// 牌库空 / 没底牌那两种情况规则照样生效，但底牌没动，不该播。
+D678.holeSwapSideOf = function (res) {
+    if (!res || !res.ok || res.fail) return -1;
+    if (res.kind === 'repickback') return 0;
+    if (res.kind === 'reback')     return 1;
+    if (res.id === 'rulenoseencard' &&
+        res.value !== undefined && res.value !== null) return 0;
+    return -1;
+};
 D678.ALL_FUNC_IDS = function () {
     return D678.FUNCS.map(function (f) { return f.id; });
 };
@@ -778,12 +842,14 @@ D678_Battle.prototype.ruleBlockedReason = function (id) {
 //   pick / pickback / picksmall -> 从牌库拿一张
 //   pick2                      -> 抽两张选一张留下（净 +1）
 //   rob                        -> 从对方场上拿一张过来
-//   num / copy                 -> 造一张虚空数字
-// 净张数不变的不算：swap（互换）、return（只减）、reback（换对方底牌）、
+//   num / copy / copyback      -> 造一张虚空数字
+// 净张数不变的不算：swap 和 smallchangebig（都是互换）、return（只减）、
+// re2big（只减）、reback（换对方底牌）、repickback（换自己底牌）、
 // repick 和 pickbig（都是先去一张再拿一张）、check / rule（不碰牌）。
 // helppick 和 mirror 都不在里面：它们往**对方**场上加牌，牛牛上限在 useFunc
 // 各自分支里单独挡对方那侧。
-D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy'];
+D678.GAIN_KINDS = ['pick', 'pickback', 'picksmall', 'pick2', 'rob', 'num', 'copy',
+                   'copyback'];
 D678.funcGainsCard = function (id) {
     var f = D678.funcData(id);
     return !!f && D678.GAIN_KINDS.indexOf(f.kind) >= 0;
@@ -803,20 +869,25 @@ D678_Battle.prototype.cardGainBlockedReason = function (si, id) {
 };
 D678_Battle.prototype.isMoreRule = function () { return this.rule === 'rulemore'; };
 D678_Battle.prototype.isHiddenRule = function () { return this.rule === 'rulenoseencard'; };
+D678_Battle.prototype.isUpRule = function () { return this.rule === 'duel'; };
+// 规则比少：必须 ≥21 才算达标，达标者之间张数少者胜。
+D678_Battle.prototype.isLessRule = function () { return this.rule === 'ruleless'; };
 // 成绩「越大越好」的规则（默认是越接近目标点数越好）
 D678_Battle.prototype.isHighRule = function () { return this.isCowRule(); };
 
-// 这张牌是否计入判定。只有 规则暗牌 会排除一部分牌（明牌不算）。
+// 这张牌是否计入判定。规则暗牌只算暗牌，规则明牌只算明牌（严格取反）。
 D678_Battle.prototype.countsForScore = function (c) {
     if (this.isHiddenRule()) return !!c.hidden;
+    if (this.isUpRule()) return !c.hidden;
     return true;
 };
 // 拿到一张牌会让判定用的点数变多少。
 // 规则暗牌下抽一张明牌对成绩毫无影响（这条规则下抽牌只会逼近抽不动，
 // 所以 AI 基本会停牌，除非手里有「抽暗牌」）—— AI 的推演必须知道这件事，
-// 否则它会以为抽牌能改善成绩。
+// 否则它会以为抽牌能改善成绩。规则明牌下反过来，抽暗牌才是白抽。
 D678_Battle.prototype.scoreDelta = function (v, hidden) {
     if (this.isHiddenRule() && !hidden) return 0;
+    if (this.isUpRule() && hidden) return 0;
     return this.adj(v);
 };
 
@@ -898,8 +969,14 @@ D678_Battle.prototype.upTotal = function (si) {
 };
 D678_Battle.prototype.isBustVal = function (t) {
     if (this.isCowRule()) return false;          // 牛牛没有爆牌，凑不出只是成绩 0
-    if (this.isOver21Rule()) return t < 21;
+    // 规则大21 和 规则比少 都把爆牌线倒过来：低于 21 即判负，上面没有界。
+    if (this.isOver21Rule() || this.isLessRule()) return t < 21;
     return t > this.target();
+};
+// 判负的那个状态在界面上叫什么。爆牌线倒过来的两张规则牌下不能叫「爆牌」——
+// 那两条规则判负的条件是**低于** 21 点，写「爆牌」会让玩家以为自己超了。
+D678_Battle.prototype.bustWord = function () {
+    return (this.isOver21Rule() || this.isLessRule()) ? '未达 21' : '爆牌';
 };
 // 「离理想还差多少」，越小越好。判定不用它（判定看 cmpScore），
 // 它是 AI 的启发式标量：godDist / canImprove / 平手次级判据都靠它排序。
@@ -1037,6 +1114,14 @@ D678_Battle.prototype.scoreOf = function (si) {
         return { bust: bust, max: this.isMaxVal(t), total: t,
                  rank: [vals.length, -this.distVal(t)], cards: vals.length };
     }
+    if (this.isLessRule()) {
+        // 比多的镜像：张数**少**者胜，张数相同再比谁近 21。
+        // 「必须 ≥21」那道门走的是 bust（isBustVal 在这条规则下判 t < 21），
+        // 所以这里不用再判一次 —— cmpScore 先比 bust，达不到的人根本进不到
+        // rank 的比较里。双方都达不到就是双爆，平局重发。
+        return { bust: bust, max: this.isMaxVal(t), total: t,
+                 rank: [-vals.length, -this.distVal(t)], cards: vals.length };
+    }
     return { bust: bust, max: this.isMaxVal(t), total: t, rank: [-this.distVal(t)] };
 };
 
@@ -1109,6 +1194,23 @@ D678_Battle.prototype.newestUp = function (si) {
     for (var i = c.length - 1; i >= 0; i--) { if (!c[i].hidden) return c[i]; }
     return null;
 };
+// 点数最大 / 最小的那张明牌。并列时取**最新**那张（你定的口径，
+// 去大 和 以小换大 共用）—— 所以比较用 >= / <=，后面的同值牌会顶掉前面的。
+//
+// 【先刷镜像】镜像牌的点数是动态的（resolveMirror 才算出来），
+// 不刷就可能拿一个过期的值去比大小，挑错牌。
+D678_Battle.prototype.extremeUp = function (si, wantMax) {
+    this.resolveMirror();
+    var c = this.sides[si].cards, best = null;
+    for (var i = 0; i < c.length; i++) {
+        if (c[i].hidden) continue;
+        if (!best) { best = c[i]; continue; }
+        if (wantMax ? (c[i].v >= best.v) : (c[i].v <= best.v)) best = c[i];
+    }
+    return best;
+};
+D678_Battle.prototype.maxUp = function (si) { return this.extremeUp(si, true); };
+D678_Battle.prototype.minUp = function (si) { return this.extremeUp(si, false); };
 D678_Battle.prototype.onField = function (v) {
     for (var s = 0; s < 2; s++) {
         var c = this.sides[s].cards;
@@ -1227,6 +1329,26 @@ D678_Battle.prototype.act = function (si, action) {
 
 //--- 功能牌 ----------------------------------------------------------------
 
+// 「照样打出去，但没有效果」。
+//
+// 【为什么大部分不合规的出牌是失效而不是拦下】你定的口径：功能牌尽量都能用，
+// 不合规的时候用了就白用。原来有 15 处是**拦下**（牌不消耗、提示一句），
+// 玩家看到的是「点了没反应」，而且哪张牌在什么局面下能点全靠自己记。
+// 现在统一成：牌消耗掉、回合仍在自己手上、日志记「（失败：原因）」。
+//
+// 【唯一的例外是牛牛的 5 张上限】那道门仍然拦下（含要牌按钮）——
+// 见 cardGainBlockedReason 和 ruleBlockedReason。
+//
+// 失效不结束回合、也不清对方的过牌（下面 res.fail 那两处分支），
+// 跟「抽号牌撞上已在场上」那种既有的失败表现一致。
+D678_Battle.prototype.funcFail = function (res, f, why) {
+    res.ok = true;
+    res.fail = true;
+    res.err = why;
+    res.msg = '对方使用了' + f.name + '（失败）';
+    return res;
+};
+
 // 返回 {ok, endTurn, msg, err}
 D678_Battle.prototype.useFunc = function (si, id, simulate) {
     var f = D678.funcData(id);
@@ -1254,7 +1376,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         }
         break;
     case 'pick2':
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (this.deck.length === 0) { this.funcFail(res, f, '牌库已空'); break; }
         // 牌库只剩 1 张 -> 没得选，退化成一次普通抽牌（牌照样消耗，你定的）
         if (this.deck.length === 1) {
             res.value = this.doDraw(si, false);
@@ -1279,14 +1401,17 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         res.msg = '对方使用了' + f.name;
         break;
     case 'pickback':
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (this.deck.length === 0) { this.funcFail(res, f, '牌库已空'); break; }
         res.value = this.doDraw(si, true);
         res.ok = true; res.endTurn = true;
         res.msg = '对方使用了' + f.name;
         break;
     case 'swap':
         var a = this.newestUp(si), b = this.newestUp(1 - si);
-        if (!a || !b) { res.err = b ? '我方场上没有明牌' : '对方场上没有明牌'; return res; }
+        if (!a || !b) {
+            this.funcFail(res, f, b ? '我方场上没有明牌' : '对方场上没有明牌');
+            break;
+        }
         res.value = a.v; res.other = b.v;     // 换之前的值，给 msg / what 用
         // 【假牌跟着数值走】（你定的规则）换的是「这张牌是什么」，所以
         // fake/face 必须跟 v 一起换：我的假 +1 换给对方，对方拿到的就是
@@ -1305,7 +1430,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         break;
     case 'rob':
         var rb = this.newestUp(1 - si);
-        if (!rb) { res.err = '对方场上没有明牌'; return res; }
+        if (!rb) { this.funcFail(res, f, '对方场上没有明牌'); break; }
         var pos = opp.cards.indexOf(rb);
         opp.cards.splice(pos, 1);
         // 换手就是换阵营，给个新 uid —— 客户端会当成「新到我这边的牌」重新入场，
@@ -1320,7 +1445,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         break;
     case 'return':
         var rt = this.newestUp(si);
-        if (!rt) { res.err = '我方场上没有明牌'; return res; }
+        if (!rt) { this.funcFail(res, f, '我方场上没有明牌'); break; }
         var p2 = side.cards.indexOf(rt);
         side.cards.splice(p2, 1);
         // 假牌不进牌库，直接消失（见 mkCard 的注释）—— 等于白扔一张功能牌，
@@ -1331,6 +1456,9 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         res.ok = true; res.msg = '对方使用了' + f.name + '，退回了 ' + res.value + ' 点明牌';
         break;
     case 'rule':
+        // 【这处仍然是拦下、不消耗牌】跟牛牛那道 5 张上限一个待遇（你定的）：
+        // 已经有人超过 5 张时规则牛牛用不出去，而不是打出去之后失效。
+        // 别顺手改成 funcFail —— 牛牛相关的门是全工程唯一保留「拦下」的两处。
         var rblock = this.ruleBlockedReason(id);
         if (rblock) { res.err = rblock; return res; }
         this.rule = id;
@@ -1362,7 +1490,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         // 例外：牌库空时没有别的牌可抽，只能洗回去再抽回同一张（你定的）。
         // 这时牌照样消耗，等于白出一张 —— 但不拦着他出。
         var rp = this.newestUp(si);
-        if (!rp) { res.err = '我方场上没有明牌'; return res; }
+        if (!rp) { this.funcFail(res, f, '我方场上没有明牌'); break; }
         var rpPos = side.cards.indexOf(rp);
         side.cards.splice(rpPos, 1);
         res.fakeGone = !!rp.fake;
@@ -1387,12 +1515,24 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
     case 'reback':
         // 强制替换对方第一张底牌。换上来的一定不是原来那张：
         // 新牌从牌库里取，而牌库里不可能有场上已经存在的那个数字。
+        //
+        // 【牌库空时换回同一张，仍然算生效】你定的口径：这一手照样算成功
+        // （日志按成功记、对方的过牌照样作废），只是换上来还是那个数字，
+        // 而且**动画照播** —— 见客户端的 holeSwapFx。
+        // 原来这里是拦下（牌不消耗），改这个的理由和别的失效一样：
+        // 「点了没反应」比「用了没效果」更难理解。
         var hole = this.firstHole(1 - si);
-        if (!hole) { res.err = '对方没有底牌'; return res; }
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (!hole) { this.funcFail(res, f, '对方没有底牌'); break; }
+        res.oldValue = hole.v;
+        if (this.deck.length === 0) {
+            // 洗回去再抽回来，等于原地不动。牌面不用改，只标记一下给界面。
+            res.value = hole.v;
+            res.same = true;
+            res.ok = true; res.msg = '对方使用了' + f.name;
+            break;
+        }
         var pickIdx = Math.floor(Math.random() * this.deck.length);
         var newV = this.deck.splice(pickIdx, 1)[0];
-        res.oldValue = hole.v;
         hole.v = newV;
         res.value = newV;
         this.shuffleInto(res.oldValue);      // 换下来的牌洗回牌库
@@ -1405,7 +1545,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         res.ok = true; res.msg = '对方使用了' + f.name;
         break;
     case 'picksmall':
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (this.deck.length === 0) { this.funcFail(res, f, '牌库已空'); break; }
         var mn = this.deckMin();
         this.doPick(si, mn, false);
         res.value = mn;
@@ -1418,14 +1558,10 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         //
         // 实现上靠顺序保证：先把明牌摘下来、此时算 deckMax（牌库里还没有它），
         // 再把它压到底，最后抽那个最大值。不用额外的排除逻辑。
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (this.deck.length === 0) { this.funcFail(res, f, '牌库已空'); break; }
         var pb = this.newestUp(si);
-        if (!pb) {
-            // 没有明牌可退 -> 失效但牌照样消耗（和 copy 同一个规矩，你定的）
-            res.ok = true; res.fail = true; res.err = '我方场上没有明牌';
-            res.msg = '对方使用了' + f.name + '（失败）';
-            break;
-        }
+        // 没有明牌可退 -> 失效但牌照样消耗（和 copy 同一个规矩，你定的）
+        if (!pb) { this.funcFail(res, f, '我方场上没有明牌'); break; }
         side.cards.splice(side.cards.indexOf(pb), 1);
         var mx = this.deckMax();
         res.oldValue = pb.v;
@@ -1450,12 +1586,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         // 复制自己最新的**明牌**的点数（newestUp 会跳过暗牌）。
         // 场上一张明牌都没有时失效，但牌照样消耗（你定的）。
         var cp = this.newestUp(si);
-        if (!cp) {
-            res.ok = true; res.fail = true;
-            res.err = '我方没有明牌可以复制';
-            res.msg = '对方使用了' + f.name + '（失败）';
-            break;
-        }
+        if (!cp) { this.funcFail(res, f, '我方没有明牌可以复制'); break; }
         // 【face 要一起复制】复制一张 +1 得到的就是另一张 +1（-1 同理）。
         // 原来只复制点数，于是复制 +1 得到一张「1 点的复制品」，显示成 1 ——
         // 玩家看到的是「我复制了 +1，场上却多了张 1」，读不通。
@@ -1470,7 +1601,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         break;
     case 'helppick':
         // 帮对方抽牌库里最小的一张明牌。不消耗回合。
-        if (this.deck.length === 0) { res.err = '牌库已空'; return res; }
+        if (this.deck.length === 0) { this.funcFail(res, f, '牌库已空'); break; }
         // 牛牛下对方满 5 张就不能再往对方场上加牌（helppick 不在 GAIN_KINDS
         // 里，cardGainBlockedReason 不会挡，所以在这里单独挡对方那侧）
         if (this.isCowRule() && opp.cards.length >= D678.COW_MAX_CARDS) {
@@ -1503,7 +1634,7 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         // 底牌始终在 index 0，所以对方只有 1 张牌时没有可破坏的目标。
         // 明牌暗牌都能破坏；暗牌被破坏时不透露点数（日志只写「暗牌」）。
         // 假牌（虚空数字 / 镜像）不进牌库，直接消失。
-        if (opp.cards.length <= 1) { res.err = '对方没有可破坏的牌'; return res; }
+        if (opp.cards.length <= 1) { this.funcFail(res, f, '对方没有可破坏的牌'); break; }
         var dst = opp.cards.pop();
         res.targetHidden = dst.hidden;
         res.fakeGone = !!dst.fake;
@@ -1512,6 +1643,87 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         this.resolveMirror();
         res.ok = true; res.msg = '对方使用了' + f.name + '，破坏了' +
             (res.targetHidden ? '一张暗牌' : ' ' + res.value + ' 点明牌');
+        break;
+    case 're2big':
+        // 双方各自最大的一张明牌压到牌库底，两张的顺序随机。
+        // 一方没有明牌就只处理另一方；双方都没有也照样能用，只是没有效果
+        //（你定的：不拒绝，白扔算玩家失误）。
+        // 并列取最新那张（maxUp 用 >= 比较）。虚空数字不进牌库、直接消失。
+        var big0 = this.maxUp(si), big1 = this.maxUp(1 - si);
+        res.mine  = big0 ? big0.v : null;
+        res.other = big1 ? big1.v : null;
+        res.mineFake  = !!(big0 && big0.fake);
+        res.otherFake = !!(big1 && big1.fake);
+        if (!big0 && !big1) { this.funcFail(res, f, '双方都没有明牌'); break; }
+        // 【先摘牌再压库】两张都摘下来之后才往牌库底压，否则先压进去的那张
+        // 会参与另一侧的挑选（虽然 maxUp 只看场上，但顺序清楚一点更稳）。
+        if (big0) side.cards.splice(side.cards.indexOf(big0), 1);
+        if (big1) opp.cards.splice(opp.cards.indexOf(big1), 1);
+        var toBottom = [];
+        if (big0 && !big0.fake) toBottom.push(big0.v);
+        if (big1 && !big1.fake) toBottom.push(big1.v);
+        D678.shuffle(toBottom);              // 两张的顺序随机（你定的）
+        for (var tb = 0; tb < toBottom.length; tb++) this.deck.push(toBottom[tb]);
+        this.resolveMirror();
+        res.ok = true;
+        res.msg = '对方使用了' + f.name;
+        break;
+    case 'repickback':
+        // 换自己的底牌，方向和 干扰 相反。「一定不是原来那张」靠 rerollOwnHole
+        // 的取牌顺序天然成立（先从牌库取新的，旧的后洗回去）。
+        //
+        // 【牌库空时算生效、不算失效】你定的：那时底牌洗回去只能抽回同一张，
+        // 但动画照播。和 干扰 那边的处理一致。
+        var myHole = this.firstHole(si);
+        if (!myHole) { this.funcFail(res, f, '我方没有底牌'); break; }
+        res.oldValue = myHole.v;
+        if (this.deck.length === 0) {
+            res.value = myHole.v;
+            res.same = true;
+            res.ok = true; res.msg = '对方使用了' + f.name;
+            break;
+        }
+        var rrb = this.rerollOwnHole(si);
+        res.value = rrb.value;
+        res.ok = true;
+        res.msg = '对方使用了' + f.name;
+        break;
+    case 'copyback':
+        // 复制自己底牌的点数，以**暗牌**形式追加。虚空数字（fake）。
+        //
+        // 【这是唯一能绕过要牌闸门加点数的牌】暗牌不进 upTotal，所以
+        // 底牌 10 + 这张 = 手上 20 点，而「明牌合计 <21」那道闸门毫无察觉。
+        // 进 GAIN_KINDS，所以牛牛下满 5 张时在函数开头就被拦下了。
+        //
+        // 静态复制、不是镜像：之后底牌被 干扰 / 重抽底牌 换掉，这张不跟着变。
+        var chb = this.firstHole(si);
+        if (!chb) { this.funcFail(res, f, '我方没有底牌'); break; }
+        side.cards.push(D678.mkCard(chb.v, true, true, chb.face));
+        res.value = chb.v;
+        res.ok = true; res.endTurn = true;
+        res.msg = '对方使用了' + f.name;
+        break;
+    case 'smallchangebig':
+        // 自己最小的明牌 <-> 对方最大的明牌。不看位置（全场最小/最大），
+        // 并列取最新那张。就地换数值，牌不换阵营（和 swap 同一套做法，
+        // 所以 fake / face / mirror 必须跟着 v 一起换 —— 见 swap 分支的注释）。
+        var sMin = this.minUp(si), oMax = this.maxUp(1 - si);
+        if (!sMin || !oMax) {
+            this.funcFail(res, f, sMin ? '对方场上没有明牌' : '我方场上没有明牌');
+            break;
+        }
+        res.value = sMin.v; res.other = oMax.v;
+        var sv2 = sMin.v; sMin.v = oMax.v; oMax.v = sv2;
+        var sf = sMin.fake, sc = sMin.face, sm = sMin.mirror;
+        if (oMax.fake) sMin.fake = true; else delete sMin.fake;
+        if (oMax.face) sMin.face = oMax.face; else delete sMin.face;
+        if (oMax.mirror) sMin.mirror = true; else delete sMin.mirror;
+        if (sf) oMax.fake = true; else delete oMax.fake;
+        if (sc) oMax.face = sc; else delete oMax.face;
+        if (sm) oMax.mirror = true; else delete oMax.mirror;
+        this.resolveMirror();
+        res.ok = true;
+        res.msg = '对方使用了' + f.name + '，' + res.value + ' 和 ' + res.other + ' 互换';
         break;
     }
 
@@ -1539,7 +1751,8 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         else if (f.kind === 'check')      what += '，看了牌库顶 ' + side.checkN + ' 张';
         else if (f.kind === 'repick')     what += '，洗掉 ' + res.oldValue + ' 重抽到 ' +
                                                   res.value + (res.same ? '（又是同一张）' : '');
-        else if (f.kind === 'reback')     what += '，替换了对方底牌';
+        else if (f.kind === 'reback')     what += '，替换了对方底牌' +
+                                                  (res.same ? '（牌库已空，没有变化）' : '');
         else if (f.kind === 'picksmall')  what += '，抽出了最小的 ' + res.value;
         else if (f.kind === 'pickbig')    what += '，退回 ' +
                                                   (res.fakeGone ? '复制品' : res.oldValue) +
@@ -1550,6 +1763,24 @@ D678_Battle.prototype.useFunc = function (si, id, simulate) {
         else if (f.kind === 'mirror')     what += '，镜像复制';
         else if (f.kind === 'destroy')    what += '，破坏了对方' +
                                                   (res.targetHidden ? '一张暗牌' : ' ' + res.value + ' 点明牌');
+        // 【去大：自己那张写点数，对方那张也写】双方各去一张，日志上两个都要有，
+        // 不然看日志的人不知道对方掉了什么。虚空那张标出来（它是消失、没进牌库）。
+        else if (f.kind === 're2big')     what += '，去掉自己' +
+                                                  (res.mine === null ? '（无明牌）' :
+                                                   ' ' + res.mine + (res.mineFake ? '（虚空）' : '')) +
+                                                  '、对方' +
+                                                  (res.other === null ? '（无明牌）' :
+                                                   ' ' + res.other + (res.otherFake ? '（虚空）' : ''));
+        // 【这两张不写点数，但不是为了防泄漏】日志只在揭牌后才下发/展示
+        //（服务器 maskLog、单机的轮结果页），而 logAct 记的 hand 本来就含
+        // 暗牌数值 —— 写不写都泄不了。不写纯粹是因为这两张的动作对象是
+        // 「自己的底牌」，点数在同一行的 hand 里已经看得到了。
+        else if (f.kind === 'repickback') what += '，重抽了自己的底牌' +
+                                                  (res.same ? '（牌库已空，没有变化）' : '');
+        else if (f.kind === 'copyback')   what += '，复制了自己的底牌';
+        else if (f.kind === 'smallchangebig')
+                                          what += '，自己 ' + res.value + ' 和对方 ' +
+                                                  res.other + ' 互换';
         else if (f.kind === 'pick2' && res.only) {
             what += '，牌库只剩 1 张，抽出了 ' + res.value;
         }
@@ -1649,7 +1880,13 @@ D678_Battle.prototype.doResolve = function () {
     };
     // 牛牛的成绩不是点数，结算画面要显示「牛4 / 无牛」，所以单独带出去
     if (this.isCowRule()) info.cows = [s0.cow, s1.cow];
-    if (this.isMoreRule()) info.cardCounts = [s0.cards, s1.cards];
+    // 比多和比少的判定都先看张数，所以结算画面要显示双方各几张
+    if (this.isMoreRule() || this.isLessRule()) info.cardCounts = [s0.cards, s1.cards];
+    // 【「爆牌」这个词在爆牌线倒过来的规则下是错的】规则大21 和 规则比少
+    // 判负的条件是**低于** 21 点，写「爆牌」等于告诉玩家他超了。
+    // 收在这里是因为单机和联机两个结算画面读的是同一份 result ——
+    // 各自判一次规则迟早漂，而且联机那份 result 里本来就没有 rule 字段。
+    info.bustWord = this.bustWord();
 
     if (win < 0) {
         info.tie = true;
@@ -1890,10 +2127,13 @@ D678.AI.scoreFromTotal = function (b, si, t, n, reach) {
         return { bust: false, max: cow === 10, rank: [cow], total: t, cow: cow };
     }
     var bust = b.isBustVal(t);
-    if (b.isMoreRule()) {
+    if (b.isMoreRule() || b.isLessRule()) {
         var cnt = (n === undefined) ? b.countCards(si, false) : n;
+        // 比少的 rank 是负张数（少者胜），和 scoreOf 那边必须一致 ——
+        // 这两处算出不同的 rank 会让 AI 按一套规则推演、按另一套结算。
+        var nRank = b.isLessRule() ? -cnt : cnt;
         return { bust: bust, max: b.isMaxVal(t), total: t,
-                 rank: [cnt, -b.distVal(t)], cards: cnt };
+                 rank: [nRank, -b.distVal(t)], cards: cnt };
     }
     return { bust: bust, max: b.isMaxVal(t), total: t, rank: [-b.distVal(t)] };
 };
@@ -2215,7 +2455,9 @@ D678.AI.oppWouldHit = function (b, si, ot, U, mtView, ent) {
 D678.AI.mergeDist = function (list, b) {
     // 牛牛也要带 n：那条规则的抽牌闸门是张数上限（见 expandOpp），
     // 张数不同的条目「还能不能再抽」不一样，合并掉会让展开用错的张数继续推。
-    var needN  = !!(b && (b.isMoreRule() || b.isCowRule()));
+    // 比少和比多一样，成绩取决于张数 —— 不带 n 会把「同点数不同张数」
+    // 这种结果相反的条目并成一条。
+    var needN  = !!(b && (b.isMoreRule() || b.isLessRule() || b.isCowRule()));
     var needRC = !!(b && b.isCowRule());
     var m = {}, out = [], i, k;
     for (i = 0; i < list.length; i++) {
@@ -2459,15 +2701,24 @@ D678.AI.ruleTimingOK = function (b, si, id) {
     var bust  = b.isBustVal(t);
     var isMax = b.isMaxVal(t);
     var dist  = b.distVal(t);
-    // 【改判定的三张过不了「离目标多远」这道闸门】它们没有「目标点数」这回事：
+    // 【改判定的五张过不了「离目标多远」这道闸门】它们没有「目标点数」这回事，
+    // 或者那个距离量对它们没有意义：
     //   · 牛牛      -> 该问的是「改完之后我的牛几点」
     //   · 比多      -> 该问的是「我的张数是不是不比对手少」
     //   · 规则暗牌  -> 该问的是「我的暗牌是不是比对手的强」
     //                 （双方通常各只有 1 张暗牌，离 21 点都远得很，
     //                   按原闸门算 dist 恒大于 RULE_NEAR，这张牌永远出不去）
-    // 所以这三张换成「改完之后我相对对手是不是真的更好」——
+    //   · 规则比少  -> 爆牌线是反的（低于 21 判负），原闸门那句
+    //                 `!bust && dist <= RULE_NEAR` 在没到 21 时恒为假，
+    //                 这张牌会永远出不去
+    //   · 规则明牌  -> 有目标点数（仍是 21），原闸门算得出来也不算错，
+    //                 但这条规则下双方的成绩**全是公开信息**（暗牌不计分），
+    //                 cmpScore 是精确的、严格比距离代理量更准：
+    //                 我 20 点、对手正好 21 点时距离闸门会放行一手必输的牌。
+    // 所以这五张换成「改完之后我相对对手是不是真的更好」——
     // 直接拿 cmpScore 比双方成绩，比任何距离代理量都准。
-    if (b.isCowRule() || b.isMoreRule() || b.isHiddenRule()) {
+    if (b.isCowRule() || b.isMoreRule() || b.isHiddenRule() ||
+        b.isLessRule() || b.isUpRule()) {
         // 【规则暗牌要按重掷之后的底牌判，不能按现在这张】出这张牌会把自己的
         // 底牌换成随机一张，所以拿当前底牌算出来的成绩，正是这一手会亲手作废的
         // 前提 —— 不换的话 AI 会因为「我现在底牌 10」而出牌，而出完那张 10 就没了。
@@ -2800,6 +3051,65 @@ D678.AI.simFunc = function (b, si, id, depth) {
             sb += this.bestValue(cb2, si, depth);
         }
         val = sb / cand.length - fv;
+    } else if (f.kind === 'repickback') {
+        // 【要按期望估，不能只掷一次】它把自己的底牌换成随机一张，而底牌在
+        // 默认规则下是计分的 —— 直接 useFunc 只采到一个样本，估值会随机漂移，
+        // AI 有时把一手烂底牌估成好棋。照 reback / 规则暗牌那两处的路子
+        // 枚举候选取平均。
+        var rbkHole = b.firstHole(si);
+        if (!rbkHole) return null;                    // 没底牌 -> 必定失效
+        if (b.deck.length === 0) return null;         // 牌库空 -> 抽回同一张，白扔
+        // 【规则明牌下这张是废牌】那条规则不算暗牌，换底牌对成绩毫无影响 ——
+        // 早退一步，既不让 AI 白扔牌，也省掉下面整轮枚举。
+        if (b.isUpRule()) return null;
+        var rbkCand = god ? b.deck.slice(0) : this.unseen(b, si);
+        if (!rbkCand.length) return null;
+        // 【候选上界 5，比 reback / 规则暗牌那两处的 8 小】这三处都是
+        // 「枚举底牌候选 × bestValue」，单张估值就要 6ms 左右 —— 是全部
+        // 功能牌里最贵的一档。原来跟着写 8，实测让 AI 每次决策的耗时接近翻倍
+        // （手上有几张新牌时 6.6ms -> 11.8ms），天梯那种一局要打几十轮的
+        // 场合会累积到用例的时间预算之外（server/_test_ladhistory.js 的
+        // ladPlay 给一局 120 秒）。
+        //
+        // 砍到 5 的代价很小：这本来就是个近似 —— slice 取的是前几个候选，
+        // 连均匀抽样都不是，多枚举几个并不换来成比例的准确度。
+        var rbkCap = 5;
+        if (rbkCand.length > rbkCap) rbkCand = rbkCand.slice(0, rbkCap);
+        var srb = 0, nrb = 0;
+        for (var rbi = 0; rbi < rbkCand.length; rbi++) {
+            var crb = b.clone();
+            var hrb = crb.firstHole(si);
+            if (!hrb) continue;
+            var oldRB = hrb.v;
+            hrb.v = rbkCand[rbi];
+            D678.remove(crb.deck, rbkCand[rbi]);
+            crb.deck.push(oldRB);
+            // 换的是**自己**的底牌：对手对我方底牌的推理作废，
+            // 而我方对对手底牌的推理（side.known）不受影响 ——
+            // 方向和 reback 正好相反，见 rerollOwnHole 的注释。
+            D678.remove(crb.sides[1 - si].known, oldRB);
+            crb.sides[si].stood = false;
+            crb.standStreak = 0;
+            srb += this.bestValue(crb, si, depth);
+            nrb++;
+        }
+        if (!nrb) return null;
+        val = srb / nrb - fv;
+    } else if (f.kind === 'copyback') {
+        // 复制自己的底牌，以暗牌形式追加。结果完全确定（没有随机性），
+        // 所以直接推演那一个盘面 —— 和 num / copy 同一个路子。
+        var cbH = b.firstHole(si);
+        if (!cbH) return null;                        // 没底牌 -> 必定失效
+        // 【规则明牌下这张是废牌】造出来的是**暗**牌，而那条规则不算暗牌，
+        // 白扔一张牌还白扔一个回合（这张消耗回合）。
+        if (b.isUpRule()) return null;
+        var ccb = b.clone();
+        // 假牌不占牌库里的任何一张，所以不走 simAdd（那个会从牌库移掉这个值）。
+        // hidden:true 是关键 —— 它不进 upTotal，所以不推那道要牌闸门。
+        ccb.sides[si].cards.push({ v: cbH.v, hidden: true, uid: -1, fake: true });
+        ccb.sides[si].stood = false;
+        ccb.standStreak = 0;
+        val = this.bestValue(ccb, si, Math.max(0, depth - 1));
     } else if (id === 'rulenoseencard' && b.firstHole(si) && b.deck.length > 0) {
         // 【这张要按期望估，不能只掷一次】它会把出牌方自己的底牌换成随机一张，
         // 而这条规则下底牌就是成绩本身 —— 直接 useFunc 只能采到一个样本，
@@ -2829,6 +3139,14 @@ D678.AI.simFunc = function (b, si, id, depth) {
         if (f.kind === 'rule' && !this.ruleTimingOK(b, si, id)) return null;
         var r = c.useFunc(si, id, true);
         if (!r.ok) return null;
+        // 【必定失效的牌不当候选】useFunc 现在对大部分不合规的出牌返回
+        // ok=true, fail=true（照样消耗、没有效果）—— 那是给**玩家**的口径，
+        // AI 跟着学就是白扔手牌。所以这里把 fail 挡掉，等价于改造之前
+        // 「useFunc 拒绝 -> 返回 null」的效果。
+        //
+        // 抽号牌那张不受影响：它有自己的分支，在那里按成功率算期望
+        //（撞牌失败是有情报收益的，不是纯亏）。
+        if (r.fail) return null;
         val = this.bestValue(c, si, depth);
     }
     return { value: val, id: id };
@@ -2918,7 +3236,13 @@ D678.AI.step = function (b, si) {
         // kind / oldValue 透出来给界面用：重抽要播「旧牌飞回牌库 + 新牌入场」
         // 那套完整动画，收牌那一半需要知道洗回去的是哪个数字
         // （见 678.js 的 redealCard）。same 留着，别的地方还在读。
+        //
+        // 【ok / value 也要带】D678.holeSwapSideOf 读这两个字段判断
+        // 「这一手换了谁的底牌」（规则暗牌只在真的重掷了才有 value）。
+        // 少带一个的话对方用重抽底牌 / 干扰 / 规则暗牌时不播换牌动画 ——
+        // 而那种漏法看着就像「对方用了牌但什么也没发生」。
         return { side: si, action: 'func', id: d.id, msg: r.msg, fail: !!r.fail,
+                 ok: !!r.ok, value: r.value,
                  endTurn: !!r.endTurn, same: !!r.same,
                  kind: r.kind, oldValue: r.oldValue };
     }
